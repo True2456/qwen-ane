@@ -357,42 +357,53 @@ cost far less than the 15.8 GB checkpoint.
 
 ### What it actually costs, and why
 
-An earlier revision of this document reported **0.5 tok/s**, which was wrong: it
-timed the first few tokens of a cold process, so most of it was reading and
-converting bf16 weights off disk, not arithmetic. Warm steady state, measured
-over repeated forwards with the caches populated:
+Two corrections, in order of how wrong they were.
 
-| | |
-|---|---:|
-| steady state | **1.27-1.34 tok/s** (~750-790 ms/token) |
-| activated params | 1.38B -> 2.76 GFLOP/token |
-| fp32 weight traffic | 5.53 GB/token -> **7.0 GB/s achieved** |
-| numpy GEMV ceiling on this machine | **27.4 GB/s** |
+**The reference is 1.27-1.34 tok/s warm, not 0.5.** The 0.5 figure timed the
+first tokens of a cold process, so most of it was reading and converting bf16
+weights off a 15.8 GB checkpoint rather than arithmetic.
 
-So the reference is **memory-bandwidth-bound on single-threaded numpy GEMV**,
-not compute-bound: 2.76 GFLOP/token is nothing, but reading 5.53 GB of fp32
-weights for a single token is everything. The best this design could reach at
-the measured GEMV ceiling is ~5 tok/s. Decoding one token at a time makes every
-projection a matrix-**vector** product, which is the worst case for bandwidth
-reuse.
+**~5 tok/s is not a ceiling for anything except this numpy code.** That number
+came from dividing 5.53 GB of fp32 weight traffic by 27.4 GB/s, the
+single-threaded numpy GEMV rate on this machine -- both of which are properties
+of the reference implementation, not of the model or the hardware. The real
+baseline, measured:
 
-Three fixes along the way, all verified to leave the output identical:
+```
+$ mlx_lm.generate --model .../Ling-3.0-tiny --max-tokens 48
+Generation: 41 tokens, 27.269 tokens-per-sec     # bf16, GPU, 16.4 GB peak
+```
+
+**MLX runs this model at 27.3 tok/s**, 20x the numpy reference, and answers
+correctly ("The capital of France is **Paris**."). That is the number the ANE
+port has to be measured against.
+
+| path | bytes/token | measured | effective bandwidth |
+|---|---:|---:|---:|
+| numpy reference, fp32, CPU | 5.53 GB | 1.3 tok/s | 7.0 GB/s |
+| **MLX, bf16, GPU** | **2.76 GB** | **27.3 tok/s** | **~75 GB/s** |
+| ANE target, int4 | 0.69 GB | — | 150 GB/s streaming (measured, `ANE-REFERENCE.md`) |
+
+Decode here is weight-bandwidth-bound, so bytes per token is the lever: int4 is
+a quarter of bf16, and the ANE's measured weight streaming is about double the
+75 GB/s MLX achieves. That is the headroom the port is chasing. It is headroom
+on paper -- the ANE also pads decode to 32 lanes and sustains ~10-20 TFLOP/s,
+and `docs/ANE-MOE-HANDOFF.md` records a 35B MoE losing to the GPU by 11x -- but
+the arithmetic is why Ling-tiny is worth trying where the 35B was not.
+
+The numpy reference stays what it is: an oracle for checking ANE blocks layer by
+layer, not a performance path. Three real inefficiencies in it were still worth
+fixing, each verified to leave the generated tokens identical:
 
 * every projection was `x @ W.T` on a non-contiguous transposed view, so numpy
   materialized a fresh copy per call -- 966 MB per token for `lm_head` alone.
   The transpose is now cached contiguously.
-* `_silu` and `_sigmoid` promoted to float64, doubling traffic through the
-  elementwise path.
-* the routed experts ran as a 184-iteration Python loop. Stacking them into one
-  matmul was tried and measured *worse* (746 ms against 786), because the
-  concatenation copies 75 MB per layer per token; the loop stays.
+* `_silu` and `_sigmoid` promoted to float64.
+* stacking the routed experts into one matmul measured *worse* than the loop
+  (746 ms against 786), because the concatenation copies 75 MB per layer per
+  token, so it was reverted rather than kept for looking tidier.
 
 Per-block, warm: MoE 384 ms (51%), KDA 264 ms (35%), MLA 20 ms, `lm_head` 6.8 ms.
-
-This is the argument for the ANE runtime rather than against numpy. The ANE
-reads **int4** experts, a quarter of the bytes, and `docs/ANE-REFERENCE.md`
-measures its weight streaming at 150 GB/s against the 27.4 GB/s numpy reaches
-here.
 
 ## Validated ANE building blocks
 
