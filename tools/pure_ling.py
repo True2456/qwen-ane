@@ -607,3 +607,90 @@ def reference_generate(model_dir: str, prompt: str, tokens: int,
 
 if __name__ == "__main__":
     main()
+
+
+# ---------------------------------------------------------------------------
+# ANE runtime. Blocks are swapped in one at a time and each is checked against
+# LingReference, so the model keeps generating correct text throughout.
+# ---------------------------------------------------------------------------
+
+class AneExpertBank:
+    """All experts of every MoE layer, baked as int4 constants.
+
+    gate|up stacks along OUTPUT rows, which is exactly what
+    AneLinearProjectionBank packs, so one bank holds a chunk of experts for all
+    23 layers as procedures. 128 experts x 1024 rows is 131072, above the
+    measured 62080 single-conv output limit, hence `chunks`.
+
+    Row-wise quantization is what makes the stacking exact: each output row
+    keeps its own scale and no partial sum crosses an expert boundary
+    (docs/ANE-REFERENCE.md).
+    """
+
+    def __init__(self, driver, checkpoint, spec, bits=4, chunks=4):
+        from pure_ane import AneLinearProjectionBank
+        self.spec, self.chunks = spec, chunks
+        per = spec.experts // chunks
+        self.per_chunk_rows = per * 2 * spec.moe_intermediate
+        self.banks = []
+        for c in range(chunks):
+            lo, hi = c * per, (c + 1) * per
+            sets = []
+            for layer in spec.moe_layers:
+                # gate rows for experts lo..hi, then up rows: the activation is
+                # sliced apart in the same order on read.
+                sets.append(
+                    [spec.expert_name(layer, e, "gate") for e in range(lo, hi)]
+                    + [spec.expert_name(layer, e, "up") for e in range(lo, hi)])
+            self.banks.append(
+                AneLinearProjectionBank(driver, checkpoint, sets, bits,
+                                        f"moe_gu_c{c}"))
+        self.nbytes = sum(b.nbytes for b in self.banks)
+
+    def gate_up(self, layer, x):
+        """Returns [experts, 2, moe_intermediate] for every expert in the layer."""
+        s = self.spec
+        idx = s.moe_layers.index(layer)
+        per = s.experts // self.chunks
+        M = s.moe_intermediate
+        out = np.empty((s.experts, 2, M), np.float32)
+        for c, bank in enumerate(self.banks):
+            r = bank.run(idx, x.astype(np.float16)).astype(np.float32)
+            g, u = r[:per * M].reshape(per, M), r[per * M:].reshape(per, M)
+            out[c * per:(c + 1) * per, 0] = g
+            out[c * per:(c + 1) * per, 1] = u
+        return out
+
+
+class LingRuntime(LingReference):
+    """LingReference with blocks moved onto the ANE, one at a time.
+
+    Subclassing the reference keeps every un-ported block exact, so the model
+    generates correct text at every stage and each swap can be diffed against
+    the parent implementation.
+    """
+
+    def __init__(self, checkpoint, spec, engine_path=".", bits=4,
+                 ane_moe=True):
+        super().__init__(checkpoint, spec)
+        from pure_ane import AneDriver
+        self.driver = AneDriver(engine_path)
+        self.bits = bits
+        self.experts = (AneExpertBank(self.driver, checkpoint, spec, bits)
+                        if ane_moe else None)
+        self.programs = 0 if self.experts is None else len(self.experts.banks)
+
+    def moe(self, x, layer):
+        if self.experts is None:
+            return super().moe(x, layer)
+        s = self.spec
+        idx, wts = self.route(x, layer)
+        gu = self.experts.gate_up(layer, x)                   # ANE: all experts
+        h = _silu(gu[idx, 0]) * gu[idx, 1]                    # top-8 only
+        h *= wts[:, None]
+        out = np.zeros_like(x)
+        for j, e in enumerate(idx):
+            out += h[j] @ self.wt(self.spec.expert_name(layer, int(e), "down"))
+        m = self.mlp_names_cached(layer)
+        return out + (_silu(x @ self.wt(m["shared_gate"]))
+                      * (x @ self.wt(m["shared_up"]))) @ self.wt(m["shared_down"])
