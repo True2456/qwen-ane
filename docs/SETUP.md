@@ -31,6 +31,10 @@ tools/ane pure-attention-long-smoke --context 262144 --valid 8193
 tools/ane pure-infer --bits 16 --tokens 4 --verify-reference
 tools/ane pure-infer --bits 4 --tokens 32 --mtp-draft 2
 tools/ane pure-infer --bits 4 --context 4096 --prompt-file prompt.txt --tokens 32
+
+# Persistent pure-ANE OpenAI endpoint and compile-free repeated benchmark:
+tools/ane pure-serve --bits 4 --context 4096 --port 1240
+tools/ane pure-bench --url http://127.0.0.1:1240 --tokens 32 --runs 3
 ```
 
 `tools/ane` is a launcher, and you should use it rather than running the Python
@@ -65,7 +69,12 @@ $PY -u -P probes/ane_program_limit.py  # where the program ceiling sits here
 private `_ANEInMemoryModel` path fails loading distinct model 128 on the M5
 Max, even with no evaluations in flight. That is not the same claim as the
 reverse-engineered hardware queue depth of 127 concurrent evaluation requests;
-treat 127 as an API-path/process budget here, not a documented total ANE limit.
+treat 127 as an API-path budget here, not a documented total ANE limit.
+
+> **The budget is system-wide, not per-process.** Measured: while another
+> process held ~122 programs, a fresh process failed to load a 16x16 program
+> with `0x50004`. Run nothing else on the ANE while probing or serving, or
+> compiles fail for shapes that are otherwise fine.
 
 ## Useful flags
 
@@ -82,12 +91,26 @@ treat 127 as an API-path/process budget here, not a documented total ANE limit.
 | pure `--mtp-draft 0/1/2` | standalone ANE-only MTP; depth 2 measured best |
 | pure `--context N` | attention/KV capacity, 256..262144; above 256 uses streamed exact ANE attention |
 | pure `--prompt-file PATH` | UTF-8 prompt file, useful for long-context tests; overrides `--prompt` |
+| `pure-serve --port N` | persistent OpenAI-compatible pure-ANE endpoint; default 1240 |
+| `pure-serve --max-tokens N` | default request output limit; clients can override it |
+| `pure-bench --runs/--warmup` | benchmark an already-running server without compiling between samples |
 
 At 256K, the target's 16 fp16 KV caches are 16 GiB in aggregate; pure MTP adds
 1 GiB. Int4 learned-weight blobs add 12.86 GB (13.16 GB with MTP). The 256K
 arrays are allocated at runtime and become resident as their blocks are filled.
 Long-context fp16 + MTP is currently rejected because that combination needs
 129 distinct loaded models; int4/int8 + MTP and fp16 target-only fit at 127.
+
+### Persistent API
+
+Wait for `PURE_ANE_SERVER_READY`, then point an OpenAI-compatible client at
+`http://127.0.0.1:1240/v1` with any placeholder API key. The server supports
+chat/completions, text completions, SSE streaming, health, metrics, and a
+dedicated benchmark endpoint. It accepts one active inference at a time and
+queues overlapping requests so mutable recurrent/KV state cannot be mixed.
+Each request resets sequence state but retains the compiled programs and
+learned-weight blobs. A 256K configuration reserves sparse KV address space;
+resetting it does not zero or fault all 16 GiB of target cache pages.
 
 ## Environment
 

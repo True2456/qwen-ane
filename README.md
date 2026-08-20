@@ -137,7 +137,7 @@ cold bake: the private compiler materializes weights and macOS may use swap.
 Deleted files still held open by another application do not count as free
 space (`lsof +L1` is useful when `df` and Finder disagree).
 
-The measured per-process `_ANEInMemoryModel` load failure at 128 distinct
+The measured `_ANEInMemoryModel` load failure at 128 distinct
 models was avoided with
 projection procedure banks (two quantized or five fp16), one shared
 attention-preparation program, one
@@ -192,6 +192,9 @@ temporal convolution directly into the resident recurrence surface.
   ANE programs, and why it is shaped this way.
 * **[docs/PERFORMANCE.md](docs/PERFORMANCE.md)** — measured throughput and
   energy, including where the ANE wins and where it does not.
+* **[docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md)** — what is left on the
+  table, ranked, with every claim tagged measured, derived, or unmeasured. The
+  decode time budget lives here.
 * **[docs/FULL-ANE-FEASIBILITY.md](docs/FULL-ANE-FEASIBILITY.md)** — measured
   feasibility of removing the remaining GPU blocks: full attention and GDN
   arithmetic work, fp16-safe softplus is solved, and recurrent state now stays

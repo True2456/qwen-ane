@@ -7,6 +7,15 @@ context 256 and executes every learned tensor operation on the ANE. Both
 designs are constrained by an empirical per-process limit in the private
 `_ANEInMemoryModel` loader; a naive mapping wants several hundred.
 
+The pure backend also has a persistent HTTP wrapper in
+`tools/pure_ane_server.py`. It retains one baked `PureAneRuntime` for the life
+of the process and serializes requests around its mutable sequence state. A
+request reset zeros the 48 compact GDN IOSurfaces and convolution histories,
+sets attention offsets back to zero, and leaves long-context KV pages alone;
+masked stale entries are overwritten before they can become valid. Repeated
+chat and benchmark requests therefore do not recompile and cannot accidentally
+inherit another conversation's state.
+
 ## Pure backend layout
 
 | block | fp16 programs |

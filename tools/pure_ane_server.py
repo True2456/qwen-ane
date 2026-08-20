@@ -167,14 +167,26 @@ class PureAneService:
                     "kv_capacity_gb":self.runtime.kv_cache_bytes/1e9,
                     "last_result":self.last_result,"model":self.model_info()}
 
+    def validate(self,prompt:str,max_tokens:int,temperature:float=0.0,
+                 top_p:float=1.0,top_k:int=0,repetition_penalty:float=1.0,
+                 **_:Any)->list[int]:
+        prompt_ids=self.tokenizer.encode(prompt)
+        if not prompt_ids:raise ValueError("prompt tokenized to nothing")
+        if max_tokens<1:raise ValueError("max_tokens must be at least 1")
+        if len(prompt_ids)+max_tokens>self.args.context:
+            raise ValueError(f"prompt plus generation ({len(prompt_ids)+max_tokens}) exceeds configured context {self.args.context}")
+        if temperature<0:raise ValueError("temperature must be non-negative")
+        if not 0<top_p<=1:raise ValueError("top_p must be in (0, 1]")
+        if top_k<0:raise ValueError("top_k must be non-negative")
+        if repetition_penalty<=0:raise ValueError("repetition_penalty must be positive")
+        return prompt_ids
+
     def generate(self,prompt:str,max_tokens:int,temperature:float=0.0,
                  top_p:float=1.0,top_k:int=0,repetition_penalty:float=1.0,
                  seed:int=0,stops:list[str]|None=None,
                  emit:Callable[[str],None] | None=None)->dict[str,Any]:
-        prompt_ids=self.tokenizer.encode(prompt)
-        if not prompt_ids:raise ValueError("prompt tokenized to nothing")
-        if len(prompt_ids)+max_tokens>self.args.context:
-            raise ValueError(f"prompt plus generation ({len(prompt_ids)+max_tokens}) exceeds configured context {self.args.context}")
+        prompt_ids=self.validate(prompt,max_tokens,temperature,top_p,top_k,
+                                 repetition_penalty)
         selector=_sampling_selector(prompt_ids,temperature,top_p,top_k,
                                     repetition_penalty,seed)
         emitter=TextEmitter(self.tokenizer,stops or [],emit)
@@ -183,10 +195,11 @@ class PureAneService:
             if first[0] is None:first[0]=time.perf_counter()
             return emitter.token(token_id)
         with self.lock:
-            entered=time.perf_counter();self.runtime.reset();start=time.perf_counter()
+            entered=time.perf_counter();start=time.perf_counter();self.runtime.reset()
             try:
-                ids,seconds=self.runtime.generate(self.tokenizer,prompt,max_tokens,
+                ids,_runtime_seconds=self.runtime.generate(self.tokenizer,prompt,max_tokens,
                     on_token=token,stop_token_ids=self.eos_ids,token_selector=selector)
+                seconds=time.perf_counter()-start
             except Exception:
                 with self.stats_lock:self.failures+=1
                 raise
@@ -276,6 +289,7 @@ def build_handler(service:PureAneService):
             if req.get("tools"):raise ValueError("tool schemas are not implemented yet")
             prompt=chat_prompt(req.get("messages",[]),bool(req.get("enable_thinking",False)))
             options=_request_options(req,service.args.max_tokens)
+            service.validate(prompt,**options)
             cid="chatcmpl-"+uuid.uuid4().hex;stream=bool(req.get("stream",False));created=int(time.time())
             if stream:
                 self._sse_start();self._sse({"id":cid,"object":"chat.completion.chunk","created":created,"model":service.args.name,"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":None}]})
@@ -315,7 +329,9 @@ def serve(args:argparse.Namespace)->None:
 
 
 def bench_client(args:argparse.Namespace)->None:
-    payload={"prompt":args.prompt,"max_tokens":args.tokens,"runs":args.runs,"warmup":args.warmup,"temperature":args.temperature}
+    payload={"max_tokens":args.tokens,"runs":args.runs,"warmup":args.warmup,"temperature":args.temperature}
+    if args.raw_prompt:payload["prompt"]=args.prompt
+    else:payload["messages"]=[{"role":"user","content":args.prompt}]
     request=urllib.request.Request(args.url.rstrip("/")+"/v1/benchmarks",data=json.dumps(payload).encode(),headers={"Content-Type":"application/json"},method="POST")
     try:
         with urllib.request.urlopen(request,timeout=args.timeout) as response:data=json.load(response)
@@ -334,6 +350,7 @@ def main()->None:
     s.add_argument("--max-request-bytes",type=int,default=8*1024*1024)
     b=sub.add_parser("bench");b.add_argument("--url",default="http://127.0.0.1:1240")
     b.add_argument("--prompt",default="Reply with exactly: OK");b.add_argument("--tokens",type=int,default=16)
+    b.add_argument("--raw-prompt",action="store_true")
     b.add_argument("--runs",type=int,default=3);b.add_argument("--warmup",type=int,default=1)
     b.add_argument("--temperature",type=float,default=0.0);b.add_argument("--timeout",type=float,default=3600)
     args=parser.parse_args();serve(args) if args.command=="serve" else bench_client(args)

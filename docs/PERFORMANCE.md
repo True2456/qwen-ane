@@ -179,6 +179,12 @@ The hardware refuses widths below 32, so a 1-token decode step computes a full
   a full MTP layer plus a full `lm_head`.
 
 The framework-free equivalent is `tools/ane pure-infer --bits 4 --mtp-draft 2`.
+For statistically useful measurements, run `tools/ane pure-serve` once and
+then `tools/ane pure-bench`. The persistent benchmark endpoint performs an
+optional warmup followed by multiple clean-state runs without including model
+compilation in each sample. It reports end-to-end tokens/s, decode-only
+tokens/s, time to first token, queue time, prompt/completion counts, and every
+individual run rather than only an average.
 It uses accept-all-or-longest-prefix rollback and contains no MLX/GPU path.
 
 ## Long-context scaling

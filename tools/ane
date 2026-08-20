@@ -27,13 +27,15 @@ O=/Applications/oMLX.app/Contents/Resources
 PY="$O/Python/cpython-3.11/bin/python3.11"
 MODEL=${Q38_MODEL:-/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B}
 export PYTHONPATH="$O/Python/framework-mlx-base/lib/python3.11/site-packages:$O:${Q38_ANE_ENGINE:-$REPO}"
-[[ -x "$PY" ]] || { echo "oMLX python not found at $PY"; exit 1; }
+require_omlx() {
+  [[ -x "$PY" ]] || { echo "oMLX python not found at $PY"; exit 1; }
+}
 
 cmd=${1:-serve}; shift 2>/dev/null || true
 case "$cmd" in
-  serve) exec "$PY" -u -P "$REPO/tools/ane_serve.py" --model "$MODEL" "$@" ;;
-  bench) exec "$PY" -u -P "$REPO/tools/ane_serve.py" --model "$MODEL" --bench "$@" ;;
-  spec)  exec "$PY" -u -P "$REPO/tools/mtp_specdec.py" --model "$MODEL" "$@" ;;
+  serve) require_omlx; exec "$PY" -u -P "$REPO/tools/ane_serve.py" --model "$MODEL" "$@" ;;
+  bench) require_omlx; exec "$PY" -u -P "$REPO/tools/ane_serve.py" --model "$MODEL" --bench "$@" ;;
+  spec)  require_omlx; exec "$PY" -u -P "$REPO/tools/mtp_specdec.py" --model "$MODEL" "$@" ;;
   pure-inspect) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane.py" --model "$MODEL" inspect "$@" ;;
   pure-loader-smoke) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane.py" --model "$MODEL" loader-smoke "$@" ;;
   pure-projection-smoke) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane.py" --model "$MODEL" projection-smoke "$@" ;;

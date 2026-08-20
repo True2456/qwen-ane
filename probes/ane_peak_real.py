@@ -153,55 +153,56 @@ def measure(p, M, H, S, deq=None, n=11):
     return ts[len(ts) // 2], rel
 
 
-REAL = (
-    ("mlp gate+up  [34816,5120]", 34816, 5120),
-    ("mlp down     [5120,17408]", 5120, 17408),
-    ("gdn in_proj  [16480,5120]", 16480, 5120),
-    ("attn qkv     [14336,5120]", 14336, 5120),
-    ("lm_head/4    [62080,5120]", 62080, 5120),
-)
+if __name__ == "__main__":
+    REAL = (
+        ("mlp gate+up  [34816,5120]", 34816, 5120),
+        ("mlp down     [5120,17408]", 5120, 17408),
+        ("gdn in_proj  [16480,5120]", 16480, 5120),
+        ("attn qkv     [14336,5120]", 14336, 5120),
+        ("lm_head/4    [62080,5120]", 62080, 5120),
+    )
 
-print("1. Real projections at S=512, TFLOP/s by weight precision")
-print(f"  {'projection':>28} {'fp16':>8} {'int8':>8} {'int4':>8}   {'int4 ms':>8}")
-for label, M, H in REAL:
-    S, cells, ms4 = 512, "", None
-    for bits in (16, 8, 4):
-        p, _ = build(M, H, S, bits)
-        if p is None:
-            cells += f"{'rej':>8}"; continue
-        ms, _ = measure(p, M, H, S)
-        if ms is None:
-            cells += f"{'ZERO':>8}"
-        else:
-            cells += f"{2*M*H*S/(ms/1000)/1e12:>8.1f}"
-            if bits == 4:
-                ms4 = ms
-        del p
-    tail = f"{ms4:>8.2f}" if ms4 else f"{'--':>8}"
-    print(f"  {label:>28}{cells}   {tail}", flush=True)
+    print("1. Real projections at S=512, TFLOP/s by weight precision")
+    print(f"  {'projection':>28} {'fp16':>8} {'int8':>8} {'int4':>8}   {'int4 ms':>8}")
+    for label, M, H in REAL:
+        S, cells, ms4 = 512, "", None
+        for bits in (16, 8, 4):
+            p, _ = build(M, H, S, bits)
+            if p is None:
+                cells += f"{'rej':>8}"; continue
+            ms, _ = measure(p, M, H, S)
+            if ms is None:
+                cells += f"{'ZERO':>8}"
+            else:
+                cells += f"{2*M*H*S/(ms/1000)/1e12:>8.1f}"
+                if bits == 4:
+                    ms4 = ms
+            del p
+        tail = f"{ms4:>8.2f}" if ms4 else f"{'--':>8}"
+        print(f"  {label:>28}{cells}   {tail}", flush=True)
 
-print("\n2. Is the fast int4 path arithmetically correct? (max rel vs dequant ref)")
-for label, M, H in (("attn qkv", 14336, 5120), ("mlp down", 5120, 17408)):
+    print("\n2. Is the fast int4 path arithmetically correct? (max rel vs dequant ref)")
+    for label, M, H in (("attn qkv", 14336, 5120), ("mlp down", 5120, 17408)):
+        for bits in (16, 4):
+            p, deq = build(M, H, 512, bits)
+            if p is None:
+                print(f"  {label:>10} int{bits:<3} rejected"); continue
+            ms, rel = measure(p, M, H, 512, deq=deq, n=3)
+            print(f"  {label:>10} int{bits:<3} rel={rel:.2e}  {ms:.2f} ms", flush=True)
+            del p
+
+    print("\n3. down_proj [5120,17408]: does splitting input channels recover it?")
     for bits in (16, 4):
-        p, deq = build(M, H, 512, bits)
-        if p is None:
-            print(f"  {label:>10} int{bits:<3} rejected"); continue
-        ms, rel = measure(p, M, H, 512, deq=deq, n=3)
-        print(f"  {label:>10} int{bits:<3} rel={rel:.2e}  {ms:.2f} ms", flush=True)
-        del p
-
-print("\n3. down_proj [5120,17408]: does splitting input channels recover it?")
-for bits in (16, 4):
-    for parts in (1, 2, 4, 8):
-        M, H, S = 5120, 17408, 512
-        p, deq = (build(M, H, S, bits) if parts == 1
-                  else build_split(M, H, S, bits, parts))
-        if p is None:
-            print(f"  int{bits:<3} parts={parts:<2} rejected"); continue
-        ms, rel = measure(p, M, H, S, deq=deq, n=5)
-        if ms is None:
-            print(f"  int{bits:<3} parts={parts:<2} ZERO"); del p; continue
-        tf = 2*M*H*S/(ms/1000)/1e12
-        print(f"  int{bits:<3} parts={parts:<2} {ms:>8.2f} ms  {tf:>5.1f} TFLOP/s "
-              f"({100*tf/PEAK_FP16:>2.0f}% peak)  rel={rel:.2e}", flush=True)
-        del p
+        for parts in (1, 2, 4, 8):
+            M, H, S = 5120, 17408, 512
+            p, deq = (build(M, H, S, bits) if parts == 1
+                      else build_split(M, H, S, bits, parts))
+            if p is None:
+                print(f"  int{bits:<3} parts={parts:<2} rejected"); continue
+            ms, rel = measure(p, M, H, S, deq=deq, n=5)
+            if ms is None:
+                print(f"  int{bits:<3} parts={parts:<2} ZERO"); del p; continue
+            tf = 2*M*H*S/(ms/1000)/1e12
+            print(f"  int{bits:<3} parts={parts:<2} {ms:>8.2f} ms  {tf:>5.1f} TFLOP/s "
+                  f"({100*tf/PEAK_FP16:>2.0f}% peak)  rel={rel:.2e}", flush=True)
+            del p
