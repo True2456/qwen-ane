@@ -614,6 +614,20 @@ if __name__ == "__main__":
 # LingReference, so the model keeps generating correct text throughout.
 # ---------------------------------------------------------------------------
 
+def _bank(driver, checkpoint, sets, bits, tag):
+    """Build one projection bank and drop its compiler scratch immediately.
+
+    AneLinearProjectionBank does not call discard_compiler_files, so every bank
+    leaves a materialized model directory behind -- 36 GB across one Ling bake,
+    enough to fill the volume. The loaded _ANEInMemoryModel owns its compiled
+    representation, so the scratch is rebuildable and safe to drop.
+    """
+    from pure_ane import AneLinearProjectionBank
+    bank = AneLinearProjectionBank(driver, checkpoint, sets, bits, tag)
+    driver.discard_compiler_files(bank.program)
+    return bank
+
+
 class AneExpertBank:
     """All experts of every MoE layer, baked as int4 constants.
 
@@ -627,8 +641,12 @@ class AneExpertBank:
     (docs/ANE-REFERENCE.md).
     """
 
-    def __init__(self, driver, checkpoint, spec, bits=4, chunks=4):
+    def __init__(self, driver, checkpoint, spec, bits=4, chunks=None):
         from pure_ane import AneLinearProjectionBank
+        # One chunk per router group. `topk_group` of `n_group` groups are live
+        # per token, so only those chunks need dispatching -- the model's own
+        # group-limited routing halves the expert traffic for free.
+        chunks = chunks or spec.n_group
         self.spec, self.chunks = spec, chunks
         per = spec.experts // chunks
         self.per_chunk_rows = per * 2 * spec.moe_intermediate
@@ -642,23 +660,27 @@ class AneExpertBank:
                 sets.append(
                     [spec.expert_name(layer, e, "gate") for e in range(lo, hi)]
                     + [spec.expert_name(layer, e, "up") for e in range(lo, hi)])
-            self.banks.append(
-                AneLinearProjectionBank(driver, checkpoint, sets, bits,
-                                        f"moe_gu_c{c}"))
+            self.banks.append(_bank(driver, checkpoint, sets, bits,
+                                    f"moe_gu_c{c}"))
         self.nbytes = sum(b.nbytes for b in self.banks)
 
-    def gate_up(self, layer, x):
-        """Returns [experts, 2, moe_intermediate] for every expert in the layer."""
+    def gate_up(self, layer, x, groups=None):
+        """gate|up for the routed experts only.
+
+        `groups` is the set of chunk indices actually needed; with chunks
+        aligned to the router's groups that is `topk_group` of `n_group`, so
+        half the chunks are skipped entirely.
+        """
         s = self.spec
         idx = s.moe_layers.index(layer)
         per = s.experts // self.chunks
         M = s.moe_intermediate
-        out = np.empty((s.experts, 2, M), np.float32)
-        for c, bank in enumerate(self.banks):
-            r = bank.run(idx, x.astype(np.float16)).astype(np.float32)
-            g, u = r[:per * M].reshape(per, M), r[per * M:].reshape(per, M)
-            out[c * per:(c + 1) * per, 0] = g
-            out[c * per:(c + 1) * per, 1] = u
+        out = np.zeros((s.experts, 2, M), np.float32)
+        xh = x.astype(np.float16)
+        for c in (range(self.chunks) if groups is None else sorted(groups)):
+            r = self.banks[c].run(idx, xh).astype(np.float32)
+            out[c * per:(c + 1) * per, 0] = r[:per * M].reshape(per, M)
+            out[c * per:(c + 1) * per, 1] = r[per * M:].reshape(per, M)
         return out
 
 
@@ -767,7 +789,8 @@ class LingRuntime(LingReference):
             return super().moe(x, layer)
         s = self.spec
         idx, wts = self.route(x, layer)
-        gu = self.experts.gate_up(layer, x)
+        per = s.experts // self.experts.chunks
+        gu = self.experts.gate_up(layer, x, {int(e) // per for e in idx})
         h = _silu(gu[idx, 0]) * gu[idx, 1]
         h *= wts[:, None]
         out = np.zeros_like(x)
@@ -796,7 +819,7 @@ class AneProjectionBanks:
     """
 
     def __init__(self, driver, checkpoint, spec, bits=8):
-        from pure_ane import AneLinearProjectionBank as B
+        B = _bank
         self.spec = spec
         kda, mla = spec.linear_attention_layers, spec.full_attention_layers
         an = spec.attention_names
@@ -845,7 +868,7 @@ class AneExpertDown:
     PER_BANK = 64
 
     def __init__(self, driver, checkpoint, spec, bits=8):
-        from pure_ane import AneLinearProjectionBank as B
+        B = _bank
         self.spec = spec
         self.split = spec.experts // self.PER_BANK
         self.banks = {}
