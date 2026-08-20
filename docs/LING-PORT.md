@@ -1,6 +1,7 @@
 # Porting Ling-3.0-tiny to the pure ANE runtime
 
-Status: **Stage 0 complete, strategy decided.** Runtime not yet built.
+Status: **Milestones 0-2a done.** Strategy decided, loader verified, KDA
+gate validated on hardware. Recurrence, MLA and MoE blocks not yet built.
 
 Ling-3.0-tiny (`BailingMoeV3` / `bailing_hybrid`) is 7.89B total / 1.38B
 activated, 15.79 GB bf16. 24 layers, hidden 1536, vocab 157184.
@@ -103,11 +104,80 @@ Three additive hunks, all default-preserving; the Qwen path is unchanged:
 3. `AneFinalHead(..., head_name=..., norm_name=...)` instead of hardcoded
    `"lm_head.weight"` / `"model.language_model.norm.weight"`, defaults unchanged.
 
+## Milestone 1: loader and spec, verified against the index
+
+`tools/pure_ling.py` holds `LingSpec`, which reads the architecture from
+`config.json` and then **checks every derived name and shape against the
+checkpoint's tensor index** rather than trusting either. That matters because
+`config.json` carries keys the modeling code never reads
+(`max_window_layers`, `num_kv_heads_for_linear_attn`, `use_qk_norm`), and
+building against them would silently produce the wrong model.
+
+```
+tensors=9283 shards=32
+embedding=model.word_embeddings.weight (157184, 1536)
+full_attention (MLA) layers=[3, 7, 11, 15, 19, 23]
+linear_attention (KDA) layers=[0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 17, 18, 20, 21, 22]
+moe layers=1..23 (23), dense mlp layers=[0]
+PURE_LING_INSPECT=PASS spec matches every verified tensor
+```
+
+`verify()` also cross-checks the layer split against which tensors exist: the
+MLA list must equal the layers carrying `q_a_proj`, and the KDA list the layers
+carrying `A_log`. Both matched.
+
+## Milestone 2a: the KDA safe gate on hardware
+
+`probes/ane_ling_kda_gate.py`, against the real layer-1 `A_log` and `dt_bias`.
+
+The gate is **not** Qwen's GatedDeltaNet form:
+
+```text
+Qwen GDN   g = exp(-exp(A_log) * softplus(a + dt_bias))       per HEAD
+Ling KDA   g = exp(-5 * sigmoid(exp(A_log) * (f + dt_bias)))  per (HEAD, KEY-CHANNEL)
+```
+
+Two consequences. The fp16-safe polynomial softplus in `docs/ANE-REFERENCE.md`
+is **not needed** — this gate is simpler. But the gate is a 2048-vector rather
+than a 16-vector, and `exp(A_log)` (per head, measured 1.4607–2.3331) must be
+folded into both the `f_proj` rows and `dt_bias` at load.
+
+Measured, comparing the two sigmoid spellings against a float64 reference:
+
+| spelling | small \|f'\|≤1 | moderate ≤8 | large ≤40 |
+|---|---:|---:|---:|
+| MIL `sigmoid` | 1.94e-2 | 2.27e-2 | 2.27e-2 |
+| `x/(1+exp(-x))` | **4.43e-3** | 1.01e-2 | 1.38e-2 |
+
+`exp_divide` is 2.2x better, confirming the `sigmoid` warning in
+`docs/ANE-REFERENCE.md`. **Use it.**
+
+Max relative error over all channels is the wrong summary, though. The gate
+multiplies the recurrent state, so a channel at `g ≈ exp(-5)` is being
+deliberately erased and its relative error costs nothing, while a channel at
+`g ≈ 1` persists and compounds. Bucketed:
+
+| g range | count | max rel | max abs |
+|---|---:|---:|---:|
+| [0.0067, 0.02) | 8309 | 6.84e-3 | 1.07e-4 |
+| [0.02, 0.1) | 3453 | 1.01e-2 | 8.44e-4 |
+| [0.1, 0.5) | 4968 | 9.46e-3 | 2.08e-3 |
+| [0.5, 0.9) | 6977 | 4.76e-3 | 2.44e-3 |
+| **[0.9, 1.001)** | 41829 | **8.38e-4** | 7.56e-4 |
+
+Precision is best exactly where it matters: **8.38e-4 in the persisting
+regime, against Qwen's 9.95e-4 decay-error reference.** Mean `|d log g|` is
+4.93e-4. fp16 spacing at the exponent 5 is 3.91e-3, which alone floors the
+small-`g` tail, so the tail figures are at the hardware limit and not worth
+chasing.
+
+The probe also sizes the mistake it exists to catch: using Qwen's softplus gate
+here would be off by up to **9.92x**. That is not a subtle divergence, so the
+layer smoke has a clear number to fail against.
+
 ## Next
 
-Milestones 1–6 are in the plan. Next up: the loader and `pure-ling-inspect`,
-then the KDA layer smoke — where the two things most likely to be silently
-wrong are the **safe gate** (`exp(-5·sigmoid(...))`, *not* softplus; mlx-lm's
-in-tree `bailing_hybrid.py` has the softplus bug and must not be used as an
-oracle) and the **per-(head, key-channel) decay**, which is a 128-vector rather
-than Qwen's per-head scalar.
+Milestone 2b is the KDA recurrence with per-(head, key-channel) decay — Qwen's
+`AneGdnRecurrence` broadcasts a width-1 column per head, and this needs a full
+128-vector, which is the layout question to settle before the layer smoke.
+Then MLA (milestone 3), the MoE block (4), full inference (5), measurement (6).
