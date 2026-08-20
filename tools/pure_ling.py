@@ -663,34 +663,204 @@ class AneExpertBank:
 
 
 class LingRuntime(LingReference):
-    """LingReference with blocks moved onto the ANE, one at a time.
+    """LingReference with blocks moved onto the ANE.
 
     Subclassing the reference keeps every un-ported block exact, so the model
     generates correct text at every stage and each swap can be diffed against
     the parent implementation.
     """
 
-    def __init__(self, checkpoint, spec, engine_path=".", bits=4,
-                 ane_moe=True):
+    def __init__(self, checkpoint, spec, engine_path=".", bits=8,
+                 ane_moe=True, ane_proj=True, ane_down=True):
         super().__init__(checkpoint, spec)
         from pure_ane import AneDriver
         self.driver = AneDriver(engine_path)
         self.bits = bits
         self.experts = (AneExpertBank(self.driver, checkpoint, spec, bits)
                         if ane_moe else None)
-        self.programs = 0 if self.experts is None else len(self.experts.banks)
+        self.proj = (AneProjectionBanks(self.driver, checkpoint, spec, bits)
+                     if ane_proj else None)
+        self.down = (AneExpertDown(self.driver, checkpoint, spec, bits)
+                     if ane_down else None)
+        self.programs = (
+            (len(self.experts.banks) if self.experts else 0)
+            + (self.proj.programs if self.proj else 0)
+            + (self.down.programs if self.down else 0))
+        self.nbytes = ((self.experts.nbytes if self.experts else 0)
+                       + (self.proj.nbytes if self.proj else 0)
+                       + (self.down.nbytes if self.down else 0))
 
+    # ------------------------------------------------------------------ KDA
+    def kda(self, x, layer):
+        if self.proj is None:
+            return super().kda(x, layer)
+        s, n = self.spec, self.attention_names_cached(layer)
+        H, D, P = s.heads, s.head_dim, s.kda_proj_dim
+        i = s.linear_attention_layers.index(layer)
+        fused = self.proj.kda_in.run(i, x.astype(np.float16)).astype(np.float32)
+        q_r, k_r, v_r = fused[:P], fused[P:2*P], fused[2*P:3*P]
+        f, gate_r, beta_r = fused[3*P:4*P], fused[4*P:5*P], fused[5*P:5*P+H]
+
+        hist = self.conv[layer]
+        win = np.concatenate([hist, np.concatenate([q_r, k_r, v_r])[:, None]], 1)
+        cw = np.concatenate([self.w(n[f"{k}_conv"]).reshape(P, s.conv_kernel)
+                             for k in ("q", "k", "v")])
+        conv = (win * cw).sum(-1)
+        self.conv[layer] = win[:, 1:]
+        q, k, v = (_silu(conv[:P]).reshape(H, D), _silu(conv[P:2*P]).reshape(H, D),
+                   _silu(conv[2*P:]).reshape(H, D))
+        q = q / np.linalg.norm(q, axis=-1, keepdims=True)
+        k = k / np.linalg.norm(k, axis=-1, keepdims=True)
+        beta = _sigmoid(beta_r)
+        a = np.exp(self.w(n["a_log"]))[:, None]
+        g = np.exp(s.kda_lower_bound
+                   * _sigmoid(a * (f.reshape(H, D) + self.w(n["dt_bias"]).reshape(H, D))))
+        S = self.state[layer] * g[:, None, :]
+        delta = (v - np.einsum("hvd,hd->hv", S, k)) * beta[:, None]
+        S = S + delta[:, :, None] * k[:, None, :]
+        self.state[layer] = S
+        y = _rms(np.einsum("hvd,hd->hv", S, q), self.w(n["o_norm"]), s.rms_eps * D)
+        y = (y * _sigmoid(gate_r).reshape(H, D)).reshape(-1)
+        return self.proj.kda_out.run(i, y.astype(np.float16)).astype(np.float32)
+
+    # ------------------------------------------------------------------ MLA
+    def mla(self, x, layer):
+        if self.proj is None:
+            return super().mla(x, layer)
+        s, n = self.spec, self.attention_names_cached(layer)
+        H, Dn, Dr, Dv = s.heads, s.qk_nope, s.qk_rope, s.v_head_dim
+        i = s.full_attention_layers.index(layer)
+        fused = self.proj.mla_a.run(i, x.astype(np.float16)).astype(np.float32)
+        qa, kva = fused[:s.q_lora_rank], fused[s.q_lora_rank:s.q_lora_rank + s.kv_lora_rank + Dr]
+        gate = _sigmoid(fused[s.q_lora_rank + s.kv_lora_rank + Dr:])
+        qa = _rms(qa, self.w(n["q_a_norm"]), s.rms_eps)
+        q = self.proj.mla_qb.run(i, qa.astype(np.float16)).astype(np.float32)
+        q = q.reshape(H, s.qk_head_dim)
+        q_nope, q_rope = q[:, :Dn], q[:, Dn:]
+        lat, k_rope = kva[:s.kv_lora_rank], kva[s.kv_lora_rank:]
+        lat = _rms(lat, self.w(n["kv_a_norm"]), s.rms_eps)
+        inv = 1.0 / (s.rope_theta ** (np.arange(0, Dr, 2, np.float64) / Dr))
+        fq = self.pos * inv
+        cos, sin = np.cos(np.concatenate([fq, fq])), np.sin(np.concatenate([fq, fq]))
+        half = Dr // 2
+
+        def rope(tt):
+            td = tt.reshape(*tt.shape[:-1], half, 2).swapaxes(-1, -2).reshape(tt.shape)
+            return td * cos + np.concatenate([-td[..., half:], td[..., :half]], -1) * sin
+
+        q_rope, k_rope = rope(q_rope), rope(k_rope)
+        self.kv[layer].append((lat.astype(np.float32), k_rope.astype(np.float32)))
+        kv_b = self.w(n["kv_b"]).reshape(H, Dn + Dv, s.kv_lora_rank)
+        W_K, W_V = kv_b[:, :Dn, :], kv_b[:, Dn:, :]
+        q_abs = np.einsum("hn,hnl->hl", q_nope, W_K)
+        L = np.stack([a for a, _ in self.kv[layer]])
+        R = np.stack([b for _, b in self.kv[layer]])
+        sc = (q_abs @ L.T + q_rope @ R.T) * (s.qk_head_dim ** -0.5)
+        pr = np.exp(sc - sc.max(-1, keepdims=True)); pr /= pr.sum(-1, keepdims=True)
+        attn = np.einsum("hl,hvl->hv", pr @ L, W_V)
+        y = (attn * gate[:, None]).reshape(-1)
+        return self.proj.mla_out.run(i, y.astype(np.float16)).astype(np.float32)
+
+    # ------------------------------------------------------------------ MoE
     def moe(self, x, layer):
         if self.experts is None:
             return super().moe(x, layer)
         s = self.spec
         idx, wts = self.route(x, layer)
-        gu = self.experts.gate_up(layer, x)                   # ANE: all experts
-        h = _silu(gu[idx, 0]) * gu[idx, 1]                    # top-8 only
+        gu = self.experts.gate_up(layer, x)
+        h = _silu(gu[idx, 0]) * gu[idx, 1]
         h *= wts[:, None]
         out = np.zeros_like(x)
         for j, e in enumerate(idx):
-            out += h[j] @ self.wt(self.spec.expert_name(layer, int(e), "down"))
-        m = self.mlp_names_cached(layer)
-        return out + (_silu(x @ self.wt(m["shared_gate"]))
-                      * (x @ self.wt(m["shared_up"]))) @ self.wt(m["shared_down"])
+            if self.down is not None:
+                out += self.down.run(layer, e, h[j]).astype(np.float32)
+            else:
+                out += h[j] @ self.wt(self.spec.expert_name(layer, int(e), "down"))
+        if self.proj is None:
+            m = self.mlp_names_cached(layer)
+            return out + (_silu(x @ self.wt(m["shared_gate"]))
+                          * (x @ self.wt(m["shared_up"]))) @ self.wt(m["shared_down"])
+        si = s.moe_layers.index(layer)
+        sgu = self.proj.shared_gu.run(si, x.astype(np.float16)).astype(np.float32)
+        M = s.moe_intermediate * s.shared_experts
+        sh = _silu(sgu[:M]) * sgu[M:]
+        return out + self.proj.shared_dn.run(si, sh.astype(np.float16)).astype(np.float32)
+
+
+class AneProjectionBanks:
+    """Every dense projection in the model, as procedure banks.
+
+    All of these are plain `x @ W.T` with a shared input dimension, so
+    AneLinearProjectionBank packs them directly: one program per block class,
+    one procedure per layer. No new MIL.
+    """
+
+    def __init__(self, driver, checkpoint, spec, bits=8):
+        from pure_ane import AneLinearProjectionBank as B
+        self.spec = spec
+        kda, mla = spec.linear_attention_layers, spec.full_attention_layers
+        an = spec.attention_names
+
+        # KDA: q|k|v|f|g|b all project from hidden, so they fuse into one conv.
+        self.kda_in = B(driver, checkpoint,
+                        [[an(l)[k] for k in ("q", "k", "v", "f", "gate", "b")]
+                         for l in kda], bits, "kda_in")
+        self.kda_out = B(driver, checkpoint, [[an(l)["out"]] for l in kda],
+                         bits, "kda_out")
+        # MLA: q_a|kv_a|g share the hidden input; q_b and dense do not.
+        self.mla_a = B(driver, checkpoint,
+                       [[an(l)[k] for k in ("q_a", "kv_a", "gate")] for l in mla],
+                       bits, "mla_a")
+        self.mla_qb = B(driver, checkpoint, [[an(l)["q_b"]] for l in mla],
+                        bits, "mla_qb")
+        self.mla_out = B(driver, checkpoint, [[an(l)["out"]] for l in mla],
+                         bits, "mla_out")
+        # shared expert, one procedure per MoE layer
+        mn = spec.mlp_names
+        self.shared_gu = B(driver, checkpoint,
+                           [[mn(l)["shared_gate"], mn(l)["shared_up"]]
+                            for l in spec.moe_layers], bits, "shared_gu")
+        self.shared_dn = B(driver, checkpoint,
+                           [[mn(l)["shared_down"]] for l in spec.moe_layers],
+                           bits, "shared_dn")
+        self.banks = [self.kda_in, self.kda_out, self.mla_a, self.mla_qb,
+                      self.mla_out, self.shared_gu, self.shared_dn]
+        self.nbytes = sum(b.nbytes for b in self.banks)
+        self.programs = len(self.banks)
+
+
+class AneExpertDown:
+    """Per-expert `down`, banked per MoE layer.
+
+    `down` cannot join the stacked form: gate|up concatenate along output rows,
+    but down concatenates along its INPUT axis and each expert consumes a
+    different slice of the activation. So it is dispatched per routed expert --
+    8 per layer -- with the layer's experts as procedures.
+
+    Measured: a bank of 64 procedures compiles, 128 does not, so each layer is
+    split in two. That limit is not the 16-blob rule (the bank packs one blob)
+    nor the 127-program rule; it is a distinct procedure-count ceiling.
+    """
+
+    PER_BANK = 64
+
+    def __init__(self, driver, checkpoint, spec, bits=8):
+        from pure_ane import AneLinearProjectionBank as B
+        self.spec = spec
+        self.split = spec.experts // self.PER_BANK
+        self.banks = {}
+        for layer in spec.moe_layers:
+            for c in range(self.split):
+                lo = c * self.PER_BANK
+                self.banks[(layer, c)] = B(
+                    driver, checkpoint,
+                    [[spec.expert_name(layer, e, "down")]
+                     for e in range(lo, lo + self.PER_BANK)],
+                    bits, f"down_l{layer}_c{c}")
+        self.nbytes = sum(b.nbytes for b in self.banks.values())
+        self.programs = len(self.banks)
+
+    def run(self, layer, expert, h):
+        e = int(expert)
+        bank = self.banks[(layer, e // self.PER_BANK)]
+        return bank.run(e % self.PER_BANK, h.astype(np.float16))
