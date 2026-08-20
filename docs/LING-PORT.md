@@ -1,7 +1,8 @@
 # Porting Ling-3.0-tiny to the pure ANE runtime
 
-Status: **Milestones 0-2b done.** Strategy decided, loader verified, KDA
-gate and recurrence validated on hardware. MLA and MoE blocks not yet built.
+Status: **Milestones 0-3a done.** Strategy decided, loader verified, KDA
+gate and recurrence validated on hardware, MLA algebra and its absorbed
+projections validated. MLA attention core and the MoE block not yet built.
 
 Ling-3.0-tiny (`BailingMoeV3` / `bailing_hybrid`) is 7.89B total / 1.38B
 activated, 15.79 GB bf16. 24 layers, hidden 1536, vocab 157184.
@@ -223,14 +224,72 @@ The fix is exact rather than a fudge: `o_norm` is an RMSNorm applied directly to
 only its epsilon needs multiplying by `Dk`. This is the same reasoning behind
 the 64x carry in Qwen's GDN recurrence (`docs/ARCHITECTURE.md`).
 
+## Milestone 3a: MLA algebra, and the absorbed projections on hardware
+
+Two probes. `ane_ling_mla_ref.py` is a float64 oracle over the real layer-3
+weights and settles the algebra before any MIL exists; `ane_ling_mla_absorb.py`
+runs the piece Qwen's port has no equivalent of.
+
+### The absorbed form is exact, not merely close
+
+| check | rel |
+|---|---:|
+| absorbed vs materialized KV | **1.37e-15** |
+| through the head gate and `dense` | 6.03e-16 |
+
+That is float64 epsilon, so folding `kv_b_proj` into the query and the output is
+an identity rather than an approximation. It pays for itself in cache:
+
+| form | bytes/token/layer | 6 MLA layers at 32K |
+|---|---:|---:|
+| absorbed (512 latent + 64 k_pe) | **1152** | 0.23 GB |
+| materialized K and V | 10240 | 2.01 GB |
+
+### Interleaved RoPE is not optional and not eyeballable
+
+The checkpoint stores rope dims interleaved, and the modeling code's
+non-interleaved branch is literally `x = 1/0` — there is no fallback. Applying
+the wrong one measures rel **2.99e-2 at cosine similarity 0.9989**: output that
+looks almost right. This is why it is a numeric check and not a code review
+item.
+
+### The absorbed maps are grouped convolutions, and the blocks stay diagonal
+
+`q_abs[h] = q_nope[h] @ W_K[h]` (`[128]→[512]`) and `out[h] = W_V[h] @ ctx[h]`
+(`[512]→[128]`) are block-diagonal over 16 heads, i.e. a `groups=H` conv.
+
+| map | fp16 | int8 | int4 |
+|---|---:|---:|---:|
+| `q_abs` `W_K` | **2.95e-4** | 7.36e-3 | 1.75e-1 |
+| `out` `W_V` | **2.38e-3** | 1.13e-2 | 1.91e-1 |
+
+Each row is paired with a head-0 isolation check — head 0's output recomputed
+against head 0's weight alone. It tracks the overall error at every precision,
+which is what proves the conv is genuinely block-diagonal; a grouped conv that
+quietly mixed heads would still produce smallish-looking numbers.
+
+**fp16 is the shipping choice, decided on arithmetic.** `kv_b_proj` is 12.6M
+params across all six MLA layers, so int4 would save 18.9 MB of a 4.48 GB model
+— 0.42% — while measuring 1.8e-1. Consistent with the Ling-3.0-flash result in
+`docs/ANE-MOE-HANDOFF.md` that per-channel int4 on this family measures 2.68e-1.
+
+### Precision plan for the whole model
+
+| block | params | precision | size |
+|---|---:|---|---:|
+| routed experts | 6945.8M | int4 | 3.47 GB |
+| all attention (KDA + MLA) | 383.7M | fp16 | 0.77 GB |
+| embeddings + `lm_head` | 482.9M | int4 | 0.24 GB |
+| **total** | | | **4.48 GB** |
+
 ## Next
 
-Milestone 3 is MLA: LoRA-rank norms, interleaved (GPT-J) RoPE at θ=6e6, and the
-absorbed KV form (512 latent + 64 k_pe per token per layer, against 60 KiB/token
-for materialized KV). Then the MoE block (4), full inference (5), measurement (6).
+Milestone 3b is the MLA attention core itself: scores over the 576-wide absorbed
+key (512 latent + 64 k_pe), softmax, and the context contraction. Structurally
+this is MQA — one shared key stream rather than Qwen's 4 KV heads — so Qwen's
+`AneAttentionCore` and its 256-token streaming design should carry over.
 
-Risks still open, from the plan: interleaved RoPE applied as non-interleaved
-produces plausible but wrong output, and the router's group-limited top-k has
-four easy-to-invert details (sigmoid not softmax; expert_bias steers selection
-only; group score is the sum of the top **2**; weights come from the pre-bias
-scores).
+Then the MoE block (milestone 4). Its four easy-to-invert details are still
+untested: sigmoid rather than softmax scoring, `expert_bias` steering selection
+only, the group score being the sum of the top **2**, and the weights being
+gathered from the **pre-bias** scores.
