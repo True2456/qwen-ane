@@ -1,8 +1,8 @@
 # Porting Ling-3.0-tiny to the pure ANE runtime
 
-Status: **Milestones 0-3a done.** Strategy decided, loader verified, KDA
-gate and recurrence validated on hardware, MLA algebra and its absorbed
-projections validated. MLA attention core and the MoE block not yet built.
+Status: **Milestones 0-3 done.** Strategy decided, loader verified, KDA gate
+and recurrence validated on hardware, MLA fully validated end to end (algebra,
+absorbed projections, attention core). The MoE block is next.
 
 Ling-3.0-tiny (`BailingMoeV3` / `bailing_hybrid`) is 7.89B total / 1.38B
 activated, 15.79 GB bf16. 24 layers, hidden 1536, vocab 157184.
@@ -282,14 +282,57 @@ params across all six MLA layers, so int4 would save 18.9 MB of a 4.48 GB model
 | embeddings + `lm_head` | 482.9M | int4 | 0.24 GB |
 | **total** | | | **4.48 GB** |
 
+## Milestone 3b: the absorbed MLA attention core on hardware
+
+`probes/ane_ling_mla_core.py`. After absorption the query and key are both
+576-wide (512 latent + 64 rope) and there is **one** shared key stream rather
+than Qwen's four KV heads, so this is MQA. Qwen's `AneAttentionCore` layout
+carries over unchanged: width is the head dim, channels carry the query heads,
+the cache rows and the mask.
+
+Because both score terms share one contiguous 576-wide key, `q_abs·lat` and
+`q_rope·k_rope` collapse into a **single matmul** rather than two.
+
+Measured against a float64 reference, cache L=256:
+
+| valid positions | ctx rel | max attention prob | masked-row leak |
+|---:|---:|---:|---:|
+| 1 | 8.76e-6 | 1.0000 | 0.00e+00 |
+| 7 | 1.29e-3 | 0.1879 | 0.00e+00 |
+| 64 | 1.96e-3 | 0.0211 | 0.00e+00 |
+| 255 | 6.34e-3 | 0.0063 | 0.00e+00 |
+| 256 | 5.70e-3 | 0.0061 | 0.00e+00 |
+
+Error grows with cache occupancy, which is fp16 accumulation over more terms;
+Qwen's own core measures 3.83e-3 at L=256, so this is the same regime.
+
+**Masked-row leak is exactly zero at every length.** That column refills the
+masked cache rows with 8-sigma garbage and remeasures the context: any softmax
+mass escaping the mask would move it. An earlier version of this probe tried to
+recover the ANE's probabilities by multiplying the context through a `pinv` of
+the cache and reported 88% argmax agreement — that was measuring the pinv's
+conditioning, not the model, and was replaced.
+
+### One deliberate inefficiency
+
+The value contraction only needs the 512 latent columns, but slicing the width
+down would make the output narrower than the input, which
+`docs/ANE-REFERENCE.md` records as failing with `status=0x1d` unless the output
+surface is allocated explicitly. The full 576 is contracted instead and the 64
+rope columns are discarded on read: 11% more work in one matmul, widths stay
+equal, and the discarded columns are never read so they are arithmetically
+inert.
+
 ## Next
 
-Milestone 3b is the MLA attention core itself: scores over the 576-wide absorbed
-key (512 latent + 64 k_pe), softmax, and the context contraction. Structurally
-this is MQA — one shared key stream rather than Qwen's 4 KV heads — so Qwen's
-`AneAttentionCore` and its 256-token streaming design should carry over.
+Milestone 4, the MoE block. Its four easy-to-invert details are still untested:
 
-Then the MoE block (milestone 4). Its four easy-to-invert details are still
-untested: sigmoid rather than softmax scoring, `expert_bias` steering selection
-only, the group score being the sum of the top **2**, and the weights being
-gathered from the **pre-bias** scores.
+* scoring is **sigmoid**, not softmax, so the 128 scores are independent and do
+  not sum to one
+* `expert_bias` is added **before** group scoring and top-k but steers
+  **selection only**
+* the group score is the sum of the top **2** in each group, not the max or mean
+* the returned weights are gathered from the **pre-bias** scores, then
+  normalized, then scaled by 2.5
+
+Then full inference (5) and measurement (6).
