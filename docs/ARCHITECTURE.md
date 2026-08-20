@@ -2,9 +2,10 @@
 
 There are two backends in this repository. The original hybrid server uses a
 69-program chained layout and leaves sequence cores on MLX/GPU. The standalone
-`tools/pure_ane.py` backend uses 122 quantized or 125 fp16 programs and executes every learned
-tensor operation on the ANE. Both designs are constrained by the private
-runtime's resident-program ceiling; a naive mapping wants several hundred.
+`tools/pure_ane.py` backend uses 122 quantized or 125 fp16 programs at direct
+context 256 and executes every learned tensor operation on the ANE. Both
+designs are constrained by an empirical per-process limit in the private
+`_ANEInMemoryModel` loader; a naive mapping wants several hundred.
 
 ## Pure backend layout
 
@@ -25,6 +26,45 @@ and both target and drafter share four vocabulary projection programs by
 supplying either `model.language_model.norm.weight` or `mtp.norm.weight` as
 runtime data. Totals are 124 programs / 13.16 GB for int4 and 127 programs for
 fp16.
+
+Long context replaces the one direct attention core with a direct core, a
+one-block statistics core, an ANE online-softmax combiner, and selected
+multi-block scan programs. The configured set is chosen to stay within 127
+distinct loaded models:
+
+| long-context configuration | scan groups | total programs |
+|---|---|---:|
+| int4/int8 target | 1, 4, 16, 32 blocks | 127 |
+| int4/int8 + MTP | 1, 32 blocks | 127 |
+| fp16 target | 1 block | 127 |
+| fp16 + MTP | — | unsupported on the current loader path (would need 129) |
+
+Missing group sizes fall back to repeated one-block scans, changing dispatch
+count but not attention math or maximum context.
+
+## Long-context attention state
+
+The checkpoint declares 262,144 positions. For positions 1–256 the original
+direct-softmax core is retained, preserving the qualified short-context token
+path. Later positions use exact online softmax:
+
+```text
+block-major fp16 K/V
+  → ANE scans 256-token blocks (up to 32 blocks per submission)
+  → each scan emits normalized value, block max, scaled exp-sum
+  → ANE pairwise merge emits the exact global normalized value
+```
+
+Every scan uses the same `1/8192` denominator scale. Since it is common to all
+blocks it cancels from the normalized result, while preventing fp16 denominator
+overflow at 256K. K/V storage is `[block, kv_head, 256, head_dim]`, so each
+submitted block is contiguous. Reset only restores the logical offset; stale
+entries remain masked until overwritten, avoiding a 16 GiB clear at 256K.
+
+The 16 target caches consume 64 KiB per configured token in aggregate. MTP's
+17th attention cache adds 4 KiB/token. Dense 256x256 RoPE matrices are held in
+an eight-position lazy cache shared by all attention layers rather than one per
+possible position.
 
 The projection banks are multi-procedure models. Packed weight payload offsets
 inside `weight.bin` are absolute file offsets; treating every payload as if it
@@ -158,8 +198,8 @@ state-layout compiler restriction is handled by the resident IOSurface path.
 The scalar softplus/decay gate passes using an fp16-safe `t*P5(t)` log1p
 approximation. See [FULL-ANE-FEASIBILITY.md](FULL-ANE-FEASIBILITY.md).
 
-The pure backend implements those sequence cores directly: shared grouped-query
-attention at context 256, per-layer causal GDN convolution, polynomial
+The pure backend implements those sequence cores directly: grouped-query
+attention through the checkpoint maximum of 262,144 positions, per-layer causal GDN convolution, polynomial
 softplus/decay/beta, and resident gated-delta state. Its fp16 semantic inference
 test matches the MLX reference prefix without importing a GPU tensor runtime.
 

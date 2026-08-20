@@ -2021,7 +2021,16 @@ output saves only 1.1x). Measured end to end:
 the fused layer's 713 MB gate+up concat, and refuses to write below
 `_CACHE_MIN_FREE` (20 GB) so it cannot fill the boot disk.
 
-## 41. SOLVED: the limit is exactly 127 distinct resident programs
+## 41. CORRECTED: this loader path stops at 127 distinct resident models
+
+**2026-08-20 terminology correction:** the experiments below establish what
+the private `_ANEInMemoryModel` path does in one process; they do not establish
+a strict total hardware program limit. Independent reverse engineering reports
+127 as the hardware's concurrent evaluation-request queue depth. Our 128th
+model fails during load with no evaluations in flight, so these may be separate
+limits or the wrapper may reserve from the same namespace. Keep the empirical
+127 scheduler budget, but describe it as a loader/process constraint until
+unload/reload and the lower `_ANEClient`/`e5rt` path are tested.
 
 `Program load failure (0x50004)` is a **program-count** limit, not memory, not
 blob size, not blob count. Established by prediction rather than correlation:

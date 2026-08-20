@@ -157,12 +157,24 @@ The `(?!Channels =)` lookahead is required — without it the match runs from th
   scale, and no partial sums cross the boundary. This is what makes fused
   projections and vocabulary chunking safe.
 
-## Program limits
+## Private-loader model limit versus hardware queue depth
 
-**Exactly 127 distinct resident programs.** Program 128 fails with
-`Program load failure (0x50004)`. It is not memory (fails with 9.8 GB free, and
-a synthetic build fails at 127 holding only 5.31 GB), not blob size, and not
-blob count.
+**This `_ANEInMemoryModel` path loads 127 distinct models per process.** Model
+128 fails with `Program load failure (0x50004)`. The failure was reproduced
+with 9.8 GB free and with a synthetic 5.31 GB build, so the scheduler must use
+127 as its current loader-path budget.
+
+Do not generalize that measurement into “the ANE can only contain 127 programs.”
+Recent [direct-ANE reverse engineering](https://maderix.substack.com/p/inside-the-m4-apple-neural-engine)
+of the lower command protocol independently reports
+a **queue depth of 127 concurrent evaluation requests**. Our load failure occurs
+before request creation/evaluation and with zero work in flight. It may be a
+per-process compiler/loader resource leak, a model-instance registry limit, or
+the private in-memory wrapper reserving from the same 7-bit namespace. The
+unload lifecycle and lower-level `e5rt`/`_ANEClient` route remain worth testing.
+The upstream [maderix/ANE](https://github.com/maderix/ANE) project likewise
+documents a separate approximately-119 compile limit per process and works
+around it with process restart.
 
 > **Capacity probes must vary the MIL *text*, not just the weights.**
 > `ANECCompile` is content-addressed: identical MIL deduplicates to a single
@@ -187,7 +199,16 @@ attention bank.
   but gives no parallelism: two programs under hints 1 and 2 driven concurrently
   take 3.810 ms against 4.057 ms serialized (1.06×), where true parallelism
   would be 2.03 ms.
-* **~10 TFLOP/s sustained**, flat from S=64 upward. 5.7–6.4 W saturated.
+* **16 cores, 42 TOPS INT8** (M4 is the 38 TOPS part), so ~21 TFLOP/s
+  fp16-equivalent. Measured peak 20.3 TFLOP/s; the model's real projections
+  reach 18.7–19.3 at int4. An earlier revision claimed ~10 TFLOP/s sustained —
+  that was one graph's number, not the hardware's. 5.7–6.4 W saturated.
+* **Weight precision changes throughput at width**, though not at S=32: on
+  `[16480,5120]` at S=512, fp16 7.0 / int8 13.9 / int4 18.7 TFLOP/s. Large
+  fp16 convs are weight-bandwidth-bound.
+* **Deep-input convs tile badly.** `[5120,17408]` runs at 24% of peak and
+  degrades with width. Split the input channels across N convs and sum the
+  partials: 4 parts is 3.81× at S=512 with no accuracy cost.
 * **Weight streaming 150 GB/s**, IOSurface activations 70 GB/s, CoreML state
   7–20 GB/s.
 * **Decode cost is flat from 1 to 32 tokens** — the hardware pads to width 32,

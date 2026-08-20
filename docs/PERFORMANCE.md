@@ -6,10 +6,12 @@ Reproduce with the probes in `probes/` and the scripts in `tools/`.
 ## The headline
 
 **The measured ANE kernel is 1.7× more efficient per joule and ~4.5× slower
-than the measured GPU kernel.** This is sustained performance for the compiled
-graphs below, not the ANE's quoted 38+ TOPS theoretical INT8/FP16 dual-lane
-peak. The gap to that peak is a utilization target, especially for multi-lane
-and more deeply pipelined graphs.
+than the measured GPU kernel** on whole-model decode. That slowness is a
+scheduling result, not an arithmetic ceiling: on the model's real projection
+shapes at int4 the ANE sustains **18.7–19.3 TFLOP/s**, which is 89–92% of this
+part's fp16-equivalent peak. See "The arithmetic ceiling" below — an earlier
+version of this document reported ~10 TFLOP/s as the hardware limit and that
+was wrong.
 
 `sudo tools/tflops_per_watt.sh` — same MLP pinned on each engine, idle-corrected,
 CPU cost of driving each included:
@@ -25,20 +27,109 @@ The GPU buys its 4.7× throughput with **10× the power** (64–84 W vs 6–8 W)
 Note GPU int4 costs *more* power than bf16 for the same throughput — dequant
 overhead.
 
-## Throughput ceiling
+## The arithmetic ceiling
 
-`probes/ane_lane_occupancy.py` — one real 27B MLP, sweeping program width:
+M5 Max's ANE is a 16-core, **42 TOPS INT8** engine (the widely quoted 38 TOPS
+is M4's). TOPS counts two operations per MAC, so 42 TOPS is 21e12 INT8 MACs/s,
+and a dual-lane INT8/FP16 array does half that in fp16 — call it **~21 TFLOP/s
+fp16-equivalent**. Note that M5's headline "4x AI compute" and its ~70 TFLOPS
+FP16 figure describe the *GPU's* per-core Neural Accelerators, which are a
+different unit and not what this repository drives.
 
-| S | ANE ms | GPU ms | ANE TFLOP/s | ANE vs GPU |
-|---|---|---|---|---|
-| 32 | 2.548 | 2.912 | 6.72 | **1.14×** |
-| 64 | 2.948 | 2.706 | 11.61 | 0.92× |
-| 512 | 26.933 | 6.328 | 10.17 | 0.23× |
-| 2048 | 125.046 | 24.654 | 8.76 | 0.20× |
+`probes/ane_peak_tflops.py` and `probes/ane_peak_real.py`, one baked conv per
+measurement, S=512:
 
-The ANE flattens at ~10 TFLOP/s from S=64 up and never improves; the GPU reaches
-~45. The single crossover at S=32 exists only because the GPU is latency-bound
-there, not compute-bound.
+| projection | fp16 | int8 | int4 | int4 % of peak |
+|---|---:|---:|---:|---:|
+| mlp gate+up `[34816,5120]` | 7.0 | 13.9 | **19.1** | 91% |
+| gdn in_proj `[16480,5120]` | 7.0 | 13.9 | **18.7** | 89% |
+| attn qkv `[14336,5120]` | 7.0 | 13.8 | **18.9** | 90% |
+| lm_head chunk `[62080,5120]` | 7.1 | 14.0 | **19.3** | 92% |
+| mlp down `[5120,17408]` | 1.1 | 2.1 | 5.0 | 24% |
+
+The best shape measured anywhere is 20.3 TFLOP/s (int4, `[32768,2048]`,
+S=512), and nothing exceeded it — independent evidence that the real ceiling
+sits near the 21 TFLOP/s the spec implies, and that we are already close to it
+on four of the five shapes.
+
+Two claims elsewhere in this repo were corrected by these measurements:
+
+* **"~10 TFLOP/s sustained, flat from S=64 up" was a property of one graph**,
+  the chained 27B MLP, whose cost is dominated by `down_proj`. It is not a
+  hardware ceiling.
+* **"Decode cost is invariant to weight precision" is true only at S=32**,
+  where dispatch dominates. At prefill widths, int4 is **2.7× fp16** on the
+  same shape. fp16 large-M convs are weight-bandwidth-bound: the array streams
+  weights once per S-tile, so cutting weight bytes 4× converts a
+  bandwidth-bound conv into a compute-bound one.
+
+### `down_proj` is pathological, and splitting it fixes it
+
+`[5120,17408]` — few output rows, very deep input — runs at 24% of peak and,
+uniquely, gets *worse* with width (21.3 µs/token at S=32 against 35.7 at
+S=512). Splitting it into N convs over disjoint input channels and summing the
+partials recovers nearly all of it:
+
+| parts | int4 ms @S=512 | TFLOP/s | % peak | max rel vs dequant ref |
+|---:|---:|---:|---:|---:|
+| 1 | 18.2 | 5.0 | 24% | 7.09e-4 |
+| 2 | 9.2 | 9.9 | 47% | 9.31e-4 |
+| **4** | **4.84** | **18.8** | **90%** | 9.27e-4 |
+| 8 | 4.59 | 19.9 | 95% | 1.37e-3 |
+
+**3.81× on that projection at S=512**, verified against a dequantized-weight
+reference, with error no worse than the unsplit conv at 4 parts. At 8 parts
+fp16 accumulation across partial sums starts to show.
+
+The gain is width-dependent and **exactly 1.00× at S=32**, so this is a
+prefill optimization, not a decode one:
+
+| width | parts=1 | parts=4 | gain |
+|---:|---:|---:|---:|
+| 32 | 0.68 ms | 0.68 ms | 1.00× |
+| 64 | 1.27 | 0.67 | 1.89× |
+| 128 | 4.42 | 1.29 | 3.43× |
+| 512 | 18.47 | 4.85 | 3.81× |
+
+Deployability is bounded by the **16-blobs-per-program** rule. `AneGdnTail`
+already uses 11, and int4 spends two blobs per part (data + scales), so
+parts=2 fits at 13 blobs while parts=4 needs 17. Packing the four payloads
+into one blob at four absolute offsets — the mechanism the projection banks
+already use — would make parts=4 fit, but that is untested.
+
+### Prefill runs 32 wide, and pays about 2.2× for it
+
+Every program in `tools/pure_ane.py` is compiled at `width=32` with at most
+three real lanes, so a 261-token prompt is ~87 sequential passes of the whole
+64-layer stack. Per-token cost at int4, µs/token:
+
+| projection | S=32 | S=64 | S=128 | S=512 | S=512 vs S=32 |
+|---|---:|---:|---:|---:|---:|
+| mlp gate+up | 40.3 | 20.2 | 18.1 | 18.6 | **2.2×** |
+| gdn in_proj | 20.5 | 10.2 | 9.0 | 9.0 | **2.3×** |
+| attn qkv | 17.8 | 8.8 | 7.7 | 7.8 | **2.3×** |
+| mlp down (unsplit) | 21.3 | 19.7 | 34.3 | 35.7 | 0.6× |
+| mlp down (4 parts) | 21.3 | 10.5 | 10.1 | 9.5 | **2.2×** |
+
+Most of the win is already at S=64–128; the curve is flat after that.
+
+**This bounds the projections only.** A 261-token prompt currently measures
+35.9 s ≈ 137 ms/token, while the projection work above totals ~5.2 ms/token at
+S=32 — so projections are a small fraction of prefill, and the rest is
+per-position GDN recurrence, attention, and per-pass dispatch overhead. Wide
+prefill and the `down_proj` split are real and measured, but the whole-prefill
+speedup they buy has not been measured and should not be assumed to be 2.2×.
+
+### The INT8 lane is not reached
+
+Everything above is fp16 arithmetic; int4/int8 weights are dequantized by
+`constexpr_blockwise_shift_scale` before the conv, which is why they buy
+bandwidth rather than MACs. Reaching 42 TOPS needs int8 *activations* into an
+int8 MAC path. int8 and uint8 feature-map inputs do compile, but only through
+a `cast` to fp16 ahead of the conv, so the arithmetic stays fp16; int4
+activations are rejected outright. No MIL spelling was found that engages an
+int8 multiply lane. The remaining ~2× to the INT8 figure is therefore
+unproven and unreached, not merely unoptimized.
 
 ## Whole model
 
@@ -89,6 +180,30 @@ The hardware refuses widths below 32, so a 1-token decode step computes a full
 
 The framework-free equivalent is `tools/ane pure-infer --bits 4 --mtp-draft 2`.
 It uses accept-all-or-longest-prefix rollback and contains no MLX/GPU path.
+
+## Long-context scaling
+
+`--context` now accepts the checkpoint maximum of 262,144. This is a capacity
+result, not a claim that 256K decode has short-chat latency. Attention remains
+O(context). At 256K, each full-attention layer scans 1,024 256-token KV blocks;
+the int4 target groups those into 32 scan submissions plus 31 ANE online-softmax
+merges. Across 16 full-attention layers, dispatch and memory traffic are
+substantial even though all attention arithmetic remains on ANE.
+
+Correctness measurements on M5 Max:
+
+| test | result |
+|---|---|
+| 512 capacity, first streamed position 257 | relative error 2.11e-3 |
+| 262,144 capacity, position 257 | relative error 1.69e-3 |
+| 262,144 capacity, position 8,193 (32-block scan + cross-group merge) | relative error 2.19e-3 |
+| full 64-layer int4, 261-token raw prompt | pass; generated token 248046 |
+
+The full boundary run baked 127 programs / 12.86 GB, ingested 261 prompt
+tokens, and generated one token in 35.934 seconds end-to-end. That run is a
+state-transition qualification, not a decode-throughput benchmark. KV capacity
+is 64 KiB per configured token for the 16 target attention layers: 16 GiB at
+256K, plus 1 GiB if MTP is enabled.
 
 The GPU is flat to T=64 for the same reason (weight-bandwidth-bound), so this
 lever is not ANE-specific.

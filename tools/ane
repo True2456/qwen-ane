@@ -18,6 +18,8 @@
 #   tools/ane pure-infer --prompt 'Reply with exactly: OK' --tokens 4 --bits 16
 #   tools/ane pure-infer --prompt 'Reply with exactly: OK' --tokens 32 --bits 4 --mtp-draft 2
 #   tools/ane pure-infer --raw-prompt --prompt-file prompt.txt --tokens 4 --bits 4 --context 4096
+#   tools/ane pure-serve --bits 4 --context 4096
+#   tools/ane pure-bench --tokens 32 --runs 3
 #
 set -u
 REPO=${0:A:h:h}
@@ -42,5 +44,7 @@ case "$cmd" in
   pure-attention-long-smoke) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane.py" --model "$MODEL" attention-long-smoke "$@" ;;
   pure-attention-layer-smoke) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane.py" --model "$MODEL" attention-layer-smoke "$@" ;;
   pure-infer) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane.py" --model "$MODEL" infer "$@" ;;
-  *)     echo "usage: tools/ane {serve|bench|spec|pure-inspect|pure-loader-smoke|pure-projection-smoke|pure-gdn-conv-smoke|pure-gdn-recurrence-smoke|pure-gdn-layer-smoke|pure-attention-core-smoke|pure-attention-long-smoke|pure-attention-layer-smoke|pure-infer} [args...]"; exit 2 ;;
+  pure-serve) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane_server.py" serve --model "$MODEL" "$@" ;;
+  pure-bench) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane_server.py" bench "$@" ;;
+  *)     echo "usage: tools/ane {serve|bench|spec|pure-inspect|pure-loader-smoke|pure-projection-smoke|pure-gdn-conv-smoke|pure-gdn-recurrence-smoke|pure-gdn-layer-smoke|pure-attention-core-smoke|pure-attention-long-smoke|pure-attention-layer-smoke|pure-infer|pure-serve|pure-bench} [args...]"; exit 2 ;;
 esac

@@ -23,7 +23,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 import numpy as np
 
@@ -1777,7 +1777,8 @@ class AneLongContextAttentionCore:
     buffers and schedules dispatches; it performs no attention arithmetic.
     """
 
-    def __init__(self,driver:AneDriver,length:int,block:int=256):
+    def __init__(self,driver:AneDriver,length:int,block:int=256,
+                 group_sizes:tuple[int,...]=(4,16,32)):
         if length<=block:
             raise ValueError("long-context attention requires length > block")
         self.driver=driver;self.Hq,self.Hkv,self.D=24,4,256
@@ -1838,7 +1839,7 @@ class AneLongContextAttentionCore:
         driver.engine._ensure_io(self.program)
         self.combine=AneAttentionCombine(driver)
         self.groups={n:AneAttentionStreamGroup(driver,n,B)
-                     for n in (2,4,8,16,32)}
+                     for n in group_sizes}
         self.programs=[self.direct_program,self.program,self.combine.program]
         self.programs.extend(group.program for group in self.groups.values())
         self.blocks=self.capacity//B
@@ -1861,7 +1862,11 @@ class AneLongContextAttentionCore:
                      "direct_program","direct_input","input","program",
                      "combine","groups","programs"):
             setattr(other,name,getattr(self,name))
-        other.keys=np.zeros_like(self.keys);other.values=np.zeros_like(self.values)
+        # np.zeros_like eagerly faults these multi-GiB arrays on macOS. Fresh
+        # calloc-backed arrays preserve sparse virtual allocation until a KV
+        # block is actually populated.
+        other.keys=np.zeros(self.keys.shape,self.keys.dtype)
+        other.values=np.zeros(self.values.shape,self.values.dtype)
         other.offset=0
         return other
 
@@ -1915,8 +1920,9 @@ class AneLongContextAttentionCore:
         else:
             state=None;block_index=0
             remaining=-(-valid//self.B)
+            group_order=sorted(self.groups,reverse=True)+[1]
             while remaining:
-                count=next(n for n in (32,16,8,4,2,1) if n<=remaining)
+                count=next(n for n in group_order if n<=remaining)
                 reaches_end=block_index+count== -(-valid//self.B)
                 last_valid=(valid-(block_index+count-1)*self.B
                             if reaches_end else self.B)
@@ -2416,6 +2422,12 @@ class PureAneRuntime:
             raise ValueError(
                 f"requested context {context} exceeds checkpoint limit {model_context}"
             )
+        if context>256 and bits==16 and mtp_draft:
+            raise ValueError(
+                "fp16 long context plus MTP needs 129 distinct in-memory "
+                "models on the current loader path; use int4/int8, disable "
+                "MTP, or use context 256"
+            )
         self.checkpoint, self.bits = checkpoint, bits
         self.context=context
         self.active_lanes = 3
@@ -2468,8 +2480,17 @@ class PureAneRuntime:
             "attention_head"
         )
         self.driver.discard_compiler_files(abank.program)
-        shared_core=(AneAttentionCore(self.driver,context) if context<=256 else
-                     AneLongContextAttentionCore(self.driver,context))
+        if context<=256:
+            shared_core=AneAttentionCore(self.driver,context)
+        else:
+            # Stay within the 127 distinct-model budget observed on this
+            # process's _ANEInMemoryModel loader path. Missing
+            # group sizes fall back to repeated one-block scans, so this only
+            # changes dispatch efficiency, never supported context or math.
+            group_sizes=(() if bits==16 else ((32,) if mtp_draft else (4,16,32)))
+            shared_core=AneLongContextAttentionCore(
+                self.driver,context,group_sizes=group_sizes
+            )
         attention_programs=getattr(shared_core,"programs",[shared_core.program])
         for program in attention_programs:
             self.driver.discard_compiler_files(program)
@@ -2550,9 +2571,14 @@ class PureAneRuntime:
             for prog in (self.mtp.fusion.program,self.mtp.tail.program):
                 self.driver.discard_compiler_files(prog)
             self.program_count+=2;self.blob_bytes+=self.mtp.nbytes
+        cache_capacity=getattr(shared_core,"capacity",context)
+        cache_count=len(aidx)+(1 if self.mtp is not None else 0)
+        self.kv_cache_bytes=(cache_count*2*shared_core.Hkv*cache_capacity*
+                             shared_core.D*np.dtype(np.float16).itemsize)
         assert_standalone("full model bake")
         print(f"PURE_ANE_BAKE=PASS programs={self.program_count} "
               f"blobs={self.blob_bytes/1e9:.2f}GB context={self.context} "
+              f"kv_capacity={self.kv_cache_bytes/1e9:.2f}GB "
               f"seconds={time.time()-start:.1f}",
               flush=True)
 
@@ -2576,6 +2602,27 @@ class PureAneRuntime:
             else:
                 layer.core.offset=saved.attention_offsets[ai];ai+=1
         self.steps=saved.steps
+
+    def reset(self) -> None:
+        """Reset all per-sequence state without recompiling any ANE program.
+
+        Long-context KV arrays are intentionally not zeroed: every valid slot
+        is overwritten before use and attention masks entries beyond ``offset``.
+        This keeps a 256K reset effectively constant-time and preserves sparse
+        virtual-memory allocation.
+        """
+        zero_state=np.zeros((self.recurrence.HK,self.recurrence.Dv),np.float16)
+        for layer in self.layers:
+            if isinstance(layer,_PureGdnLayer):
+                layer.conv.reset()
+                self.recurrence.restore(layer.state,zero_state)
+            else:
+                layer.core.reset()
+        if self.mtp is not None:
+            self.mtp.core.reset()
+        self.steps=0
+        self.last_hidden=None
+        assert_standalone("sequence reset")
 
     def step_many(self,token_ids:list[int])->tuple[np.ndarray,np.ndarray]:
         """Advance 1-3 causal positions, batching all learned weight matmuls."""
@@ -2644,10 +2691,23 @@ class PureAneRuntime:
         return logits[:,0]
 
     def generate(self, tokenizer: StandaloneTokenizer, prompt: str,
-                 max_tokens: int) -> tuple[list[int], float]:
+                 max_tokens: int, *,
+                 on_token: Callable[[int], bool | None] | None = None,
+                 stop_token_ids: set[int] | None = None,
+                 token_selector: Callable[[np.ndarray,list[int]],int] | None = None
+                 ) -> tuple[list[int], float]:
+        """Prefill and decode a sequence, optionally reporting tokens live.
+
+        ``on_token`` runs after a token is committed and can return ``False``
+        to stop. A custom ``token_selector`` enables CPU-side sampling; MTP is
+        used only for the deterministic greedy path because speculative
+        acceptance for sampling requires coupled RNG distributions.
+        """
         ids=tokenizer.encode(prompt)
         if not ids:
             raise ValueError("prompt tokenized to nothing")
+        if max_tokens<1:
+            raise ValueError("max_tokens must be at least 1")
         if len(ids)+max_tokens>self.context:
             raise ValueError(
                 f"prompt plus generation ({len(ids)+max_tokens}) exceeds "
@@ -2663,7 +2723,8 @@ class PureAneRuntime:
             if os.environ.get("PURE_ANE_TRACE_PREFIX") == "1":
                 print(f"prefix={start_at+len(chunk)} token={chunk[-1]} "
                       f"next={int(np.argmax(logits))}",flush=True)
-        if self.mtp is not None and len(ids)>1:
+        use_mtp=self.mtp is not None and token_selector is None
+        if use_mtp and len(ids)>1:
             history=np.stack(prompt_hidden[:-1],axis=1)
             next_ids=ids[1:]
             for start_at in range(0,len(next_ids),self.active_lanes):
@@ -2672,22 +2733,42 @@ class PureAneRuntime:
                     history[:,start_at:start_at+len(chunk)],chunk,
                     project_logits=False
                 )
-        if self.mtp is not None:
+        def select(current:np.ndarray,generated:list[int])->int:
+            if token_selector is None:return int(np.argmax(current))
+            return int(token_selector(current,generated))
+        if use_mtp:
             return self._generate_mtp(
-                int(np.argmax(logits)),prompt_hidden[-1],max_tokens,start
+                int(np.argmax(logits)),prompt_hidden[-1],max_tokens,start,
+                on_token=on_token,stop_token_ids=stop_token_ids
             )
         generated=[]
         for index in range(max_tokens):
-            token=int(np.argmax(logits))
+            token=select(logits,generated)
+            if stop_token_ids and token in stop_token_ids:
+                break
             generated.append(token)
+            if on_token is not None and on_token(token) is False:
+                break
             if index+1<max_tokens:
                 logits=self.step(token)
         return generated,time.perf_counter()-start
 
     def _generate_mtp(self,cur:int,last_hidden:np.ndarray,max_tokens:int,
-                      start:float)->tuple[list[int],float]:
+                      start:float,*,
+                      on_token:Callable[[int],bool | None] | None=None,
+                      stop_token_ids:set[int] | None=None
+                      )->tuple[list[int],float]:
         assert self.mtp is not None
-        generated=[cur];cycles=accepted=0
+        generated=[];cycles=accepted=0
+        def commit(tokens:list[int])->bool:
+            for token in tokens:
+                if len(generated)>=max_tokens:return False
+                if stop_token_ids and token in stop_token_ids:return False
+                generated.append(token)
+                if on_token is not None and on_token(token) is False:return False
+            return True
+        if not commit([cur]):
+            return generated,time.perf_counter()-start
         while len(generated)<max_tokens:
             mtp_saved=self.mtp.snapshot();drafts=[];dh=last_hidden;dtok=cur
             remaining=max_tokens-len(generated)
@@ -2704,7 +2785,7 @@ class PureAneRuntime:
                 n_ok+=1
             if n_ok==len(drafts):
                 additions=drafts+[preds[-1]]
-                generated.extend(additions);accepted+=len(additions)
+                accepted+=min(len(additions),max_tokens-len(generated))
                 cur=preds[-1];last_hidden=verify_hidden[:,-1]
             else:
                 self.restore(target_saved);self.mtp.restore(mtp_saved)
@@ -2715,9 +2796,11 @@ class PureAneRuntime:
                 self.mtp.step_many(
                     replay_hidden,actual_next,project_logits=False
                 )
-                generated.extend(actual_next);accepted+=len(actual_next)
+                additions=actual_next
+                accepted+=min(len(additions),max_tokens-len(generated))
                 cur=fix;last_hidden=replay_hidden[:,-1]
             cycles+=1
+            if not commit(additions):break
         elapsed=time.perf_counter()-start
         print(f"PURE_ANE_MTP=PASS draft={self.mtp_draft} cycles={cycles} "
               f"accepted_per_cycle={accepted/max(1,cycles):.3f}",flush=True)

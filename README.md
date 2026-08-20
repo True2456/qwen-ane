@@ -22,9 +22,35 @@ only the standard library and numpy.
 tools/ane pure-loader-smoke
 tools/ane pure-gdn-layer-smoke --bits 16
 tools/ane pure-attention-layer-smoke --bits 16
+tools/ane pure-attention-long-smoke --context 262144 --valid 8193
 tools/ane pure-infer --bits 16 --tokens 4 --verify-reference
 tools/ane pure-infer --bits 4 --tokens 32 --mtp-draft 2
+tools/ane pure-infer --bits 4 --context 4096 --prompt-file prompt.txt --tokens 32
 ```
+
+For chat clients and repeatable benchmarks, keep the pure model resident:
+
+```bash
+tools/ane pure-serve --bits 4 --context 4096 --port 1240
+
+# In another terminal; this reuses the already-baked model for every run.
+tools/ane pure-bench --url http://127.0.0.1:1240 --tokens 32 --runs 3 --warmup 1
+```
+
+The persistent endpoint is OpenAI-compatible at
+`http://127.0.0.1:1240/v1`. It implements `GET /v1/models`,
+`POST /v1/chat/completions` (streaming and non-streaming),
+`POST /v1/completions`, `POST /v1/benchmarks`, and `GET /metrics`. The model is
+compiled once at process start. Requests are serialized because GDN and KV
+caches are mutable; before each independent request those caches are reset
+without unloading or recompiling ANE programs. Full conversation history in a
+chat request is prefetched from clean state. Prefix/session cache reuse is not
+implemented yet.
+
+Greedy decode uses pure MTP when `--mtp-draft` is enabled. Nonzero
+`temperature` uses CPU-side sampling over ANE-produced logits and therefore
+disables speculative MTP for that request; no learned model arithmetic leaves
+the ANE. Tool schemas and multimodal content are not implemented yet.
 
 The complete 64-layer scheduler now bakes and dispatches without a GPU or MLX:
 
@@ -42,11 +68,49 @@ same four-token reference prefix in 4.791 seconds with 12.86 GB of blobs. In a
 semantically equivalent reasoning. Int8 matched the MLX reference for 16 tokens
 and then took a different but correct path, producing the requested `OK`. This
 is strong evidence that both formats work, but not yet a broad benchmark.
-`pure-infer`
-continues to default to fp16. CPU work is limited to tokenization,
+`pure-infer` continues to default to fp16. CPU work is limited to tokenization,
 embedding-row selection, IOSurface byte movement, cache bookkeeping, and greedy
-sampling; all learned tensor arithmetic, attention, GDN convolution and
+or probabilistic token selection; all learned tensor arithmetic, attention, GDN convolution and
 recurrence, normalization, MLPs, and the final head run on the ANE.
+
+### Context up to 256K
+
+The pure backend accepts `--context` from 256 through the checkpoint's declared
+maximum of **262,144 tokens**. The original direct-softmax program remains in
+use through position 256. Above that boundary, KV is stored block-major and
+the ANE scans 256-token blocks in grouped submissions, returning stable-softmax
+statistics that a weight-free ANE program merges exactly. The host schedules
+and copies buffers but performs no attention arithmetic. Dense RoPE matrices
+are generated lazily for only the active positions instead of preallocating a
+262K-position table.
+
+```bash
+# Reproducible boundary and multi-block numerical test at 256K capacity:
+tools/ane pure-attention-long-smoke --context 262144 --valid 8193
+
+# Long prompts are easier to supply by file:
+tools/ane pure-infer --bits 4 --context 262144 \
+  --raw-prompt --prompt-file prompt.txt --tokens 32
+```
+
+The 16 target attention layers require **64 KiB per configured token** in
+aggregate: 256 MiB at 4K, 2 GiB at 32K, and 16 GiB at 256K. MTP adds another
+4 KiB/token (1 GiB at 256K). These caches are fp16 regardless of weight
+quantization. Decode attention remains O(context): 256K is supported for
+correctness and retrieval capacity, but it is not expected to have short-chat
+latency without further cache paging/windowing work.
+
+The integrated 261-token prompt test crossed the old boundary successfully:
+
+```text
+PURE_ANE_BAKE=PASS programs=127 blobs=12.86GB context=512 kv_capacity=0.03GB
+PURE_ANE_EXECUTION=PASS prompt_tokens=261 generated=1 seconds=35.934
+```
+
+The isolated 256K-capacity test passed at position 8,193 with relative error
+`2.19e-3`. All 16 target caches report exactly 16 GiB of logical capacity, but
+fresh calloc-backed blocks remain sparse: the allocation-only test peaked at
+58.8 MB RSS before any KV blocks were populated.
 
 The standalone backend now consumes the checkpoint's one MTP layer without
 MLX. `--mtp-draft 2` batches `[confirmed, draft1, draft2]` through the target's
@@ -73,7 +137,8 @@ cold bake: the private compiler materializes weights and macOS may use swap.
 Deleted files still held open by another application do not count as free
 space (`lsof +L1` is useful when `df` and Finder disagree).
 
-The measured resident-program failure near 134 programs was avoided with
+The measured per-process `_ANEInMemoryModel` load failure at 128 distinct
+models was avoided with
 projection procedure banks (two quantized or five fp16), one shared
 attention-preparation program, one
 shared attention core, and one shared GDN recurrence. This is why the pure
@@ -82,6 +147,13 @@ Pure MTP adds two programs: an fp16 embedding/hidden fusion projection and the
 MTP decoder tail. Its QKV projection is another procedure in the existing
 attention bank, and it shares the target's four dynamically-normalized
 vocabulary-head programs.
+
+This is deliberately described as a limit of the private loader path, not a
+strict hardware total. Recent reverse engineering separately identifies a
+hardware evaluation-queue depth of 127 requests. Our failure occurs while
+loading model 128 with no evaluations in flight (`0x50004`), so the two
+observations must not be conflated; unloading/multiplexing or a lower-level
+dispatch path may remove the resident-model restriction.
 
 ## What actually runs on the ANE
 
@@ -130,12 +202,27 @@ temporal convolution directly into the resident recurrence surface.
 ## Honest summary
 
 The ANE is **1.7× more efficient per joule** than the M5 Max GPU (1.24 vs
-0.74 TFLOP/W) and draws ~6 W against 64–84 W. The quoted 38+ TOPS ANE figure is
-a theoretical INT8/FP16 dual-lane peak; it is not contradicted by this repo's
-~10–16.4 TFLOP/s-equivalent sustained kernels, which measure specific compiled
-graphs. The comparable GPU kernel reaches ~45–48. Whole-model pure int4 now
-measures 2.770 tok/s without MTP and 3.185 with pure MTP; the older hybrid path
-measures 3.5–3.8 tok/s against 8.8 tok/s on the GPU.
+0.74 TFLOP/W) and draws ~6 W against 64–84 W. The comparable GPU kernel reaches
+~45–48 TFLOP/s. Whole-model pure int4 measures 2.770 tok/s without MTP and
+3.185 with pure MTP; the older hybrid path measures 3.5–3.8 tok/s against
+8.8 tok/s on the GPU.
+
+The right ANE figure for M5 Max is **42 TOPS INT8** — 38 TOPS is the M4 part,
+and M5's headline "4× AI compute" belongs to the GPU's per-core Neural
+Accelerators, not to the ANE. 42 TOPS is ~21 TFLOP/s fp16-equivalent, and on
+the model's real projection shapes at int4 the ANE sustains **18.7–19.3
+TFLOP/s, or 89–92% of it**. An earlier claim in this repository that the ANE
+ceilings at ~10 TFLOP/s was wrong: that was one graph's throughput, dominated
+by a `down_proj` shape that tiles badly. Splitting that projection's input
+channels four ways measures **3.81× on it** at S=512 with no accuracy cost.
+
+So the arithmetic is close to spec and the loss is in scheduling: prefill runs
+32 lanes wide, which costs about 2.2× per token on every weight-heavy
+projection. The unreached 2× to the INT8 figure needs int8 activations feeding
+an int8 MAC lane, and no MIL spelling for that was found —
+`constexpr_blockwise_shift_scale` dequantizes to fp16 before the conv, so
+quantization currently buys bandwidth, not MACs. See
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 So this is currently a power-efficiency and GPU-availability result, with real
 unused ANE headroom still visible between whole-model throughput, sustained

@@ -32,7 +32,7 @@ and no GPU synchronization in the decode loop.
 
 ## Current standalone implementation
 
-The pure runtime uses a 256-token context and the following resident layout:
+At direct context 256 the pure runtime uses the following loaded-model layout:
 
 | component | programs |
 |---|---:|
@@ -46,10 +46,12 @@ The pure runtime uses a 256-token context and the following resident layout:
 | final norm + vocabulary head | 4 |
 | **total** | **122 quantized; 125 fp16** |
 
-This is below the observed load failure near 134 resident programs. A previous
-one-program-per-Q/K-norm design failed at layer 38 even with pageable model
-memory, establishing that program resources—not the nominal 128 GB unified-RAM
-capacity—were the immediate ceiling.
+Long context through 262,144 replaces the one attention core with additional
+stream/merge models and reaches 127 loaded models. The current
+`_ANEInMemoryModel` path rejects distinct model 128 with `0x50004`. This is an
+empirical private-loader/process budget, not a claim that the hardware's total
+program capacity is 127; the separately reverse-engineered 127 value describes
+concurrent evaluation queue depth.
 
 End-to-end allocation and dispatch are proven at 12.86 GB int4 and 25.72 GB
 int8. The original quantized semantic failures were measured before the stable
@@ -147,6 +149,7 @@ Measured results:
 | 512 | one monolithic program | compile rejected | — | — |
 | 512 | streamed 256-token chunks | pass | 1.30e-3 | 0.390 ms/chunk |
 | 1024 | streamed 256-token chunks | pass | 1.44e-3 | 0.309 ms/chunk |
+| 8193 | integrated 32-block scan + ANE merge, 256K capacity | pass | 2.19e-3 | — |
 
 The direct program hits a compiler-complexity/shape ceiling above 256 tokens.
 This is not an attention-math ceiling.  The streamed path returns each chunk's
@@ -159,11 +162,12 @@ w_i = sumexp_i * exp(m_i - m)
 y = sum(y_i * w_i) / sum(w_i)
 ```
 
-The current probe performs that tiny combination on CPU.  It uses no GPU.  A
-production implementation can use one shared, weight-free ANE combine program
-or retain the CPU combine (24 heads × a few chunks is negligible arithmetic).
-The KV cache should be stored block-major in 256-token IOSurfaces so no cache
-repacking occurs at dispatch time.
+The original probe performs that tiny combination on CPU. The production pure
+runtime now uses a shared, weight-free ANE combine program, so the host performs
+no attention arithmetic. KV is block-major in 256-token blocks, and scan
+programs handle 1/4/16/32 blocks per submission. A common `1/8192` scaling of
+every exponential sum prevents fp16 denominator overflow at 256K without
+changing relative weights or the normalized result.
 
 RoPE is not a blocker: positions are known to the host, so precomputed sin/cos
 rows can be supplied as data and rotation is elementwise multiply/add.  Q/K
@@ -344,9 +348,9 @@ ANE final norm + lm_head
 CPU sampling
 ```
 
-This graph is implemented in `tools/pure_ane.py` and uses no GPU. The current
-attention core is fixed at 256 positions; the streamed online-softmax design
-above remains the route to longer context. The pure path is not guaranteed to
+This graph is implemented in `tools/pure_ane.py` and uses no GPU. The direct
+attention core handles the first 256 positions and exact streamed online
+softmax extends it through the checkpoint maximum of 262,144. The pure path is not guaranteed to
 beat the hybrid runtime: the ANE still computes at least 32 decode lanes and
 sustains about 10 TFLOP/s. Its purpose is to establish GPU-free throughput,
 tokens per joule, and the true cost of state movement without MLX
@@ -364,12 +368,15 @@ end-to-end throughput from 2.770 to 3.185 tok/s.
 
 ## Remaining order
 
-1. Add exact streamed online-softmax combination for contexts over 256.
-2. Persist compiled artifacts so cold start does not rebake 124/127 programs.
-3. Run broad behavioral/perplexity evaluation of native int4 and int8. Int4
+1. Persist compiled artifacts so cold start does not rebake 124/127 programs.
+2. Build persistent streaming/chat serving and session reset around the now-long-context runtime.
+3. Test the `_ANEInMemoryModel` unload lifecycle or lower-level dispatch route;
+   the observed 127 distinct-model load budget is separate from the reported
+   127-request hardware queue depth.
+4. Run broad behavioral/perplexity evaluation of native int4 and int8. Int4
    now passes the short semantic oracle, so do not replace the format before
    measuring it properly.
-4. Measure steady-state wall power, decode-only throughput, and tokens/joule
+5. Measure steady-state wall power, decode-only throughput, and tokens/joule
    with the standalone process.
-5. Only then test selective GPU overlap against the now-working pure-ANE
+6. Only then test selective GPU overlap against the now-working pure-ANE
    baseline.
