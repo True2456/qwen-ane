@@ -91,6 +91,21 @@ relative error between 6.3e-5 and 7.3e-4.
 substitute caps out near 9216 output channels. Instead return two outputs from
 the MIL func and bind two surfaces (see below). No width limit.
 
+`pad`+`pad`+`add` is not merely limited, it is **expensive**. Measured on the
+Ling KDA recurrence, same arithmetic, only the output spelling changed:
+
+| emit | ms |
+|---|---:|
+| `y` only, 16 channels | 0.118 |
+| state only, 2048 channels | 0.123 |
+| both merged with `pad`+`pad`+`add`, 2064 channels | **0.508** |
+| both as two bound outputs | **0.138** |
+
+The merge costs **+0.385 ms, roughly 4x the entire rest of the program**, and
+two bound outputs recover it (3.7x). The two pads each materialize a full-size
+temporary and the add reads both. Never merge results this way to avoid the
+binding work — the binding is much cheaper than the merge.
+
 **Reduction over a sub-range of channels** — grouped conv, `groups=H`, `Dk→1`
 per group. Verified rel 4e-4.
 

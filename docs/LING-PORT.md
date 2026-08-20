@@ -477,16 +477,66 @@ token ~32 tok/s — past MLX. That single missing op is the difference.
 
 ### The lever that actually changes the answer
 
-Single-token decode is the wrong target. A width-64 dispatch costs the same as
-width-32 (`docs/OPTIMIZATIONS.md`), and Stage 0 measured baked-dense MoE at
-**1.14 ms/token with all 64 lanes filled** against 56.3 at one position. The
-baked path is routing-agnostic, so any 64 positions cost one dispatch — which is
-exactly why Stage 0 chose it over staging, and why staging cannot follow here.
+Single-token decode is the wrong target. Measured, every Ling block except one
+costs the same at width 64 as at width 32:
 
-So the ANE port loses at one token per step and wins by a wide margin on batched
-work. The route to beating 27.3 tok/s is tree-shaped speculation filling those
-lanes, the same conclusion as O1 in `docs/OPTIMIZATIONS.md`, not shaving the
-per-token path.
+| block | S=32 | S=64 | ratio |
+|---|---:|---:|---:|
+| `kda_in`, `kda_out`, all MLA, `moe_gu`, `lm_head`, shared `gate\|up` | — | — | **0.87-1.02x** |
+| `moe_down` | 0.758 | 1.462 | 1.93x |
+| `shared_down` | 0.092 | 0.128 | 1.39x |
+
+Only `moe_down` fails to stay flat, because its 65536-channel activation
+surface grows with width. Everything weight-heavy is free at 64 lanes.
+
+**But the recurrence is not batchable.** KDA state and MLA attention advance one
+position at a time, so 18 KDA layers plus 6 MLA cores are a strictly sequential
+per-position cost no amount of lane filling removes. That is the real wall, and
+it was hiding a bug.
+
+### The recurrence was 4x slower than its own arithmetic
+
+Ling's KDA recurrence measured 0.509 ms/layer-position against Qwen's 0.358,
+despite having 16 heads to Qwen's 48 — a third of the work taking 1.4x the time.
+Decomposing it:
+
+| variant | ms |
+|---|---:|
+| full arithmetic, emit `y` only | 0.118 |
+| full arithmetic, emit state only | 0.123 |
+| emit both via `pad`+`pad`+`add` | 0.508 |
+| **emit both as two bound outputs** | **0.138** |
+
+The arithmetic is 0.12 ms. **Merging the two results into one surface with
+`pad`+`pad`+`add` cost +0.385 ms, four times everything else.** The probe used
+that spelling only to sidestep `_bind_secondary_output`, which is hardcoded for
+width 32 while these outputs are width 128 — a two-line fix, not a design
+constraint. Qwen's GDN recurrence already binds two outputs, which is why it was
+faster with three times the heads.
+
+Fixing it takes the sequential cost from **9.16 to 2.48 ms per position**, and
+the finding is now recorded in `docs/ANE-REFERENCE.md` because it applies to any
+program tempted to merge results.
+
+### Where that leaves the two paths
+
+| path | per token | tok/s | MLX |
+|---|---:|---:|---:|
+| decode, one position per step | ~78.9 ms | **12.7** | 27.3 |
+| batched, 64 lanes filled | ~4.8 ms | **~208** | 25.8 (prompt) |
+
+Batched: 3.32 ms of sequential recurrence and attention, plus ~1.5 ms of
+everything else amortized across 64 lanes.
+
+**So the ANE loses decode by ~2x and wins batched work by ~8x.** Prefill and
+any batch-shaped workload are where this port pays.
+
+**Decode speculation is harder here than for Qwen.** Ling-3.0-tiny sets
+`num_nextn_predict_layers: 0` and the checkpoint contains **zero MTP tensors**,
+so there is no built-in drafter to fill the lanes with. Qwen's 2.385
+accepted-tokens-per-cycle result does not transfer. Filling lanes at decode
+would need an external draft model, prompt-lookup/n-gram speculation, or
+trained Medusa-style heads — none of which exist yet.
 
 ### Cheap wins, in order
 
