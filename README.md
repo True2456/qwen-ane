@@ -260,9 +260,20 @@ That four-way form is now packed into one ANE weight file and enabled by
 default. Complete real tails at width 64 improve **18.4% (GDN)** and **16.8%
 (attention)**, while the current width-32 server remains flat at 3.499 tok/s.
 
-So the arithmetic is close to spec and the loss is in scheduling: prefill runs
-32 lanes wide, which costs about 2.2× per token on every weight-heavy
-projection. The unreached 2× to the INT8 figure needs int8 activations feeding
+So the arithmetic is close to spec and much of the loss is in scheduling.
+Prefill now groups complete 16-token blocks through one shared, weight-free GDN
+program containing all 16 ordered recurrent steps. Q/K normalization, softplus,
+decay, sigmoid gates, state updates, and outputs all remain on the ANE; prefix
+state enters and leaves the graph directly. This reduces a real layer's GDN
+block from 12.756 to **3.499 ms (3.65×)**. The compiler rejects both dense
+affine-state scans and Qwen's multi-query chunk matmuls, while a 64-token
+unrolled graph is slower, so 16 is the measured deployment point. On the
+production server a 148-token prompt fell from the earlier ~137 ms/token class
+to **41.31 ms/token**, with warmed decode unchanged at 3.53–3.65 tok/s and
+prefix-cache reuse still working. Partial prompt blocks and decode retain the
+one-step recurrence; see
+[docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md#o3a-fuse-the-gdn-recurrence-across-a-prompt-block-deployed).
+The unreached 2× to the INT8 figure needs int8 activations feeding
 an int8 MAC lane, and no MIL spelling for that was found —
 `constexpr_blockwise_shift_scale` dequantizes to fp16 before the conv, so
 quantization currently buys bandwidth, not MACs. See

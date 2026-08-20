@@ -1,7 +1,7 @@
 # Porting Ling-3.0-tiny to the pure ANE runtime
 
-Status: **Milestones 0-2a done.** Strategy decided, loader verified, KDA
-gate validated on hardware. Recurrence, MLA and MoE blocks not yet built.
+Status: **Milestones 0-2b done.** Strategy decided, loader verified, KDA
+gate and recurrence validated on hardware. MLA and MoE blocks not yet built.
 
 Ling-3.0-tiny (`BailingMoeV3` / `bailing_hybrid`) is 7.89B total / 1.38B
 activated, 15.79 GB bf16. 24 layers, hidden 1536, vocab 157184.
@@ -175,9 +175,62 @@ The probe also sizes the mistake it exists to catch: using Qwen's softplus gate
 here would be off by up to **9.92x**. That is not a subtle divergence, so the
 layer smoke has a clear number to fail against.
 
+## Milestone 2b: the KDA recurrence fits Qwen's layout unchanged
+
+`probes/ane_ling_kda_step.py`. This was the risk that could have forced a
+redesign: Qwen's `AneGdnRecurrence` decays with a per-head scalar, while KDA's
+decay is per **(head, key-channel)** — a 128-vector per head.
+
+It turned out to be *simpler*, not harder. Qwen stores `state[h,dv,dk]` at
+channel `h*Dk+dk`, width `dv`, so `(h,dk)` **is** the channel index: a
+per-key-channel decay is a per-channel scalar, i.e. a width-1 column broadcast
+across the width — the same idiom `k` and `q` already use. Qwen's per-head
+scalar is the one that needs a grouped-conv broadcast. Everything else (the
+`Dk→1` reduction, the `1→Dk` delta broadcast) is unchanged.
+
+Measured over six *dependent* steps, feeding the ANE's own state forward, against
+a float64 reference:
+
+| step | y rel | state rel |
+|---:|---:|---:|
+| 0 | 1.13e-3 | 8.40e-4 |
+| 2 | 1.58e-3 | 1.20e-3 |
+| 5 | 1.41e-3 | 1.08e-3 |
+
+No drift across steps. Qwen's GDN resident-state reference is 1.06e-3.
+
+Both results leave on one surface: `concat` does not exist and `pad`+`add` caps
+near 9216 channels, comfortably above the 2064 needed (`HK`=2048 state + `H`=16
+output). That avoids the secondary-output binding helper, which is hardcoded for
+width 32 while these outputs are width 128.
+
+### `q` must not be pre-scaled by `Dk**-0.5`
+
+The reference kernel scales `q` by `128**-0.5 = 0.0884` before the readout.
+Doing that ahead of the ANE step is a **9x accuracy loss**:
+
+| q scale | typical \|s2·q\| | y rel |
+|---|---:|---:|
+| `Dk**-0.5` | 5.08e-05 — **denormal** | 1.91e-2 |
+| l2 only | 5.20e-04 | 2.06e-3 |
+| × 8 | 4.66e-03 | 1.32e-3 |
+
+fp16's smallest normal is 6.10e-05, so the pre-scaled products fall into the
+denormal range and lose precision before the reduction ever runs.
+
+The fix is exact rather than a fudge: `o_norm` is an RMSNorm applied directly to
+`y`, and RMSNorm is scale-invariant, so the factor is absorbed completely —
+only its epsilon needs multiplying by `Dk`. This is the same reasoning behind
+the 64x carry in Qwen's GDN recurrence (`docs/ARCHITECTURE.md`).
+
 ## Next
 
-Milestone 2b is the KDA recurrence with per-(head, key-channel) decay — Qwen's
-`AneGdnRecurrence` broadcasts a width-1 column per head, and this needs a full
-128-vector, which is the layout question to settle before the layer smoke.
-Then MLA (milestone 3), the MoE block (4), full inference (5), measurement (6).
+Milestone 3 is MLA: LoRA-rank norms, interleaved (GPT-J) RoPE at θ=6e6, and the
+absorbed KV form (512 latent + 64 k_pe per token per layer, against 60 KiB/token
+for materialized KV). Then the MoE block (4), full inference (5), measurement (6).
+
+Risks still open, from the plan: interleaved RoPE applied as non-interleaved
+produces plausible but wrong output, and the router's group-limited top-k has
+four easy-to-invert details (sigmoid not softmax; expert_bias steers selection
+only; group score is the sum of the top **2**; weights come from the pre-bias
+scores).

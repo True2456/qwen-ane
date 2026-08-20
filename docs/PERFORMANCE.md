@@ -124,12 +124,27 @@ three real lanes, so a 261-token prompt is ~87 sequential passes of the whole
 
 Most of the win is already at S=64–128; the curve is flat after that.
 
-**This bounds the projections only.** A 261-token prompt currently measures
+**This bounds the projections only.** The original 261-token measurement was
 35.9 s ≈ 137 ms/token, while the projection work above totals ~5.2 ms/token at
-S=32 — so projections are a small fraction of prefill, and the rest is
-per-position GDN recurrence, attention, and per-pass dispatch overhead. Wide
-prefill and the `down_proj` split are real and measured, but the whole-prefill
-speedup they buy has not been measured and should not be assumed to be 2.2×.
+S=32 — so projections were a small fraction of prefill, and most time was in
+per-position GDN recurrence, attention, and per-pass dispatch overhead.
+
+The production runtime now handles each complete 16-token prompt block with a
+single shared GDN recurrence program. The graph performs the exact ordered
+Qwen recurrence, Q/K RMS normalization, polynomial softplus, decay and sigmoid
+gating on the ANE, and chains arbitrary incoming compact state. A continued
+real layer-0 block measures 3.499 ms versus 12.756 ms stepwise (**3.65×**),
+with identical fused and production-stepwise output/state. Sixty-four tokens
+measure 54.310 versus 48.693 ms and are intentionally not selected.
+
+End to end, a 148-token prompt (nine fused blocks plus a four-token remainder)
+measured **41.31 ms/token** over two warm runs. Decode remained **274–283
+ms/token (3.53–3.65 tok/s)**. Exact prefix-cache reuse also passed with 23
+tokens reused, zero evaluated, and 6.8 ms to cached logits. These figures are
+from the int4, context-4096, MTP-off server with 126 resident programs; partial
+blocks and decode continue to use the one-step recurrence. MTP draft-2 also
+loads at exactly 127 resident programs and passed semantic and speculative
+generation checks.
 
 ### The INT8 lane is not reached
 

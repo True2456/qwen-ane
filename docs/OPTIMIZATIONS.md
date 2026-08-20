@@ -250,6 +250,74 @@ own programs. Widths must be a multiple of 32 — **measured** today, S=48 build
 but fails `evaluate` with `status=0x1d`, which is the documented 64-byte
 row-stride rule.
 
+#### O3a. Fuse the GDN recurrence across a prompt block. *(deployed)*
+
+The projection-only O3 result does not solve the dominant GDN prefill problem:
+the current runtime still submits one resident-state recurrence evaluation per
+token and per GDN layer. `probes/ane_gdn_scan64.py` now qualifies three exact
+formulations using real layer-0 int4 projection and causal-convolution inputs,
+with every token output and the final `48×128×128` state checked against both
+NumPy and the production ANE recurrence.
+
+**Measured compiler boundary.** The obvious associative affine scan is exact,
+but its transition is a per-head `128×128` matrix, not a scalar decay. General
+dynamic `128×128` transition composition is rejected by the private compiler
+even at two tokens. Qwen's official chunked delta rule avoids those dense
+transitions, but its first multi-query token-space product
+`N×128 · 128×N` is also rejected. The accepted dynamic attention graph in this
+backend is decode-shaped; adding softmax and the value product did not make a
+multi-token query axis compile at N=2 or N=32. This rules out describing the
+current compiler as supporting a parallel 64-position GDN scan.
+
+**Deployed fallback.** One shared, weight-free ANE program contains 16 exact
+recurrent steps, including raw Q/K RMS normalization, polynomial softplus,
+decay, sigmoid beta, state updates, and output contractions. It accepts and
+returns the production compact state, so prompt blocks and restored prefix
+caches chain without CPU model arithmetic. This is sequential in dependency
+order inside the graph, but removes 15 submissions and state-surface round
+trips. It costs one program-budget slot, not one per layer.
+
+**Measured real layer-0 continuation after a 32-token prefix:**
+
+| block | fused ANE | stepwise ANE | speedup | fused vs step output/state |
+|---:|---:|---:|---:|---:|
+| 2 | 0.633 ms | 2.181 ms | 3.45× | identical |
+| **16** | **3.499 ms** | **12.756 ms** | **3.65×** | **identical** |
+| 64 | 54.310 ms | 48.693 ms | 0.90× | numerically passes, rejected for deployment |
+
+The earlier 4.27× result was optimistic because Q/K normalization and gates
+were precomputed by NumPy for the scan while included in the stepwise baseline.
+The deployed 3.65× result times all of that model arithmetic inside the ANE
+graph. Sixteen is the selected block; the compiler scheduler crosses a cliff
+before 64.
+
+To let the rest of the model consume 16 positions without another 64-program
+prefill set, RMSNorm was vectorized: transpose `[channels, lanes]` to put
+channels on the compiler-supported width reduction axis, normalize every lane
+together, then transpose the denominators back. The standalone 16-lane test
+measured 1.35e-3 relative error and 0.133 ms. A complete chained GDN tail is
+bit-identical through the 3- and 16-lane APIs; one lane measured 3.08 versus
+3.12 ms, while 16 lanes measured 3.16 versus 18.88 ms as six old calls.
+
+**Measured production server, int4/context 4096, MTP off:**
+
+| test | result |
+|---|---:|
+| resident programs | 126 |
+| semantic check | exact `OK` |
+| 148-token prompt, two warm runs | **41.31 ms/token mean** |
+| earlier 261-token baseline | ~137 ms/token |
+| warmed decode | **274–283 ms/token (3.53–3.65 tok/s)** |
+| exact 23-token prefix hit | 23 reused, 0 evaluated, 6.8 ms to cached logits |
+
+The 148-token profile contained nine full 16-token blocks and one four-token
+remainder. Its 624 GDN recurrence calls are exactly 432 fused layer calls plus
+192 stepwise remainder calls, confirming that production—not only the probe—
+uses the new path. Partial blocks and decode retain the one-step recurrence.
+The MTP configuration also loads successfully at the 127-program boundary;
+`--mtp-draft 2` passed exact `OK` generation and a six-token speculative run
+with `mtp_used=true`.
+
 ### O4. Keep weights at int4; do not "upgrade" for accuracy without measuring
 
 **Measured** — `probes/ane_peak_real.py`, same shape, S=512: fp16 7.0, int8

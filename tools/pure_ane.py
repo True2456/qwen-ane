@@ -417,8 +417,8 @@ def _stable_rms_block(source: str, output: str, channels: int, width: int,
     if not 1 <= active_lanes <= width:
         raise ValueError(f"invalid active RMS lanes {active_lanes}/{width}")
     if active_lanes > 1:
-        return _stable_rms_lanes(
-            source, output, channels, width, weight, prefix, active_lanes
+        return _stable_rms_vectorized(
+            source, output, channels, width, weight, prefix
         )
     eps_root = float(np.float16(1e-3)).hex()
     p = prefix
@@ -438,6 +438,39 @@ def _stable_rms_block(source: str, output: str, channels: int, width: int,
     tensor<fp16, [1, 1, 1, 1]> {p}sd = sqrt(x={p}mse)[name=string("{p}sd")];
     tensor<fp16, [1, 1, 1, 1]> {p}den0 = mul(x={p}max, y={p}sd)[name=string("{p}den0")];
     tensor<fp16, [1, 1, 1, 1]> {p}den = mul(x={p}den0, y=fp16(0x1p-6))[name=string("{p}den")];
+    tensor<fp16, [1, {channels}, 1, {width}]> {p}unit = real_div(x={source}, y={p}den)[name=string("{p}unit")];
+    tensor<fp16, [1, {channels}, 1, {width}]> {output} = mul(x={p}unit, y={weight})[name=string("{output}")];'''
+
+
+def _stable_rms_vectorized(source: str, output: str, channels: int,
+                           width: int, weight: str, prefix: str) -> str:
+    """Overflow-safe independent RMSNorm for every physical lane at once.
+
+    Transposing ``[channels, lanes]`` to ``[lanes, channels]`` moves the
+    otherwise compiler-rejected channel reduction onto the supported width
+    axis. The resulting per-lane denominators transpose back to width scalars
+    and broadcast over the original tensor. Zero-filled inactive lanes remain
+    zero, so one graph serves decode and wide prefill without lane-unrolled
+    work or a second set of weight programs.
+    """
+    eps_root = float(np.float16(1e-3)).hex()
+    p = prefix
+    return f'''    tensor<fp16, [1, {width}, 1, {channels}]> {p}xt = transpose(perm=tensor<int32, [4]>([0,3,2,1]), x={source})[name=string("{p}xt")];
+    tensor<fp16, [1, {width}, 1, {channels}]> {p}abs = abs(x={p}xt)[name=string("{p}abs")];
+    tensor<fp16, [1, {width}, 1, 1]> {p}max0 = reduce_max(axes=tensor<int32, [1]>([3]), keep_dims=bool(true), x={p}abs)[name=string("{p}max0")];
+    tensor<fp16, [1, {width}, 1, 1]> {p}max = maximum(x={p}max0, y=fp16({eps_root}))[name=string("{p}max")];
+    tensor<fp16, [1, {width}, 1, {channels}]> {p}scaled0 = real_div(x={p}xt, y={p}max)[name=string("{p}scaled0")];
+    tensor<fp16, [1, {width}, 1, {channels}]> {p}scaled = mul(x={p}scaled0, y=fp16(0x1p+6))[name=string("{p}scaled")];
+    tensor<fp16, [1, {width}, 1, {channels}]> {p}sq = mul(x={p}scaled, y={p}scaled)[name=string("{p}sq")];
+    tensor<fp16, [1, {width}, 1, 1]> {p}ms = reduce_mean(axes=tensor<int32, [1]>([3]), keep_dims=bool(true), x={p}sq)[name=string("{p}ms")];
+    tensor<fp16, [1, {width}, 1, 1]> {p}er0 = real_div(x=fp16({eps_root}), y={p}max)[name=string("{p}er0")];
+    tensor<fp16, [1, {width}, 1, 1]> {p}er = mul(x={p}er0, y=fp16(0x1p+6))[name=string("{p}er")];
+    tensor<fp16, [1, {width}, 1, 1]> {p}e2 = mul(x={p}er, y={p}er)[name=string("{p}e2")];
+    tensor<fp16, [1, {width}, 1, 1]> {p}mse = add(x={p}ms, y={p}e2)[name=string("{p}mse")];
+    tensor<fp16, [1, {width}, 1, 1]> {p}sd = sqrt(x={p}mse)[name=string("{p}sd")];
+    tensor<fp16, [1, {width}, 1, 1]> {p}den0 = mul(x={p}max, y={p}sd)[name=string("{p}den0")];
+    tensor<fp16, [1, {width}, 1, 1]> {p}den1 = mul(x={p}den0, y=fp16(0x1p-6))[name=string("{p}den1")];
+    tensor<fp16, [1, 1, 1, {width}]> {p}den = transpose(perm=tensor<int32, [4]>([0,3,2,1]), x={p}den1)[name=string("{p}den")];
     tensor<fp16, [1, {channels}, 1, {width}]> {p}unit = real_div(x={source}, y={p}den)[name=string("{p}unit")];
     tensor<fp16, [1, {channels}, 1, {width}]> {output} = mul(x={p}unit, y={weight})[name=string("{output}")];'''
 
@@ -2710,9 +2743,10 @@ class PureAneRuntime:
         if down_proj_parts not in (1,4):
             raise ValueError("down_proj parts must be 1 or 4")
         self.down_proj_parts=down_proj_parts
-        self.active_lanes = 3
-        if not 0 <= mtp_draft < self.active_lanes:
-            raise ValueError(f"MTP draft must be 0..{self.active_lanes-1}")
+        self.active_lanes = 16
+        self.mtp_lanes = 3
+        if not 0 <= mtp_draft < self.mtp_lanes:
+            raise ValueError(f"MTP draft must be 0..{self.mtp_lanes-1}")
         self.mtp_draft=mtp_draft
         self.profile_enabled=profile_decode
         self._profile_phase="idle"
@@ -2723,6 +2757,12 @@ class PureAneRuntime:
         self.driver = AneDriver(engine_path)
         self.recurrence = AneGdnRecurrence(self.driver)
         self.driver.discard_compiler_files(self.recurrence.program)
+        # One shared, weight-free exact 16-position recurrence graph. Importing
+        # lazily avoids a module cycle in the standalone qualification probe;
+        # this class is framework-free and uses the same local ANE driver.
+        from probes.ane_gdn_scan64 import AneGdnUnrolled
+        self.prefill_recurrence = AneGdnUnrolled(self.driver, self.active_lanes)
+        self.driver.discard_compiler_files(self.prefill_recurrence.program)
         shared_prepare = AneAttentionPrepareDynamic(self.driver, context)
         self.driver.discard_compiler_files(shared_prepare.program)
         types = text.get("layer_types") or [
@@ -2772,7 +2812,7 @@ class PureAneRuntime:
         )
         self.driver.discard_compiler_files(layer0_head.program)
         self.layers: list[_PureGdnLayer | _PureAttentionLayer] = []
-        self.program_count = (3+len(attention_programs)+
+        self.program_count = (4+len(attention_programs)+
                               (1 if mtp_bank is not None else 0))
         self.blob_bytes = (layer0_head.nbytes+
                            (mtp_bank.nbytes if mtp_bank is not None else 0))
@@ -2848,7 +2888,7 @@ class PureAneRuntime:
             self.mtp=PureAneMtp(
                 self.driver,checkpoint,_BankProjection(mtp_bank,0),
                 mtp_prepare,shared_core.fork_cache(),self.final_head,bits,
-                self.active_lanes,down_proj_parts
+                self.mtp_lanes,down_proj_parts
             )
             for prog in (self.mtp.fusion.program,self.mtp.tail.program):
                 self.driver.discard_compiler_files(prog)
@@ -3027,18 +3067,51 @@ class PureAneRuntime:
                 activated=layer.conv(projection[:10240])
                 if profiling:record("gdn_conv",started)
                 activated,_=_lane_matrix(activated,10240,self.active_lanes)
-                cores=np.empty((6144,lanes),np.float16)
-                for lane in range(lanes):
-                    q=activated[:2048,lane].reshape(16,128)
-                    k=activated[2048:4096,lane].reshape(16,128)
-                    v=activated[4096:10240,lane].reshape(48,128)
+                if lanes == self.active_lanes:
                     started=time.perf_counter_ns() if profiling else 0
-                    core=self.recurrence(
-                        layer.state,q,k,v,projection[16432:16480,lane],
-                        projection[16384:16432,lane],layer.a_log,layer.dt_bias
+                    raw_q=np.stack([
+                        activated[:2048,lane].reshape(16,128)
+                        for lane in range(lanes)
+                    ])
+                    raw_k=np.stack([
+                        activated[2048:4096,lane].reshape(16,128)
+                        for lane in range(lanes)
+                    ])
+                    values=np.stack([
+                        activated[4096:10240,lane].reshape(48,128)
+                        for lane in range(lanes)
+                    ])
+                    initial=self.recurrence.materialize(layer.state)
+                    self.prefill_recurrence.load(
+                        raw_q,raw_k,values,
+                        projection[16432:16480,:lanes].T,
+                        projection[16384:16432,:lanes].T,
+                        layer.a_log,layer.dt_bias,initial
+                    )
+                    block,state=self.prefill_recurrence.run_loaded()
+                    self.recurrence.restore(
+                        layer.state,
+                        state.astype(np.float16).transpose(0,2,1).reshape(
+                            self.recurrence.HK,self.recurrence.Dv
+                        )
                     )
                     if profiling:record("gdn_recurrence",started)
-                    cores[:,lane]=core.reshape(-1)
+                    cores=block.reshape(lanes,6144).T.astype(
+                        np.float16,copy=False
+                    )
+                else:
+                    cores=np.empty((6144,lanes),np.float16)
+                    for lane in range(lanes):
+                        q=activated[:2048,lane].reshape(16,128)
+                        k=activated[2048:4096,lane].reshape(16,128)
+                        v=activated[4096:10240,lane].reshape(48,128)
+                        started=time.perf_counter_ns() if profiling else 0
+                        core=self.recurrence(
+                            layer.state,q,k,v,projection[16432:16480,lane],
+                            projection[16384:16432,lane],layer.a_log,layer.dt_bias
+                        )
+                        if profiling:record("gdn_recurrence",started)
+                        cores[:,lane]=core.reshape(-1)
                 started=time.perf_counter_ns() if profiling else 0
                 result=layer.tail(
                     cores,projection[10240:16384],hidden
@@ -3152,8 +3225,8 @@ class PureAneRuntime:
         self._profile_phase="mtp_prefill"
         if use_mtp and prefilled_tokens==0 and len(ids)>1:
             history=np.stack(prompt_hidden[:-1],axis=1);next_ids=ids[1:]
-            for start_at in range(0,len(next_ids),self.active_lanes):
-                chunk=next_ids[start_at:start_at+self.active_lanes]
+            for start_at in range(0,len(next_ids),self.mtp_lanes):
+                chunk=next_ids[start_at:start_at+self.mtp_lanes]
                 self.mtp.step_many(
                     history[:,start_at:start_at+len(chunk)],chunk,
                     project_logits=False
@@ -3163,8 +3236,8 @@ class PureAneRuntime:
                 raise ValueError("MTP prefix resume requires cached last hidden state")
             history=np.stack([cached_last_hidden]+prompt_hidden[:-1],axis=1)
             next_ids=ids[prefilled_tokens:]
-            for start_at in range(0,len(next_ids),self.active_lanes):
-                chunk=next_ids[start_at:start_at+self.active_lanes]
+            for start_at in range(0,len(next_ids),self.mtp_lanes):
+                chunk=next_ids[start_at:start_at+self.mtp_lanes]
                 self.mtp.step_many(
                     history[:,start_at:start_at+len(chunk)],chunk,
                     project_logits=False
