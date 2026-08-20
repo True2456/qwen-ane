@@ -35,6 +35,7 @@ import logging
 import os
 import shutil
 import struct
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -658,6 +659,20 @@ class AneEngine:
     def __init__(self):
         self._fw = None
         self._available = False
+        # Aggregated startup telemetry for the private compiler/loader path.
+        # A "compile" API call is not necessarily compiler work: recent ANE
+        # builds retain content-addressed compiled artifacts across processes.
+        self.compile_metrics = {
+            "calls": 0,
+            "cache_probe_hits": 0,
+            "cache_load_hits": 0,
+            "source_bytes": 0,
+            "descriptor_seconds": 0.0,
+            "cache_probe_seconds": 0.0,
+            "materialize_seconds": 0.0,
+            "compile_seconds": 0.0,
+            "load_seconds": 0.0,
+        }
         self._init_framework()
 
     def _init_framework(self):
@@ -747,6 +762,7 @@ class AneEngine:
         if not self._available:
             return None
 
+        call_started = time.perf_counter()
         raw_weight_files = raw_weight_files or frozenset()
         keep_alive = []
         entries = {}
@@ -784,19 +800,7 @@ class AneEngine:
             logger.error("multiproc in-memory model creation failed (nil)")
             return None
 
-        # Same on-disk materialisation compile_linear relies on: the compiler
-        # reads model.mil + weights/ from localModelPath, not from the dict.
-        local = _desc(_msg(model, "localModelPath"))
-        if local and local != "(nil)":
-            shutil.rmtree(local, ignore_errors=True)
-            wdir = os.path.join(local, "weights")
-            os.makedirs(wdir, exist_ok=True)
-            with open(os.path.join(local, "model.mil"), "wb") as fh:
-                fh.write(mil_text.encode("utf-8"))
-            for name, data in weights.items():
-                payload = data if name in raw_weight_files else _make_blob(data)
-                with open(os.path.join(wdir, name), "wb") as fh:
-                    fh.write(payload)
+        descriptor_seconds = time.perf_counter() - call_started
 
         copts = {}
         if instance_hint > 0:
@@ -812,33 +816,100 @@ class AneEngine:
             copts[_nsstring("kANEFKeepModelMemoryWiredKey")] = _nsnumber_int(int(_kw))
         opts_dict = _nsdict(copts)
 
-        err_ptr = ctypes.c_void_p(0)
-        Compile = ctypes.CFUNCTYPE(
-            ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))
-        if not Compile(("objc_msgSend", _objc))(
-                model, _sel("compileWithQoS:options:error:"), 21, opts_dict,
-                ctypes.byref(err_ptr)):
-            logger.error("multiproc compile FAILED: %s",
-                         _desc(err_ptr.value) if err_ptr.value else "unknown")
-            return None
-
-        err_ptr = ctypes.c_void_p(0)
-        Load = ctypes.CFUNCTYPE(
-            ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))
-        if not Load(("objc_msgSend", _objc))(
+        # `_ANEInMemoryModel` has a persistent content-addressed compiler
+        # cache, but the old path unconditionally rewrote model.mil/weights and
+        # invoked the compiler.  On a hit, load the cached artifact directly.
+        # If that private behavior changes, the normal materialize+compile path
+        # below remains an automatic fallback.
+        probe_started = time.perf_counter()
+        Exists = ctypes.CFUNCTYPE(
+            ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        cache_hit = bool(Exists(("objc_msgSend", _objc))(
+            model, _sel("compiledModelExists")))
+        probe_seconds = time.perf_counter() - probe_started
+        allow_reuse = os.environ.get("Q38_ANE_REUSE_COMPILED", "1") != "0"
+        loaded_from_cache = False
+        load_seconds = 0.0
+        if cache_hit and allow_reuse:
+            err_ptr = ctypes.c_void_p(0)
+            Load = ctypes.CFUNCTYPE(
+                ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))
+            load_started = time.perf_counter()
+            loaded_from_cache = bool(Load(("objc_msgSend", _objc))(
                 model, _sel("loadWithQoS:options:error:"), 21, opts_dict,
-                ctypes.byref(err_ptr)):
-            logger.error("multiproc load FAILED: %s",
-                         _desc(err_ptr.value) if err_ptr.value else "unknown")
-            return None
+                ctypes.byref(err_ptr)))
+            load_seconds += time.perf_counter() - load_started
+            if not loaded_from_cache:
+                logger.info("cached ANE artifact did not load; recompiling: %s",
+                            _desc(err_ptr.value) if err_ptr.value else "unknown")
+
+        # Same on-disk materialisation compile_linear relies on: the compiler
+        # reads model.mil + weights/ from localModelPath, not from the dict.
+        materialize_seconds = compile_seconds = 0.0
+        if not loaded_from_cache:
+            materialize_started = time.perf_counter()
+            local = _desc(_msg(model, "localModelPath"))
+            if local and local != "(nil)":
+                shutil.rmtree(local, ignore_errors=True)
+                wdir = os.path.join(local, "weights")
+                os.makedirs(wdir, exist_ok=True)
+                with open(os.path.join(local, "model.mil"), "wb") as fh:
+                    fh.write(mil_text.encode("utf-8"))
+                for name, data in weights.items():
+                    payload = data if name in raw_weight_files else _make_blob(data)
+                    with open(os.path.join(wdir, name), "wb") as fh:
+                        fh.write(payload)
+            materialize_seconds = time.perf_counter() - materialize_started
+
+            err_ptr = ctypes.c_void_p(0)
+            Compile = ctypes.CFUNCTYPE(
+                ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))
+            compile_started = time.perf_counter()
+            compiled = bool(Compile(("objc_msgSend", _objc))(
+                    model, _sel("compileWithQoS:options:error:"), 21, opts_dict,
+                    ctypes.byref(err_ptr)))
+            compile_seconds = time.perf_counter() - compile_started
+            if not compiled:
+                logger.error("multiproc compile FAILED: %s",
+                             _desc(err_ptr.value) if err_ptr.value else "unknown")
+                return None
+
+            err_ptr = ctypes.c_void_p(0)
+            Load = ctypes.CFUNCTYPE(
+                ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))
+            load_started = time.perf_counter()
+            loaded = bool(Load(("objc_msgSend", _objc))(
+                    model, _sel("loadWithQoS:options:error:"), 21, opts_dict,
+                    ctypes.byref(err_ptr)))
+            load_seconds += time.perf_counter() - load_started
+            if not loaded:
+                logger.error("multiproc load FAILED: %s",
+                             _desc(err_ptr.value) if err_ptr.value else "unknown")
+                return None
 
         prog = AneProgram(model=model, input_dim=input_dim,
                           output_dim=output_dim, seq_len=seq_len,
                           weight_dequant=np.empty((0, 0), np.float32))
         prog._compile_opts = opts_dict
         prog._keep_alive = keep_alive
+        prog._compile_cache_hit = loaded_from_cache
+        prog._compile_timings = {
+            "descriptor_seconds": descriptor_seconds,
+            "cache_probe_seconds": probe_seconds,
+            "materialize_seconds": materialize_seconds,
+            "compile_seconds": compile_seconds,
+            "load_seconds": load_seconds,
+        }
+        metrics = self.compile_metrics
+        metrics["calls"] += 1
+        metrics["cache_probe_hits"] += int(cache_hit)
+        metrics["cache_load_hits"] += int(loaded_from_cache)
+        metrics["source_bytes"] += sum(len(x) for x in weights.values())
+        for key, value in prog._compile_timings.items():
+            metrics[key] += value
         return prog
 
     def compile_procedure_bank(

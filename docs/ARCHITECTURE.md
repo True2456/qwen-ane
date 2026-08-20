@@ -2,8 +2,9 @@
 
 There are two backends in this repository. The original hybrid server uses a
 69-program chained layout and leaves sequence cores on MLX/GPU. The standalone
-`tools/pure_ane.py` backend uses 122 quantized or 125 fp16 programs at direct
-context 256 and executes every learned tensor operation on the ANE. Both
+`tools/pure_ane.py` backend uses 120 programs at direct context 256 and 125 for
+the default int4 long-context scan set, and executes every learned tensor
+operation on the ANE. Both
 designs are constrained by an empirical per-process limit in the private
 `_ANEInMemoryModel` loader; a naive mapping wants several hundred.
 
@@ -16,25 +17,46 @@ masked stale entries are overwritten before they can become valid. Repeated
 chat and benchmark requests therefore do not recompile and cannot accidentally
 inherit another conversation's state.
 
+One prompt-boundary snapshot is retained for automatic prefix reuse. It copies
+the compact GDN recurrence states and convolution histories plus the last hidden
+vector and logits; attention K/V stays in the existing block-major arrays, so
+only logical offsets need snapshotting. A hit is allowed only when the cached
+token tuple is an exact prefix and its execution mode matches (greedy/MTP or
+sampled target-only). New suffix tokens overwrite only positions after that
+boundary. An unrelated request invalidates the entry before overwriting early
+KV slots. This is state caching, not response memoization: decoding still runs.
+
+Reasoning controls are rendered before tokenization, using the three values and
+exact instruction strings in the checkpoint's `tokenizer_config.json`. They
+therefore participate naturally in prefix identity: changing from `medium` to
+`low` or `xhigh` changes the token prefix and forces a safe miss. Generated text
+is split at Qwen's closing `</think>` marker; the implicit opening marker lives
+in the generation prompt. Reasoning, final content, and native tool XML are then
+routed independently to their OpenAI response fields.
+
 ## Pure backend layout
 
-| block | fp16 programs |
+| block | programs |
 |---|---:|
 | 48 GDN depthwise convolutions | 48 |
 | 64 complete layer tails | 64 |
-| four 12-layer GDN projection banks + one attention bank | 5 |
 | shared GDN recurrence, attention prepare, and attention core | 3 |
 | layer-0 norm/projection | 1 |
 | final norm + vocabulary head chunks | 4 |
-| **total** | **125** |
+| **direct-context target total** | **120** |
 
-Pure MTP adds two resident programs. The fusion projection remains fp16 for
+Layers 1–63 have no standalone input-projection dispatch: every preceding tail
+returns both its current hidden state and the next layer's normalized learned
+projection. This keeps the blob count below 16 (13 for GDN, 10 for attention),
+removes the two quantized target projection banks, and saves 63 dispatches.
+
+Pure MTP adds three resident programs: its projection bank plus fusion and
+tail. The fusion projection remains fp16 for
 acceptance quality; the MTP attention/MLP tail uses the selected target
-precision. MTP QKV is procedure 17 in the existing attention projection bank,
+precision. MTP QKV is procedure 0 in its draft-only projection bank,
 and both target and drafter share four vocabulary projection programs by
 supplying either `model.language_model.norm.weight` or `mtp.norm.weight` as
-runtime data. Totals are 124 programs / 13.16 GB for int4 and 127 programs for
-fp16.
+runtime data.
 
 Long context replaces the one direct attention core with a direct core, a
 one-block statistics core, an ANE online-softmax combiner, and selected
@@ -43,9 +65,9 @@ distinct loaded models:
 
 | long-context configuration | scan groups | total programs |
 |---|---|---:|
-| int4/int8 target | 1, 4, 16, 32 blocks | 127 |
-| int4/int8 + MTP | 1, 32 blocks | 127 |
-| fp16 target | 1 block | 127 |
+| int4/int8 target | 1, 4, 16, 32 blocks | 125 |
+| int4/int8 + MTP | 1, 32 blocks | 126 |
+| fp16 target | 1 block | 122 |
 | fp16 + MTP | — | unsupported on the current loader path (would need 129) |
 
 Missing group sizes fall back to repeated one-block scans, changing dispatch
@@ -75,7 +97,7 @@ The 16 target caches consume 64 KiB per configured token in aggregate. MTP's
 an eight-position lazy cache shared by all attention layers rather than one per
 possible position.
 
-The projection banks are multi-procedure models. Packed weight payload offsets
+The remaining MTP projection bank is a multi-procedure-capable model. Packed weight payload offsets
 inside `weight.bin` are absolute file offsets; treating every payload as if it
 started at `0x80` makes procedure 0 appear correct while later procedures read
 the wrong weights. Splitting fp16 GDN projections into 12-layer banks also

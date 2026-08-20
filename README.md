@@ -37,27 +37,64 @@ tools/ane pure-serve --bits 4 --context 4096 --port 1240
 tools/ane pure-bench --url http://127.0.0.1:1240 --tokens 32 --runs 3 --warmup 1
 ```
 
+`pure-serve` quantizes each checkpoint tensor only once. Its default
+Zstandard-compressed cache lives at `~/Library/Caches/q38-pure-ane`; the
+measured int4 cache is 9.18 GB on disk and reduced a full restart from 60.97 s
+to 14.50 s (504/504 quantized-tensor hits, 127/127 compiled-artifact hits).
+Use `--no-bake-cache` to disable it. `GET /v1/metrics` exposes quantize,
+read/decompress, descriptor, compile, and ANE-load phase totals.
+
 The persistent endpoint is OpenAI-compatible at
 `http://127.0.0.1:1240/v1`. It implements `GET /v1/models`,
 `POST /v1/chat/completions` (streaming and non-streaming),
 `POST /v1/completions`, `POST /v1/benchmarks`, and `GET /metrics`. The model is
-compiled once at process start. Requests are serialized because GDN and KV
-caches are mutable; before each independent request those caches are reset
-without unloading or recompiling ANE programs. Full conversation history in a
-chat request is prefetched from clean state. Prefix/session cache reuse is not
-implemented yet.
+loaded once at process start. Requests are serialized because GDN and KV
+caches are mutable. The server automatically retains the most recent prompt
+boundary: when the next request begins with the same token sequence, it restores
+the 48 GDN states, convolution histories, attention/MTP offsets, last hidden
+state, and cached logits, then evaluates only the new suffix. A mismatch resets
+state without unloading or recompiling ANE programs. Set `"prefix_cache":
+false` on a request to force a clean prefill; `/v1/benchmarks` does this by
+default, while `pure-bench --prefix-cache` measures warm-prefix latency.
 
 Greedy decode uses pure MTP when `--mtp-draft` is enabled. Nonzero
 `temperature` uses CPU-side sampling over ANE-produced logits and therefore
 disables speculative MTP for that request; no learned model arithmetic leaves
-the ANE. Tool schemas and multimodal content are not implemented yet.
+the ANE. OpenAI function tools, `tool_choice`, assistant `tool_calls`, tool
+results, and structured streamed/non-streamed tool-call responses are supported
+using Qwen's native tool format internally. Tool-enabled SSE buffers the current
+assistant turn until its XML can be validated and emitted as one structured
+`tool_calls` delta. Multimodal content is not implemented yet.
+
+### Qwen3.8 thinking levels
+
+The server follows this checkpoint's own chat template, whose behavior is not
+the generic OpenAI `low/medium/high` scale. Thinking is enabled by default and
+defaults to `xhigh`. The accepted values are exactly `low`, `medium`, and
+`xhigh`:
+
+```json
+{
+  "enable_thinking": true,
+  "reasoning_effort": "medium"
+}
+```
+
+`low` injects the checkpoint's brief/focused reasoning instruction. `medium`
+intentionally injects no effort instruction. `xhigh` injects its careful
+validation/alternatives instruction. Set `"enable_thinking": false` to use
+the checkpoint's empty `<think>` framing and return only an answer. JSON
+responses put private reasoning in `message.reasoning_content` and the answer
+in `message.content`; SSE uses matching `reasoning_content` and `content`
+deltas. Send `reasoning_content` back on assistant history messages to preserve
+the exact conversation prefix and maximize cache reuse.
 
 The complete 64-layer scheduler now bakes and dispatches without a GPU or MLX:
 
 | precision | ANE programs | learned-weight blobs | status |
 |---|---:|---:|---|
-| per-output int4 | 122 | 12.86 GB | exact for 4 MLX tokens; coherent after divergence; 2.770 tok/s with three-lane prompt ingestion |
-| int4 + pure MTP depth 2 | 124 | 13.16 GB | exact same 32 target tokens; **3.185 tok/s**, 2.385 accepted tokens/cycle |
+| chained int4, long context | 125 | 12.82 GB | identical saved 16-token A/B output; **3.499 tok/s** unprofiled mean |
+| int4 + pure MTP depth 2 | 126 at long context | 13.11 GB | identical target text, but 2.907 tok/s on the current short benchmark; keep opt-in |
 | per-output int8 | 122 | 25.72 GB | exact for 16 MLX tokens; then diverges but correctly answers `OK`; 2.421 tok/s |
 | fp16 | 125 | 51.42 GB | **full semantic inference passes**; known prompt generated the same first four tokens as MLX |
 
@@ -206,8 +243,9 @@ temporal convolution directly into the resident recurrence surface.
 
 The ANE is **1.7× more efficient per joule** than the M5 Max GPU (1.24 vs
 0.74 TFLOP/W) and draws ~6 W against 64–84 W. The comparable GPU kernel reaches
-~45–48 TFLOP/s. Whole-model pure int4 measures 2.770 tok/s without MTP and
-3.185 with pure MTP; the older hybrid path measures 3.5–3.8 tok/s against
+~45–48 TFLOP/s. Whole-model pure int4 now measures **3.499 tok/s** after
+chaining each next-layer projection into the preceding tail; the older hybrid
+path measures 3.5–3.8 tok/s against
 8.8 tok/s on the GPU.
 
 The right ANE figure for M5 Max is **42 TOPS INT8** — 38 TOPS is the M4 part,
@@ -218,6 +256,9 @@ TFLOP/s, or 89–92% of it**. An earlier claim in this repository that the ANE
 ceilings at ~10 TFLOP/s was wrong: that was one graph's throughput, dominated
 by a `down_proj` shape that tiles badly. Splitting that projection's input
 channels four ways measures **3.81× on it** at S=512 with no accuracy cost.
+That four-way form is now packed into one ANE weight file and enabled by
+default. Complete real tails at width 64 improve **18.4% (GDN)** and **16.8%
+(attention)**, while the current width-32 server remains flat at 3.499 tok/s.
 
 So the arithmetic is close to spec and the loss is in scheduling: prefill runs
 32 lanes wide, which costs about 2.2× per token on every weight-heavy

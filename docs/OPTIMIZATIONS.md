@@ -10,6 +10,78 @@ Every claim here is tagged with how it is known:
 
 All figures are M5 Max, Qwen3.8-27B, int4 weights, `tools/pure_ane.py`.
 
+## Startup: quantize once, compile once
+
+**Measured** — `probes/ane_compile_cache.py`, run in two fresh Python
+processes. `_ANEInMemoryModel.compiledModelExists` exposes the private
+framework's content-addressed artifact cache. The loader now checks it and
+loads the artifact directly, falling back to materialize + compile only when
+the direct load fails:
+
+| same identity program | compile | materialize | load | output |
+|---|---:|---:|---:|---|
+| first process | 13.12 ms | 0.94 ms | 15.98 ms | exact |
+| second process | **0** | **0** | 4.71 ms | exact |
+
+**Measured on the complete model before populating the quantized cache** —
+persistent server restart, int4,
+context 4096, 127 programs, 12.86 GB of learned-weight blobs:
+
+| phase | result |
+|---|---:|
+| compiled-artifact hits | **127 / 127** |
+| compiler time | **0.00 s** |
+| compiler input materialization | **0.00 s** |
+| ANE load | 0.46 s |
+| descriptor construction/hash | 5.27 s |
+| BF16 → int4 quantization | **53.96 s** |
+| total startup | 60.97 s |
+
+Compilation was already the small part. The private descriptor
+identity includes the weight payloads, so the host must still recreate or read
+12.86 GB of int4 blobs before it can find the compiled artifact.
+
+The requested fix is the persistent prequantized-weight cache (`--bake-cache`,
+enabled by default under `~/Library/Caches/q38-pure-ane`). It stores each
+row-quantized tensor as a versioned Zstandard frame and validates the exact
+decompressed payload size before use. A sampled 44.57 MB real Qwen tensor
+compressed to 31.32 MB (70.3%). The complete cache occupies 9.18 GB of files
+(8.5 GiB reported by `du`) instead of another raw 12.86-GB copy.
+
+**Measured warm restart after populating that cache:**
+
+| phase | result |
+|---|---:|
+| prequantized tensor hits | **504 / 504** |
+| BF16 → int4 quantization | **0.00 s** |
+| compressed bytes read | 9.18 GB |
+| read + decompress | 7.54 s |
+| compiled-artifact hits | **127 / 127** |
+| compiler time / materialization | **0.00 / 0.00 s** |
+| descriptor construction/hash | 5.20 s |
+| ANE load | 0.45 s |
+| **total server startup** | **14.50 s** |
+
+The cache refuses new writes unless the volume will retain 8 GB of free
+headroom (20 GB on Python versions without Zstandard support).
+`--no-bake-cache` disables it. Exact phase and cache counters are returned by
+`GET /v1/metrics` under `startup`.
+
+### What the “42” roof means
+
+Do not compare the decode table directly to 42 TFLOP/s. Apple officially lists
+a faster **16-core** Neural Engine for M5 Max, but does not publish a 42-TOPS
+precision table. The 42 figure used by the probes is the reported **INT8 TOPS**
+roof, not a 42-TFLOP/s FP16 roof. Under the dual-lane assumption used in this
+repository it corresponds to roughly **21 TFLOP/s FP16-equivalent**. Our best
+measured real-shape int4 kernels at 18.7–20.3 TFLOP/s are therefore about
+89–97% of that arithmetic ceiling. Decode is slow because its width-32 graphs
+use few lanes and pay hundreds of dispatches, not because the saturated array
+is delivering only 10–15 out of an available 42 FP16 TFLOP/s.
+
+Apple's public statement is deliberately less specific: [M5 Max has a faster
+16-core Neural Engine with a higher-bandwidth memory connection](https://www.apple.com/newsroom/2026/03/apple-debuts-m5-pro-and-m5-max-to-supercharge-the-most-demanding-pro-workflows/).
+
 ## Where a decode token actually goes
 
 **Measured** — `probes/ane_decode_budget.py`. Each of the model's real
@@ -83,14 +155,17 @@ today); what is missing is tree-shaped drafting and tree-aware causal masking.
 
 **Unmeasured** — the achieved speedup. Measured inputs that bound it: 68.8%
 per-token MTP acceptance and 2.385 accepted tokens/cycle at depth 2
-(`docs/PERFORMANCE.md`). No number is claimed here; build it and measure.
+(`docs/PERFORMANCE.md`) on the earlier benchmark. After projection chaining,
+the raw `Hello` benchmark sustained only 1.875 accepted tokens/cycle: MTP was
+bit-identical but ran at 2.907 tok/s versus the target's 3.499. No tree-speedup
+number is claimed here; build it and measure.
 
 **Cost** — tree attention masking in the shared attention core, and GDN
 recurrence must advance along the accepted path only. The rollback machinery
 that makes this safe already exists: the scheduler snapshots 48 compact GDN
 states plus convolution histories and replays the proven prefix.
 
-### O2. Split `down_proj` across input channels. *(measured, not deployed)*
+### O2. Split `down_proj` across input channels. *(deployed and measured)*
 
 **Measured** — `probes/ane_peak_real.py`. `[5120,17408]` — few output rows,
 very deep input — runs at 24% of peak and is the only projection that gets
@@ -112,13 +187,38 @@ accumulation across partial sums starts to degrade it.
 that it (a) unlocks O1's 64 free lanes, since unsplit `down_proj` alone doubles
 at S=64, and (b) is worth 3.81× on prefill convolution.
 
-**Cost** — the **16-blobs-per-program** rule. `AneGdnTail` already uses 11
-(`o`,`os`,`d`,`ds`,`gu`,`gus`,`gn`,`gmean`,`grep`,`pn`,`next`), and int4 costs
-two blobs per part, so parts=2 fits at 13 and parts=4 needs 17.
-**Unmeasured** workaround: pack the four payloads into a single blob at four
-absolute offsets, which is the mechanism the projection banks already use
-(`docs/ANE-REFERENCE.md`, procedure-bank weight offsets). Until that is tested,
-parts=2 is the deployable version at 1.93× on the same shape.
+**Implemented workaround for the 16-weight-file rule.** The already-quantized
+int4 matrix is sliced by input channel, preserving its exact nibbles and row
+scales. Four data tensors and four copies of the scale tensor are then stored
+as milinternal records inside one `down.bin`, with file-absolute payload
+pointers and eight MIL offsets. This changes `AneGdnTail` from 13 weight files
+to 12 and `AneAttentionTail` from 10 to 9, so the compiler accepts the complete
+chained programs. No requantization is involved; only fp16 partial-sum order
+can differ. `--down-proj-parts 1` retains the old graph for A/B tests; 4 is the
+pure runtime and server default.
+
+**Measured on real complete tails**, nine post-warmup calls per case:
+
+| complete int4 tail | width | parts=1 | packed parts=4 | change |
+|---|---:|---:|---:|---:|
+| GDN | 32 | 2.421 ms | 2.447 ms | +1.1% |
+| attention | 32 | 2.479 ms | 2.504 ms | +1.0% |
+| GDN | 64 | 3.289 ms | **2.683 ms** | **-18.4%** |
+| attention | 64 | 3.261 ms | **2.714 ms** | **-16.8%** |
+
+Both width-64 graphs passed their full-layer BF16-checkpoint oracle. GDN output
+was unchanged in the sampled layer; attention changed only within the existing
+int4 error envelope (20.37% → 20.33% max-relative error against the unquantized
+layer oracle).
+
+At the current one-token width-32 production setting the packed graph is
+neutral end to end. It emitted identical 16-token text and measured 3.499
+tok/s versus the saved one-way 3.499 tok/s. Profiled decode was 284.82 versus
+284.39 ms/token. Its production purpose is now proven: it removes the
+`down_proj` width-64 cliff needed by O1 without regressing today's server.
+The optional depth-2 MTP configuration also compiled with the packed tail (126
+programs), emitted the same 16-token target text, and retained its measured
+1.875 accepted tokens/cycle; it remains slower than target-only and opt-in.
 
 ### O3. Stop compiling prefill 32 wide. *(measured on projections only)*
 
@@ -162,23 +262,44 @@ warning. The claim elsewhere in this repo that decode is "invariant to weight
 precision" holds **only at S=32**, where dispatch dominates. Any move to int8
 or fp16 for accuracy costs up to 2.7× on every widened path.
 
-### O5. Measure the unattributed half before optimizing it. *(not an optimization yet)*
+### O5. Measure the real production loop. *(completed)*
 
-**Derived** — convolution is 48.9% of the token budget and the measured
-sequence cores add ~26 ms, leaving roughly 160 ms/token (44%) unattributed
-between fused-program overhead, normalization, host IOSurface copies, and
-Python. **This is the largest single bucket in the budget and its contents are
-unknown.**
+**Measured** — `pure-serve --profile-decode`, three 16-token clean-state runs
+after one warmup. The opt-in profiler times the actual `PureAneRuntime` calls
+and is returned under each request's `profile`; cumulative totals are exposed
+by `GET /v1/metrics`. Mean decode was 297.41 ms/token:
 
-`docs/PERFORMANCE.md` records host overhead as negligible on a *single*
-dispatch — `cast 0.001 / write 0.017 / submit 1.882 / read 0.018 ms`, 98% ANE —
-but that was one dispatch of one fused layer, not ~324 dispatches with
-per-layer state copies, and it should not be generalized to the whole token.
+| production phase | ms/token | share |
+|---|---:|---:|
+| 48 GDN tails | 128.56 | 43.2% |
+| 64 projection heads | 49.00 | 16.5% |
+| 16 attention tails | 42.27 | 14.2% |
+| 48 GDN recurrence calls | 35.93 | 12.1% |
+| 48 GDN convolutions | 21.02 | 7.1% |
+| vocabulary head | 10.10 | 3.4% |
+| attention core + prepare | 8.30 | 2.8% |
+| embedding + Python scheduler remainder | 1.90 | 0.6% |
 
-The measurement to write: instrument the real `PureAneRuntime` decode loop with
-per-phase timers around each program class and each host copy, rather than
-timing isolated shapes. Until that exists, any effort spent on this half is
-guesswork.
+The earlier 44% “unattributed host” bucket was an invalid subtraction of
+isolated conv arithmetic from fused production programs. Python scheduling is
+only 0.2–0.3%; fused tails are the real majority.
+
+**Implemented from this trace — chained next-layer projections.** Each tail
+already computes the next input RMSNorm. It now applies the next layer's
+projection before returning its secondary output, eliminating 63 projection
+dispatches and both target projection-bank programs. The complete model fell
+from 127 to 125 programs and 12.86 to 12.82 GB. Three profiled A/B runs emitted
+identical 16-token text and changed:
+
+| | before | chained | change |
+|---|---:|---:|---:|
+| mean end-to-end | 3.352 tok/s | **3.503 tok/s** | **+4.48%** |
+| mean decode | 297.41 ms/token | **284.39 ms/token** | **-13.02 ms** |
+| projection-head calls/token | 64 | **1** | -63 |
+
+Five unprofiled production runs measured 3.499 tok/s mean (3.470–3.532), so
+the profiler itself does not explain the gain. A semantic request still
+returned exactly `OK`.
 
 ### O6. Do not run two ANE processes at once. *(measured, operational)*
 
@@ -200,19 +321,17 @@ concurrently with the GPU", listed as a standing use in
 | `kANEFAneInstanceHint` for parallelism | 3.810 ms concurrent vs 4.057 serialized = 1.06×, where real parallelism would be 2.03 ms | `ane_instances.py` |
 | Quantizing further to speed decode | int8 1.989 vs int4 1.941 ms/layer at S=32 | `docs/PERFORMANCE.md` |
 | Fusing dispatches to cut count | gate+up from 3 convs to 2 moved 1.929 → 1.939 ms | `docs/PERFORMANCE.md` |
-| Caching the MIL compile | `ANECCompile` re-runs from MIL every time; preserving its output saves 1.1× | `docs/PERFORMANCE.md` |
+| Preserving only the MIL source directory | still calls `ANECCompile` and saves 1.1×; direct `compiledModelExists` reuse is the implemented solution | `docs/PERFORMANCE.md` |
 | Expert co-activation clustering | fails; a token's experts span ~7 groups | `docs/FULL-HANDOFF.md` §23.2, §26.2 |
 | In-graph slicing of weights | catastrophic | `docs/FULL-HANDOFF.md` §25.2 |
 
 ## Order of work
 
-1. **O5** — instrument the real decode loop. 51% of the token is unexplained
-   and everything below is being ranked without it.
-2. **O2 at parts=2** — deployable now at 13 blobs, and a precondition for O1.
-   Test the packed-blob route to parts=4.
-3. **O1** — tree speculation into 64 lanes. Largest available multiplier, and
+1. **O1** — tree speculation into 64 lanes. O2's packed parts=4 prerequisite
+   is now deployed and measured on the complete width-64 tails. This is the
+   largest available multiplier, and
    the only one that attacks the fixed convolution cost rather than shaving it.
-4. **O3** — only if O5 shows prefill is projection-bound, which the current
+2. **O3** — only if O5 shows prefill is projection-bound, which the current
    arithmetic suggests it is not.
 
 ## Reproducing

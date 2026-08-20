@@ -91,11 +91,22 @@ prefill optimization, not a decode one:
 | 128 | 4.42 | 1.29 | 3.43× |
 | 512 | 18.47 | 4.85 | 3.81× |
 
-Deployability is bounded by the **16-blobs-per-program** rule. `AneGdnTail`
-already uses 11, and int4 spends two blobs per part (data + scales), so
-parts=2 fits at 13 blobs while parts=4 needs 17. Packing the four payloads
-into one blob at four absolute offsets — the mechanism the projection banks
-already use — would make parts=4 fit, but that is untested.
+The packed four-way form is now deployed. It slices the existing row-quantized
+payload (so int4 values and scales are unchanged), writes the four data tensors
+and their scale tensors as milinternal records in one `down.bin`, and references
+them at absolute offsets. This stays below the compiler's 16-weight-file rule:
+the chained GDN tail uses 12 files and the attention tail 9. The old form is
+available as `--down-proj-parts 1`; packed 4 is the pure runtime default.
+
+On complete real tails, packed four-way changes width-64 GDN from 3.289 to
+**2.683 ms** (-18.4%) and attention from 3.261 to **2.714 ms** (-16.8%). At
+width 32 both tails are about 1% slower in isolation, but the full server is
+flat: identical 16-token output and 3.499 tok/s for both forms; profiled decode
+was 284.82 versus 284.39 ms/token. Thus it removes the width-64 pathology
+without a measurable production regression.
+Depth-2 MTP was also requalified with the packed tail: 126 programs compiled,
+the same 16-token output was produced, and acceptance remained 1.875
+tokens/cycle. This compatibility result does not change MTP's opt-in status.
 
 ### Prefill runs 32 wide, and pays about 2.2× for it
 
@@ -187,6 +198,36 @@ tokens/s, time to first token, queue time, prompt/completion counts, and every
 individual run rather than only an average.
 It uses accept-all-or-longest-prefix rollback and contains no MLX/GPU path.
 
+### Production-loop profile and projection chaining
+
+`pure-serve --profile-decode` now measures the real loop. Before chaining,
+mean decode across three warm runs was 297.41 ms/token: GDN tails 43.2%,
+projection heads 16.5%, attention tails 14.2%, recurrence 12.1%, GDN conv 7.1%,
+and Python scheduler remainder only 0.2–0.3%. The previously derived 44%
+“unattributed host” bucket was not real; isolated conv costs cannot be
+subtracted from fused tail programs that contain additional arithmetic.
+
+The target now folds each next-layer projection into the preceding tail's
+already-computed RMSNorm output. This removes 63 dispatches and two projection
+banks, reducing the long-context int4 server from 127 to 125 programs and
+12.86 to 12.82 GB. Identical 16-token outputs measured 3.352 → **3.503 tok/s**
+(+4.48%) and 297.41 → **284.39 ms/token** decode. Five unprofiled runs averaged
+3.499 tok/s, confirming profiling overhead is negligible.
+
+Linear depth-2 MTP was requalified after chaining: all three outputs matched
+the target exactly, but this short raw-prompt workload accepted only 1.875
+tokens/cycle and ran at 2.907 tok/s versus the target's 3.499. The faster target
+has moved the break-even point; `--mtp-draft 2` remains correct and opt-in, but
+tree-shaped drafting is required to turn the free width-64 lanes into a gain.
+
+On the live int4/context-4096 server, an identical 17-token chat changed from a
+3.066 s cold request and 2.746 s TTFT to a 0.341 s cached request and 8.4 ms
+TTFT. The cache reported all 17 prompt tokens reused and zero evaluated. A
+38-token continuation reused the original 17-token boundary, evaluated the 21
+new tokens, and produced the expected answer. `/v1/benchmarks` disables prefix
+reuse by default so warmups do not silently turn measured runs into cache-hit
+tests; opt in explicitly when measuring interactive continuation latency.
+
 ## Long-context scaling
 
 `--context` now accepts the checkpoint maximum of 262,144. This is a capacity
@@ -254,14 +295,30 @@ on the ANE.
 
 ## Startup
 
-| | bake | total |
-|---|---|---|
-| cold | 44 s | 52.6 s |
-| `--bake-cache` warm | 21 s | 28.5 s |
+The pure server now reopens the private framework's content-addressed compiled
+artifacts across processes. A measured int4/context-4096 restart hit **127/127**
+artifacts: compiler time **0.00 s**, compiler input materialization **0.00 s**,
+ANE load 0.46 s, descriptor construction/hash 5.27 s, BF16→int4 quantization
+53.96 s, total 60.97 s. `probes/ane_compile_cache.py` independently verifies
+that a second process executes a cached program exactly without calling the
+compiler.
 
-Quantisation is 83% of the bake (0.45 s of 0.54 s per layer) and is cacheable.
-The MIL compile is 0.09 s and is **not** — `ANECCompile` re-runs from MIL every
-time, and preserving its content-addressed output saves only 1.1×.
+The remaining cold-start cost is quantization, not compilation. The persistent
+server's `--bake-cache` stores versioned Zstandard-compressed prequantized blobs
+and is enabled by default; `--no-bake-cache` disables it. The complete cache is
+9.18 GB on disk (8.5 GiB via `du`) for 12.86 GB of unpacked blobs.
+
+A measured warm restart hit **504/504** quantized tensors and **127/127**
+compiled artifacts: quantization 0.00 s, read/decompress 7.54 s, descriptor
+construction/hash 5.20 s, ANE load 0.45 s, compiler/materialization 0.00 s,
+and **14.50 s total**. New compressed writes stop when they would leave under
+8 GB free (20 GB on the uncompressed Python fallback). Inspect exact phase
+totals at `GET /v1/metrics` → `startup`.
+
+The older hybrid `tools/ane_serve.py` measurements were cold 52.6 s and warm
+28.5 s. They established that prebaking helps, but its claim that the compiled
+artifact could not be reopened no longer applies to the pure loader: direct
+`compiledModelExists` → `loadWithQoS` reuse is now tested and implemented.
 
 ## A caution about the energy numbers
 

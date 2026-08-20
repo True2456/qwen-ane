@@ -90,10 +90,14 @@ treat 127 as an API-path budget here, not a documented total ANE limit.
 | `--ane-fused-layers -1 --ane-gdn --ane-attn` | the older per-block mode, 127 programs |
 | pure `--mtp-draft 0/1/2` | standalone ANE-only MTP; depth 2 measured best |
 | pure `--context N` | attention/KV capacity, 256..262144; above 256 uses streamed exact ANE attention |
+| pure `--down-proj-parts 1/4` | packed input-channel split for MLP `down_proj`; 4 is the default and unlocks efficient width 64 |
 | pure `--prompt-file PATH` | UTF-8 prompt file, useful for long-context tests; overrides `--prompt` |
 | `pure-serve --port N` | persistent OpenAI-compatible pure-ANE endpoint; default 1240 |
+| `pure-serve --bake-cache DIR` | compressed prequantized cache; measured 60.97 s → 14.50 s warm startup |
+| `pure-serve --no-bake-cache` | disable the default `~/Library/Caches/q38-pure-ane` cache |
 | `pure-serve --max-tokens N` | default request output limit; clients can override it |
 | `pure-bench --runs/--warmup` | benchmark an already-running server without compiling between samples |
+| `pure-bench --prefix-cache` | measure cached-prefix latency instead of clean-state benchmark runs |
 
 At 256K, the target's 16 fp16 KV caches are 16 GiB in aggregate; pure MTP adds
 1 GiB. Int4 learned-weight blobs add 12.86 GB (13.16 GB with MTP). The 256K
@@ -108,9 +112,45 @@ Wait for `PURE_ANE_SERVER_READY`, then point an OpenAI-compatible client at
 chat/completions, text completions, SSE streaming, health, metrics, and a
 dedicated benchmark endpoint. It accepts one active inference at a time and
 queues overlapping requests so mutable recurrent/KV state cannot be mixed.
-Each request resets sequence state but retains the compiled programs and
-learned-weight blobs. A 256K configuration reserves sparse KV address space;
-resetting it does not zero or fault all 16 GiB of target cache pages.
+The most recent prompt snapshot is reused automatically when it is an exact
+token prefix of the next request. API responses expose `prefix_cache_hit`,
+`prefix_tokens_reused`, and `prompt_tokens_evaluated`; aggregate values are in
+`GET /metrics`. Send `"prefix_cache": false` to force clean state. A 256K
+configuration reserves sparse KV address space; reset does not zero or fault
+all 16 GiB of target cache pages.
+
+OpenAI `tools` and `tool_choice` are accepted for function tools. The server
+renders Qwen's native tool schema, converts generated XML to OpenAI
+`message.tool_calls`, accepts those calls plus `role: "tool"` results on the
+next request, and supports multiple calls. Tool-enabled SSE is structurally
+correct but buffers the assistant turn until it can distinguish ordinary text
+from a complete tool call.
+
+### Thinking levels
+
+Qwen3.8-27B's bundled template enables thinking when `enable_thinking` is
+omitted and resolves an omitted `reasoning_effort` to `xhigh`. It accepts only
+`low`, `medium`, and `xhigh`—`high` is not a valid alias for this checkpoint.
+The pure server matches those defaults and the exact checkpoint-authored system
+instructions. `medium` has no extra system instruction by design.
+
+```bash
+curl http://127.0.0.1:1240/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "messages": [{"role": "user", "content": "Solve 17*23"}],
+    "enable_thinking": true,
+    "reasoning_effort": "low"
+  }'
+```
+
+Non-streaming responses separate `message.reasoning_content` from final
+`message.content`. Streaming sends the same two fields as deltas and recognizes
+`</think>` even when it crosses token/chunk boundaries. Historical assistant
+messages may include `reasoning_content`; the chat renderer preserves it exactly
+as the model template requires. `pure-bench` keeps thinking off unless
+`--thinking` is supplied, with `--reasoning-effort low|medium|xhigh` selecting
+the level.
 
 ## Environment
 
