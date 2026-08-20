@@ -36,6 +36,8 @@ case "$cmd" in
   serve) require_omlx; exec "$PY" -u -P "$REPO/tools/ane_serve.py" --model "$MODEL" "$@" ;;
   bench) require_omlx; exec "$PY" -u -P "$REPO/tools/ane_serve.py" --model "$MODEL" --bench "$@" ;;
   spec)  require_omlx; exec "$PY" -u -P "$REPO/tools/mtp_specdec.py" --model "$MODEL" "$@" ;;
+  ling-inspect) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ling.py" inspect "$@" ;;
+  ling-reference-generate) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ling.py" reference-generate "$@" ;;
   pure-inspect) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane.py" --model "$MODEL" inspect "$@" ;;
   pure-loader-smoke) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane.py" --model "$MODEL" loader-smoke "$@" ;;
   pure-projection-smoke) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane.py" --model "$MODEL" projection-smoke "$@" ;;
@@ -48,5 +50,5 @@ case "$cmd" in
   pure-infer) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane.py" --model "$MODEL" infer "$@" ;;
   pure-serve) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane_server.py" serve --model "$MODEL" "$@" ;;
   pure-bench) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane_server.py" bench "$@" ;;
-  *)     echo "usage: tools/ane {serve|bench|spec|pure-inspect|pure-loader-smoke|pure-projection-smoke|pure-gdn-conv-smoke|pure-gdn-recurrence-smoke|pure-gdn-layer-smoke|pure-attention-core-smoke|pure-attention-long-smoke|pure-attention-layer-smoke|pure-infer|pure-serve|pure-bench} [args...]"; exit 2 ;;
+  *)     echo "usage: tools/ane {serve|bench|spec|pure-inspect|pure-loader-smoke|pure-projection-smoke|pure-gdn-conv-smoke|pure-gdn-recurrence-smoke|pure-gdn-layer-smoke|pure-attention-core-smoke|pure-attention-long-smoke|pure-attention-layer-smoke|pure-infer|pure-serve|pure-bench|ling-inspect|ling-reference-generate} [args...]"; exit 2 ;;
 esac

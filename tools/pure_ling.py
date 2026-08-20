@@ -340,11 +340,236 @@ def main() -> None:
         "Q38_LING_MODEL", "/Users/true/.lmstudio/models/inclusionAI/Ling-3.0-tiny"))
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("inspect")
+    gen = sub.add_parser("reference-generate")
+    gen.add_argument("--prompt", default="The capital of France is")
+    gen.add_argument("--tokens", type=int, default=8)
+    gen.add_argument("--raw-prompt", action="store_true")
     args = p.parse_args()
     assert_standalone("ling cli")
     if args.command == "inspect":
         inspect(args.model)
+    elif args.command == "reference-generate":
+        reference_generate(args.model, args.prompt, args.tokens, args.raw_prompt)
 
+
+
+
+# ---------------------------------------------------------------------------
+# Reference forward. Numpy, float32, no ANE. This is the oracle the ANE
+# runtime is checked against, and it is the fastest way to prove the whole
+# architecture -- KDA, MLA, and the MoE router together -- actually generates
+# text before any of it is committed to MIL.
+# ---------------------------------------------------------------------------
+
+def _rms(x, w, eps):
+    return x / np.sqrt((x * x).mean(-1, keepdims=True) + eps) * w
+
+
+def _silu(x):
+    return x / (1.0 + np.exp(-x, dtype=np.float64)).astype(x.dtype)
+
+
+def _sigmoid(x):
+    return (1.0 / (1.0 + np.exp(-x.astype(np.float64)))).astype(np.float32)
+
+
+class LingReference:
+    """Single-token-at-a-time float32 forward over the real checkpoint.
+
+    Weights are pulled lazily and cached, and routed experts are read per
+    token, so a few tokens cost far less than the 15.8 GB checkpoint.
+    """
+
+    def __init__(self, checkpoint: Checkpoint, spec: LingSpec):
+        self.ck, self.spec = checkpoint, spec
+        self._w: dict[str, np.ndarray] = {}
+        s = spec
+        self.state = {i: np.zeros((s.heads, s.head_dim, s.head_dim), np.float32)
+                      for i in s.linear_attention_layers}
+        self.conv = {i: np.zeros((3 * s.kda_proj_dim, s.conv_kernel - 1), np.float32)
+                     for i in s.linear_attention_layers}
+        self.kv = {i: [] for i in s.full_attention_layers}
+        self.pos = 0
+
+    def w(self, name: str) -> np.ndarray:
+        if name not in self._w:
+            self._w[name] = self.ck.tensor(name, np.float32)
+        return self._w[name]
+
+    def reset(self) -> None:
+        for v in self.state.values():
+            v[:] = 0
+        for v in self.conv.values():
+            v[:] = 0
+        for k in self.kv:
+            self.kv[k] = []
+        self.pos = 0
+
+    # ------------------------------------------------------------------ KDA
+    def kda(self, x, layer):
+        s, n = self.spec, self.attention_names_cached(layer)
+        H, D, P = s.heads, s.head_dim, s.kda_proj_dim
+        qkv = np.concatenate([x @ self.w(n[k]).T for k in ("q", "k", "v")])
+        hist = self.conv[layer]
+        win = np.concatenate([hist, qkv[:, None]], axis=1)      # [3P, K]
+        cw = np.concatenate([self.w(n[f"{k}_conv"]).reshape(P, s.conv_kernel)
+                             for k in ("q", "k", "v")])
+        conv = (win * cw).sum(-1)
+        self.conv[layer] = win[:, 1:]
+        q, k, v = _silu(conv[:P]).reshape(H, D), _silu(conv[P:2*P]).reshape(H, D), \
+            _silu(conv[2*P:]).reshape(H, D)
+        q = q / np.linalg.norm(q, axis=-1, keepdims=True)
+        k = k / np.linalg.norm(k, axis=-1, keepdims=True)
+        f = (x @ self.w(n["f"]).T).reshape(H, D)
+        beta = _sigmoid(x @ self.w(n["b"]).T)                   # [H]
+        a = np.exp(self.w(n["a_log"]))[:, None]
+        z = a * (f + self.w(n["dt_bias"]).reshape(H, D))
+        g = np.exp(s.kda_lower_bound * _sigmoid(z))             # [H, D] per key channel
+        S = self.state[layer] * g[:, None, :]
+        kv_mem = np.einsum("hvd,hd->hv", S, k)
+        delta = (v - kv_mem) * beta[:, None]
+        S = S + delta[:, :, None] * k[:, None, :]
+        self.state[layer] = S
+        y = np.einsum("hvd,hd->hv", S, q)
+        # o_norm is an RMSNorm applied to y, and RMSNorm is scale invariant, so
+        # the reference kernel's q * D**-0.5 is absorbed here with eps * D.
+        y = _rms(y, self.w(n["o_norm"]), s.rms_eps * D)
+        gate = _sigmoid(x @ self.w(n["gate"]).T).reshape(H, D)
+        return (y * gate).reshape(-1) @ self.w(n["out"]).T
+
+    # ------------------------------------------------------------------ MLA
+    def mla(self, x, layer):
+        s, n = self.spec, self.attention_names_cached(layer)
+        H, Dn, Dr, Dv = s.heads, s.qk_nope, s.qk_rope, s.v_head_dim
+        q = _rms(x @ self.w(n["q_a"]).T, self.w(n["q_a_norm"]), s.rms_eps)
+        q = (q @ self.w(n["q_b"]).T).reshape(H, s.qk_head_dim)
+        q_nope, q_rope = q[:, :Dn], q[:, Dn:]
+        c = x @ self.w(n["kv_a"]).T
+        lat, k_rope = c[:s.kv_lora_rank], c[s.kv_lora_rank:]
+        lat = _rms(lat, self.w(n["kv_a_norm"]), s.rms_eps)
+        inv = 1.0 / (s.rope_theta ** (np.arange(0, Dr, 2, np.float64) / Dr))
+        f = self.pos * inv
+        cos, sin = np.cos(np.concatenate([f, f])), np.sin(np.concatenate([f, f]))
+        half = Dr // 2
+
+        def rope(t):                       # interleaved (GPT-J) pairing
+            td = t.reshape(*t.shape[:-1], half, 2).swapaxes(-1, -2).reshape(t.shape)
+            return td * cos + np.concatenate(
+                [-td[..., half:], td[..., :half]], -1) * sin
+
+        q_rope, k_rope = rope(q_rope), rope(k_rope)
+        self.kv[layer].append((lat.astype(np.float32), k_rope.astype(np.float32)))
+        kv_b = self.w(n["kv_b"]).reshape(H, Dn + Dv, s.kv_lora_rank)
+        W_K, W_V = kv_b[:, :Dn, :], kv_b[:, Dn:, :]
+        q_abs = np.einsum("hn,hnl->hl", q_nope, W_K)
+        L = np.stack([a for a, _ in self.kv[layer]])
+        R = np.stack([b for _, b in self.kv[layer]])
+        sc = (q_abs @ L.T + q_rope @ R.T) * (s.qk_head_dim ** -0.5)
+        p = np.exp(sc - sc.max(-1, keepdims=True))
+        p /= p.sum(-1, keepdims=True)
+        ctx = p @ L
+        attn = np.einsum("hl,hvl->hv", ctx, W_V)
+        gate = _sigmoid(x @ self.w(n["gate"]).T)                # [H] head_wise
+        return (attn * gate[:, None]).reshape(-1) @ self.w(n["out"]).T
+
+    # ------------------------------------------------------------------ MoE
+    def route(self, x, layer):
+        """BailingMoeV3Gate. fp32; sigmoid scoring; group-limited top-k."""
+        s, m = self.spec, self.mlp_names_cached(layer)
+        logits = x.astype(np.float32) @ self.w(m["router"]).T.astype(np.float32)
+        scores = _sigmoid(logits)                                # NOT softmax
+        routing = scores + self.w(m["expert_bias"])              # selection only
+        grp = routing.reshape(s.n_group, -1)
+        gs = np.sort(grp, -1)[:, -2:].sum(-1)                    # sum of top TWO
+        live = np.argpartition(gs, -s.topk_group)[-s.topk_group:]
+        mask = np.zeros(s.n_group, bool)
+        mask[live] = True
+        masked = np.where(np.repeat(mask, grp.shape[1]), routing, -np.inf)
+        idx = np.argpartition(masked, -s.top_k)[-s.top_k:]
+        wts = scores[idx]                                        # PRE-bias scores
+        if s.norm_topk_prob:
+            wts = wts / (wts.sum() + 1e-20)
+        return idx, wts * s.routed_scale
+
+    def moe(self, x, layer):
+        s = self.spec
+        idx, wts = self.route(x, layer)
+        out = np.zeros_like(x)
+        for e, wt in zip(idx, wts):
+            g = self.w(self.spec.expert_name(layer, int(e), "gate"))
+            u = self.w(self.spec.expert_name(layer, int(e), "up"))
+            d = self.w(self.spec.expert_name(layer, int(e), "down"))
+            out += wt * ((_silu(x @ g.T) * (x @ u.T)) @ d.T)
+        m = self.mlp_names_cached(layer)
+        sg, su, sd = (self.w(m["shared_gate"]), self.w(m["shared_up"]),
+                      self.w(m["shared_down"]))
+        return out + (_silu(x @ sg.T) * (x @ su.T)) @ sd.T       # unscaled
+
+    def dense_mlp(self, x, layer):
+        m = self.mlp_names_cached(layer)
+        return (_silu(x @ self.w(m["gate"]).T) * (x @ self.w(m["up"]).T)) \
+            @ self.w(m["down"]).T
+
+    # ---------------------------------------------------------------- caches
+    def attention_names_cached(self, layer):
+        key = ("attn", layer)
+        if key not in self._w:
+            self._w[key] = self.spec.attention_names(layer)      # type: ignore
+        return self._w[key]
+
+    def mlp_names_cached(self, layer):
+        key = ("mlp", layer)
+        if key not in self._w:
+            self._w[key] = self.spec.mlp_names(layer)            # type: ignore
+        return self._w[key]
+
+    # --------------------------------------------------------------- forward
+    def forward(self, token_id: int) -> np.ndarray:
+        s = self.spec
+        h = np.asarray(self.ck.embedding(token_id), np.float32).reshape(-1)
+        for layer in range(s.layers):
+            nn = s.norm_names(layer)
+            a = _rms(h, self.w(nn["input"]), s.rms_eps)
+            h = h + (self.mla(a, layer) if s.is_full_attention(layer)
+                     else self.kda(a, layer))
+            p = _rms(h, self.w(nn["post_attention"]), s.rms_eps)
+            h = h + (self.moe(p, layer) if s.is_moe(layer)
+                     else self.dense_mlp(p, layer))
+        self.pos += 1
+        h = _rms(h, self.w("model.norm.weight"), s.rms_eps)
+        return h @ self.w("lm_head.weight").T
+
+
+def reference_generate(model_dir: str, prompt: str, tokens: int,
+                       raw: bool = False) -> None:
+    """Greedy decode through the numpy reference. Proves the architecture."""
+    import time
+    checkpoint, spec = load(model_dir)
+    tok = StandaloneTokenizer(model_dir)
+    if not raw:
+        # Bailing V3 template (chat_template.jinja): a SYSTEM turn is always
+        # emitted, and thinking is on by default so the assistant turn opens
+        # with <think>.
+        prompt = ("<role>SYSTEM</role><|role_end|>"
+                  "<role>HUMAN</role>" + prompt + "<|role_end|>"
+                  "<role>ASSISTANT</role>")
+    ids = tok.encode(prompt)
+    print(f"prompt {len(ids)} tokens: {ids[:12]}{'...' if len(ids) > 12 else ''}")
+    ref = LingReference(checkpoint, spec)
+    t0 = time.perf_counter()
+    for i in ids[:-1]:
+        ref.forward(int(i))
+    out, cur = [], int(ids[-1])
+    for _ in range(tokens):
+        logits = ref.forward(cur)
+        cur = int(np.argmax(logits))
+        out.append(cur)
+        print(f"  token {cur:>7}  {tok.decode([cur])!r}", flush=True)
+    dt = time.perf_counter() - t0
+    print(f"\ntoken_ids={out}")
+    print(f"text={tok.decode(out)!r}")
+    print(f"\nLING_REFERENCE_GENERATE=PASS {len(ids)}+{tokens} tokens in "
+          f"{dt:.1f}s ({(len(ids)+tokens)/dt:.2f} tok/s, numpy fp32, no ANE)")
 
 if __name__ == "__main__":
     main()

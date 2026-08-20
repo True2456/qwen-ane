@@ -1,8 +1,10 @@
 # Porting Ling-3.0-tiny to the pure ANE runtime
 
-Status: **Milestones 0-3 done.** Strategy decided, loader verified, KDA gate
-and recurrence validated on hardware, MLA fully validated end to end (algebra,
-absorbed projections, attention core). The MoE block is next.
+Status: **The model runs and generates correct text.** A numpy reference
+forward over the real checkpoint produces ' Paris.' for 'The capital of France
+is', which validates KDA, MLA and the MoE router together. Every ANE building
+block is separately validated on hardware. What remains is wiring those blocks
+into a full ANE runtime.
 
 Ling-3.0-tiny (`BailingMoeV3` / `bailing_hybrid`) is 7.89B total / 1.38B
 activated, 15.79 GB bf16. 24 layers, hidden 1536, vocab 157184.
@@ -323,16 +325,50 @@ rope columns are discarded on read: 11% more work in one matmul, widths stay
 equal, and the discarded columns are never read so they are arithmetically
 inert.
 
+## It generates text
+
+`tools/pure_ling.py reference-generate` is a float32 numpy forward over the real
+checkpoint — no ANE, no MLX. It exists to prove the architecture end to end and
+to be the oracle the ANE runtime is checked against.
+
+```
+$ tools/ane ling-reference-generate --raw-prompt --prompt "The capital of France is"
+  token   13997  ' Paris'
+  token      13  '.'
+text=' Paris.\n\nOkay'
+```
+
+and through the checkpoint's own Bailing V3 chat template, thinking on:
+
+```
+$ tools/ane ling-reference-generate --prompt "What is 2+2? Answer in one word."
+text='\n1.  **Analyze the Request'
+```
+
+That is one pass through all 24 layers: 18 KDA, 6 MLA, 23 MoE blocks with
+group-limited top-8 routing, a shared expert, and the dense layer 0. Getting
+' Paris.' means the routing details are right — sigmoid rather than softmax
+scoring, `expert_bias` steering selection only, the group score being the sum of
+the top two, and the weights coming from the pre-bias scores. Any of those
+inverted produces fluent nonsense rather than a wrong-looking crash.
+
+Weights are pulled lazily and routed experts are read per token, so a few tokens
+cost far less than the 15.8 GB checkpoint. It runs at ~0.5 tok/s in numpy, which
+is the point of moving it to the ANE.
+
+## Validated ANE building blocks
+
+| block | probe | result |
+|---|---|---|
+| KDA safe gate | `ane_ling_kda_gate.py` | 8.38e-4 where `g >= 0.9` |
+| KDA recurrence | `ane_ling_kda_step.py` | y 1.4e-3, state 1.1e-3, 6 dependent steps |
+| MLA absorbed algebra | `ane_ling_mla_ref.py` | 1.37e-15 vs materialized KV |
+| MLA absorbed projections | `ane_ling_mla_absorb.py` | fp16 2.95e-4 / 2.38e-3, blocks diagonal |
+| MLA attention core | `ane_ling_mla_core.py` | ctx 5.7e-3 at L=256, zero mask leak |
+| MoE strategy | `ane_ling_moe_strategy.py` | baked-dense int4, 1.14 ms/token at 64 lanes |
+
 ## Next
 
-Milestone 4, the MoE block. Its four easy-to-invert details are still untested:
-
-* scoring is **sigmoid**, not softmax, so the 128 scores are independent and do
-  not sum to one
-* `expert_bias` is added **before** group scoring and top-k but steers
-  **selection only**
-* the group score is the sum of the top **2** in each group, not the max or mean
-* the returned weights are gathered from the **pre-bias** scores, then
-  normalized, then scaled by 2.5
-
-Then full inference (5) and measurement (6).
+Wire the validated blocks into `LingRuntime`, checked layer by layer against
+`LingReference`. The program budget is ~20 of 127, so each block class can be
+one procedure bank over its shape-identical layers.
