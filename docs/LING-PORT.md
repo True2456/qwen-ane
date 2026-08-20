@@ -416,8 +416,87 @@ Per-block, warm: MoE 384 ms (51%), KDA 264 ms (35%), MLA 20 ms, `lm_head` 6.8 ms
 | MLA attention core | `ane_ling_mla_core.py` | ctx 5.7e-3 at L=256, zero mask leak |
 | MoE strategy | `ane_ling_moe_strategy.py` | baked-dense int4, 1.14 ms/token at 64 lanes |
 
+## What the ANE port would actually cost, and why
+
+`probes/ane_ling_budget.py` measures every block at Ling's real shapes and
+weights it by how often it fires per token. Against MLX's measured 36.7 ms/token:
+
+| block | calls | ms/call | ms/token | % of MLX budget |
+|---|---:|---:|---:|---:|
+| **`moe_gu`** (4 chunks x 23) | 92 | 0.428 | **39.38** | **107%** |
+| **`moe_down`** (23) | 23 | 0.793 | **18.23** | 50% |
+| `kda_in` (q\|k\|v\|f\|g\|b fused) | 18 | 0.288 | 5.18 | 14% |
+| shared expert (gate\|up + down) | 46 | ~0.11 | 4.92 | 13% |
+| `kda_out` | 18 | 0.136 | 2.45 | 7% |
+| `lm_head`, 3 chunks | 3 | 0.647 | 1.94 | 5% |
+| all six MLA blocks | 36 | ~0.12 | 4.20 | 11% |
+
+**MoE is 67% of the token.** Everything else together is 28 ms.
+
+### Cost 1: no `gather`, so 16x the expert bytes are read
+
+A token routes to 8 of 128 experts — 217 MB at int4 across 23 layers. Baking
+all 128 reads **3.47 GB**, sixteen times what is needed. The ANE has no
+`gather`, so the alternatives are to compute every expert or to physically copy
+the routed ones in (`docs/ANE-MOE-HANDOFF.md` §27, and Stage 0 above).
+
+Ling has something Qwen's MoE did not: `n_group=8, topk_group=4`, so the router
+**confines every token to 4 of the 8 groups**. At most 64 of 128 experts can be
+live, and half the work is skippable for free. Measured per-group dispatch:
+
+| experts per dispatch | gate\|up | down |
+|---:|---:|---:|
+| 64 | 0.773 ms | 0.763 ms |
+| 32 | 0.422 | 0.424 |
+| 16 | 0.255 | 0.175 |
+
+### Cost 2: the per-dispatch floor, which this model is too small to amortize
+
+The driver floor is 0.090 ms per dispatch regardless of work
+(`probes/ane_decode_budget.py`). It is visible directly in the shared expert:
+0.098 ms/call to move 1.6 MB is essentially **all floor**.
+
+| configuration | MoE | total | tok/s | dispatches | floor |
+|---|---:|---:|---:|---:|---:|
+| all 128 experts | 57.6 ms | 85.6 ms | **11.7** | 272 | 24.5 ms (29%) |
+| 4 live groups of 16 | 39.6 ms | 67.6 ms | **14.8** | 341 | 30.7 ms (45%) |
+| MLX bf16 GPU | — | 36.7 ms | **27.3** | — | — |
+
+**The two costs oppose each other.** Finer groups read fewer bytes but need more
+dispatches: halving expert traffic (3.47 -> 1.74 GB) raises dispatches 272 -> 341
+and the floor 24.5 -> 30.7 ms. It is still a net win, 11.7 -> 14.8 tok/s, but it
+does not reach MLX.
+
+For scale: on Qwen3.8-27B the same floor was 29 ms of a 361 ms token, **8%**.
+Here it is 29-45%. Ling-tiny activates 1.4B parameters across 24 layers of many
+small blocks, so there is far less arithmetic per dispatch to hide the fixed
+cost behind.
+
+If the routed experts could be read directly, MoE would be 3.6 ms and the whole
+token ~32 tok/s — past MLX. That single missing op is the difference.
+
+### The lever that actually changes the answer
+
+Single-token decode is the wrong target. A width-64 dispatch costs the same as
+width-32 (`docs/OPTIMIZATIONS.md`), and Stage 0 measured baked-dense MoE at
+**1.14 ms/token with all 64 lanes filled** against 56.3 at one position. The
+baked path is routing-agnostic, so any 64 positions cost one dispatch — which is
+exactly why Stage 0 chose it over staging, and why staging cannot follow here.
+
+So the ANE port loses at one token per step and wins by a wide margin on batched
+work. The route to beating 27.3 tok/s is tree-shaped speculation filling those
+lanes, the same conclusion as O1 in `docs/OPTIMIZATIONS.md`, not shaving the
+per-token path.
+
+### Cheap wins, in order
+
+1. **Dispatch only the 4 live groups** — 1.42x on MoE, measured, and it needs
+   nothing new: the router already produces the group mask.
+2. **Fold the shared expert into a routed group dispatch** — it is 4.92 ms/token
+   of almost pure floor for 4.7 MB, and removing 46 dispatches saves ~4 ms.
+3. **Fill the lanes.** Everything above is worth ~2x; this is worth ~20x.
+
 ## Next
 
-Wire the validated blocks into `LingRuntime`, checked layer by layer against
-`LingReference`. The program budget is ~20 of 127, so each block class can be
-one procedure bank over its shape-identical layers.
+Build `LingRuntime` against `LingReference`, group-limited dispatch from the
+start, and measure the batched path rather than the single-token one.
