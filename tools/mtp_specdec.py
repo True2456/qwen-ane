@@ -36,7 +36,8 @@ ap.add_argument("--dense-bits", type=int, default=8)
 ap.add_argument("--ane-lm-head", action="store_true",
                 help="bake lm_head onto the ANE too")
 ap.add_argument("--lm-head-chunks", type=int, default=4)
-ap.add_argument("--engine", default=os.path.expanduser("~/AppleLLM/q38_native_engine"))
+ap.add_argument("--engine", default=os.environ.get(
+    "Q38_ANE_ENGINE", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 ap.add_argument("--prompt", default="Explain how a transformer language model works.")
 a = ap.parse_args()
 

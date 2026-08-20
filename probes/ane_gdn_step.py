@@ -7,7 +7,8 @@ Layout: state[h, dv, dk] -> channel h*Dk+dk, width dv. In that layout
 All six tensors ride in on one surface; y and the new state leave on two.
 """
 import os, sys, io, ctypes, contextlib, numpy as np
-sys.path.insert(0, os.path.expanduser("~/AppleLLM/q38_native_engine"))
+sys.path.insert(0, os.environ.get("Q38_ANE_ENGINE",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import runtime.q38_ane_engine as E
 from runtime.q38_ane_engine import (AneEngine, _iosurface_view, _load_iosurface,
                                     _iosurface_alloc_size, _create_iosurface,

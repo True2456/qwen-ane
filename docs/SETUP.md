@@ -6,9 +6,10 @@
   program limits and throughput will differ on other parts.
 * **oMLX.app** installed at `/Applications/oMLX.app` for the hybrid server. It
   is not imported or required by the framework-free `pure-*` backend.
-* The ANE engine module at `~/AppleLLM/q38_native_engine` (provides
-  `runtime/q38_ane_engine.py`: MIL compilation, IOSurface allocation, and the
-  `_ANEInMemoryModel` plumbing).
+* Nothing else. The ANE driver — MIL compilation, IOSurface allocation and the
+  `_ANEInMemoryModel` plumbing — is vendored at `runtime/q38_ane_engine.py` and
+  needs only the standard library and numpy. Point `Q38_ANE_ENGINE` at another
+  checkout of `q38_native_engine` to use that copy instead.
 * The model: `Qwen3.8-27B` in MLX/safetensors form. Default path is
   `/Users/<you>/.lmstudio/models/Qwen/Qwen3.8-27B`; override with `Q38_MODEL`.
 * Hybrid int4: about 13 GB for ANE blobs, plus model/runtime headroom.
@@ -46,7 +47,7 @@ Run the probes in dependency order; each is standalone and prints pass/fail.
 
 ```bash
 O=/Applications/oMLX.app/Contents/Resources
-export PYTHONPATH="$O/Python/framework-mlx-base/lib/python3.11/site-packages:$O:$HOME/AppleLLM/q38_native_engine"
+export PYTHONPATH="$O/Python/framework-mlx-base/lib/python3.11/site-packages:$O:$PWD"
 PY="$O/Python/cpython-3.11/bin/python3.11"
 
 $PY -u -P probes/ane_rmsnorm.py        # RMSNorm formulations
@@ -80,6 +81,7 @@ ceiling is an M5 Max measurement, not a documented constant.
 | var | meaning |
 |---|---|
 | `Q38_MODEL` | model directory |
+| `Q38_ANE_ENGINE` | ANE driver checkout; defaults to this repository |
 | `ANE_MAX_PROGRAMS` | program budget (default 127) |
 | `ANE_ORDER=gdn_first` | bake small blocks before the large fused layers |
 | `Q38_ANE_KEEP_WIRED` | `kANEFKeepModelMemoryWiredKey` (measured: no effect) |

@@ -6,7 +6,8 @@ the limit is a count; if they go far past it, the limit is memory and shrinking
 per-program blobs would buy more slots.
 """
 import os, sys, io, contextlib, numpy as np
-sys.path.insert(0, os.path.expanduser("~/AppleLLM/q38_native_engine"))
+sys.path.insert(0, os.environ.get("Q38_ANE_ENGINE",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import runtime.q38_ane_engine as E
 from runtime.q38_ane_engine import AneEngine
 

@@ -5,7 +5,8 @@ separately, dodging the ~9216-channel pad+add width cap -- which is what stands
 between the current build and putting every projection on the ANE.
 """
 import os, sys, io, ctypes, contextlib, numpy as np
-sys.path.insert(0, os.path.expanduser("~/AppleLLM/q38_native_engine"))
+sys.path.insert(0, os.environ.get("Q38_ANE_ENGINE",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import runtime.q38_ane_engine as E
 from runtime.q38_ane_engine import (AneEngine, _msg, _sel, _desc, _objc, _cls,
                                     _nsarray, _nsnumber_int, _indexset_to_nsarray,

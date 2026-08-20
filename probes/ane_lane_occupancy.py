@@ -34,7 +34,8 @@ except KeyError:
     g = load(pre+"gate_proj.weight"); u = load(pre+"up_proj.weight"); d = load(pre+"down_proj.weight")
 print(f"MLP shapes  gate{g.shape} down{d.shape}")
 
-sys.path.insert(0, os.path.expanduser("~/AppleLLM/q38_native_engine"))
+sys.path.insert(0, os.environ.get("Q38_ANE_ENGINE",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import runtime.q38_ane_engine as E
 from runtime.q38_ane_engine import AneEngine, _iosurface_view
 

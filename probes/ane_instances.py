@@ -6,7 +6,8 @@ means two engines; concurrent ~= t1+t2 means one engine and the hint is advisory
 """
 import os, sys, time, json, struct, numpy as np
 from concurrent.futures import ThreadPoolExecutor
-sys.path.insert(0, os.path.expanduser("~/AppleLLM/q38_native_engine"))
+sys.path.insert(0, os.environ.get("Q38_ANE_ENGINE",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import importlib.util
 spec = importlib.util.spec_from_file_location("ane_serve",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools", "ane_serve.py"))

@@ -7,7 +7,8 @@ program widths, reporting achieved TFLOP/s so it can be paired with a
 concurrent powermetrics sample.
 """
 import os, sys, time, json, struct, numpy as np
-sys.path.insert(0, os.path.expanduser("~/AppleLLM/q38_native_engine"))
+sys.path.insert(0, os.environ.get("Q38_ANE_ENGINE",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import importlib.util
 spec = importlib.util.spec_from_file_location("ane_serve", os.path.join(
     os.path.dirname(__file__), "..", "..", "tools", "ane_serve.py"))

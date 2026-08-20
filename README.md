@@ -15,7 +15,8 @@ Answers on `http://127.0.0.1:1239/v1` (OpenAI-compatible).
 does not import MLX, oMLX, PyTorch, Core ML, Transformers, or a GPU runtime. It
 reads BF16 safetensors directly, uses `tokenizers` for token IDs, and submits
 MIL programs and IOSurfaces straight to `AppleNeuralEngine.framework` through
-the small private driver in `q38_native_engine`.
+the private driver vendored at `runtime/q38_ane_engine.py`, which itself needs
+only the standard library and numpy.
 
 ```bash
 tools/ane pure-loader-smoke

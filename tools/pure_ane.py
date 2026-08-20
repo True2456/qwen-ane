@@ -30,6 +30,10 @@ import numpy as np
 
 FORBIDDEN_COMPUTE_MODULES = ("mlx", "torch", "coremltools")
 
+# The ANE driver (``runtime.q38_ane_engine``) is vendored at the repository
+# root.  ``Q38_ANE_ENGINE`` points at another checkout instead.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 
 def assert_standalone(where: str = "runtime") -> None:
     """Fail closed if a GPU-capable model framework entered this process."""
@@ -1622,12 +1626,17 @@ class AneAttentionCombine:
     tensor<fp16,[1,{H},1,{D}]> mb=slice_by_index(begin=tensor<int32,[4]>([0,{4*H},0,0]),end=tensor<int32,[4]>([1,{5*H},1,{D}]),x=x)[name=string("mb")];
     tensor<fp16,[1,{H},1,{D}]> db=slice_by_index(begin=tensor<int32,[4]>([0,{5*H},0,0]),end=tensor<int32,[4]>([1,{6*H},1,{D}]),x=x)[name=string("db")];
     tensor<fp16,[1,{H},1,{D}]> gm=maximum(x=ma,y=mb)[name=string("gm")];
-    tensor<fp16,[1,{H},1,{D}]> wa=mul(x=da,y=exp(x=sub(x=ma,y=gm))[name=string("ea")])[name=string("wa")];
-    tensor<fp16,[1,{H},1,{D}]> wb=mul(x=db,y=exp(x=sub(x=mb,y=gm))[name=string("eb")])[name=string("wb")];
+    tensor<fp16,[1,{H},1,{D}]> dma=sub(x=ma,y=gm)[name=string("dma")];
+    tensor<fp16,[1,{H},1,{D}]> dmb=sub(x=mb,y=gm)[name=string("dmb")];
+    tensor<fp16,[1,{H},1,{D}]> ea=exp(x=dma)[name=string("ea")];
+    tensor<fp16,[1,{H},1,{D}]> eb=exp(x=dmb)[name=string("eb")];
+    tensor<fp16,[1,{H},1,{D}]> wa=mul(x=da,y=ea)[name=string("wa")];
+    tensor<fp16,[1,{H},1,{D}]> wb=mul(x=db,y=eb)[name=string("wb")];
     tensor<fp16,[1,{H},1,{D}]> den=add(x=wa,y=wb)[name=string("den")];
     tensor<fp16,[1,{H},1,{D}]> na=mul(x=ya,y=wa)[name=string("na")];
     tensor<fp16,[1,{H},1,{D}]> nb=mul(x=yb,y=wb)[name=string("nb")];
-    tensor<fp16,[1,{H},1,{D}]> y=real_div(x=add(x=na,y=nb)[name=string("num")],y=den)[name=string("y")];
+    tensor<fp16,[1,{H},1,{D}]> num=add(x=na,y=nb)[name=string("num")];
+    tensor<fp16,[1,{H},1,{D}]> y=real_div(x=num,y=den)[name=string("y")];
     tensor<int32,[8]> py=const()[name=string("py"),val=tensor<int32,[8]>([0,0,0,{2*H},0,0,0,0])];
     tensor<int32,[8]> pm=const()[name=string("pm"),val=tensor<int32,[8]>([0,0,{H},{H},0,0,0,0])];
     tensor<int32,[8]> pd=const()[name=string("pd"),val=tensor<int32,[8]>([0,0,{2*H},0,0,0,0,0])];
@@ -1657,6 +1666,101 @@ class AneAttentionCombine:
             dst[:3*self.H]=left;dst[3*self.H:]=right
         if not self.driver.engine.submit(self.program):
             raise RuntimeError("ANE attention combine submission failed")
+        with self.driver.view(
+            self.program._out_surf,(3*self.H,self.D),np.float16
+        ) as src:
+            return np.array(src,np.float16)
+
+
+class AneAttentionStreamGroup:
+    """Scan 2-32 independent 256-token blocks in one ANE submission."""
+
+    DEN_SCALE=8192
+
+    def __init__(self,driver:AneDriver,blocks:int,block:int=256):
+        if blocks not in (2,4,8,16,32):
+            raise ValueError(f"unsupported attention stream group {blocks}")
+        self.driver=driver;self.N=blocks;self.B=block
+        self.H,self.K,self.D=24,4,256
+        N,B,H,K,D=self.N,self.B,self.H,self.K,self.D
+        G=N*K;HH=N*H
+        self.input=HH+2*G*B+G;C=self.input
+        k0,k1=HH,HH+G*B;v0,v1=k1,k1+G*B;m0=v1
+        mil=f'''program(1.3)
+{driver.module._BUILD_INFO}
+{{ func main<ios18>(tensor<fp16,[1,{C},1,{D}]> x) {{
+ tensor<fp16,[1,{HH},1,{D}]> qf=slice_by_index(begin=tensor<int32,[4]>([0,0,0,0]),end=tensor<int32,[4]>([1,{HH},1,{D}]),x=x)[name=string("qf")];
+ tensor<fp16,[1,{G*B},1,{D}]> kf=slice_by_index(begin=tensor<int32,[4]>([0,{k0},0,0]),end=tensor<int32,[4]>([1,{k1},1,{D}]),x=x)[name=string("kf")];
+ tensor<fp16,[1,{G*B},1,{D}]> vf=slice_by_index(begin=tensor<int32,[4]>([0,{v0},0,0]),end=tensor<int32,[4]>([1,{v1},1,{D}]),x=x)[name=string("vf")];
+ tensor<fp16,[1,{G},1,{B}]> mask=slice_by_index(begin=tensor<int32,[4]>([0,{m0},0,0]),end=tensor<int32,[4]>([1,{m0+G},1,{B}]),x=x)[name=string("mask")];
+ tensor<fp16,[1,{G},{H//K},{D}]> q=reshape(shape=tensor<int32,[4]>([1,{G},{H//K},{D}]),x=qf)[name=string("q")];
+ tensor<fp16,[1,{G},{B},{D}]> k=reshape(shape=tensor<int32,[4]>([1,{G},{B},{D}]),x=kf)[name=string("k")];
+ tensor<fp16,[1,{G},{B},{D}]> v=reshape(shape=tensor<int32,[4]>([1,{G},{B},{D}]),x=vf)[name=string("v")];
+ tensor<fp16,[1,{G},{H//K},{B}]> raw=matmul(transpose_x=bool(false),transpose_y=bool(true),x=q,y=k)[name=string("raw")];
+ tensor<fp16,[1,{G},{H//K},{B}]> scaled=mul(x=raw,y=fp16(0x1p-4))[name=string("scaled")];
+ tensor<fp16,[1,{G},{H//K},{B}]> score=add(x=scaled,y=mask)[name=string("score")];
+ tensor<int32,[1]> ax3=const()[name=string("ax3"),val=tensor<int32,[1]>([3])];
+ tensor<fp16,[1,{G},{H//K},1]> mx=reduce_max(axes=ax3,keep_dims=bool(true),x=score)[name=string("mx")];
+ tensor<fp16,[1,{G},{H//K},{B}]> centered=sub(x=score,y=mx)[name=string("centered")];
+ tensor<fp16,[1,{G},{H//K},{B}]> ex=exp(x=centered)[name=string("ex")];
+ tensor<fp16,[1,{G},{H//K},1]> den=reduce_sum(axes=ax3,keep_dims=bool(true),x=ex)[name=string("den")];
+ tensor<fp16,[1,{G},{H//K},{D}]> num=matmul(transpose_x=bool(false),transpose_y=bool(false),x=ex,y=v)[name=string("num")];
+ tensor<fp16,[1,{G},{H//K},{D}]> yn=real_div(x=num,y=den)[name=string("yn")];
+ tensor<fp16,[1,{N},{H},{D}]> yb=reshape(shape=tensor<int32,[4]>([1,{N},{H},{D}]),x=yn)[name=string("yb")];
+ tensor<fp16,[1,{N},{H},1]> mb=reshape(shape=tensor<int32,[4]>([1,{N},{H},1]),x=mx)[name=string("mb")];
+ tensor<fp16,[1,{N},{H},1]> db=reshape(shape=tensor<int32,[4]>([1,{N},{H},1]),x=den)[name=string("db")];
+ tensor<int32,[1]> ax1=const()[name=string("ax1"),val=tensor<int32,[1]>([1])];
+ tensor<fp16,[1,1,{H},1]> gm=reduce_max(axes=ax1,keep_dims=bool(true),x=mb)[name=string("gm")];
+ tensor<fp16,[1,{N},{H},1]> dm=sub(x=mb,y=gm)[name=string("dm")];
+ tensor<fp16,[1,{N},{H},1]> ew=exp(x=dm)[name=string("ew")];
+ tensor<fp16,[1,{N},{H},1]> weights=mul(x=db,y=ew)[name=string("weights")];
+ tensor<fp16,[1,1,{H},1]> dt=reduce_sum(axes=ax1,keep_dims=bool(true),x=weights)[name=string("dt")];
+ tensor<fp16,[1,{N},{H},{D}]> yw=mul(x=yb,y=weights)[name=string("yw")];
+ tensor<fp16,[1,1,{H},{D}]> nt=reduce_sum(axes=ax1,keep_dims=bool(true),x=yw)[name=string("nt")];
+ tensor<fp16,[1,1,{H},{D}]> yt=real_div(x=nt,y=dt)[name=string("yt")];
+ tensor<fp16,[1,{H},1,{D}]> y=reshape(shape=tensor<int32,[4]>([1,{H},1,{D}]),x=yt)[name=string("y")];
+ tensor<fp16,[1,{H},1,1]> gm4=reshape(shape=tensor<int32,[4]>([1,{H},1,1]),x=gm)[name=string("gm4")];
+ tensor<fp16,[1,{H},1,1]> dt4=reshape(shape=tensor<int32,[4]>([1,{H},1,1]),x=dt)[name=string("dt4")];
+ tensor<fp16,[1,{H},1,{D}]> zero=mul(x=y,y=fp16(0x0p+0))[name=string("zero")];
+ tensor<fp16,[1,{H},1,{D}]> one=add(x=zero,y=fp16(0x1p+0))[name=string("one")];
+ tensor<fp16,[1,{H},1,{D}]> mw=mul(x=gm4,y=one)[name=string("mw")];
+ tensor<fp16,[1,{H},1,1]> ds=mul(x=dt4,y=fp16(0x1p-13))[name=string("ds")];
+ tensor<fp16,[1,{H},1,{D}]> dw=mul(x=ds,y=one)[name=string("dw")];
+ tensor<int32,[8]> py=const()[name=string("py"),val=tensor<int32,[8]>([0,0,0,{2*H},0,0,0,0])];
+ tensor<int32,[8]> pm=const()[name=string("pm"),val=tensor<int32,[8]>([0,0,{H},{H},0,0,0,0])];
+ tensor<int32,[8]> pd=const()[name=string("pd"),val=tensor<int32,[8]>([0,0,{2*H},0,0,0,0,0])];
+ tensor<fp16,[1,{3*H},1,{D}]> yp=pad(mode=string("constant"),constant_val=fp16(0x0p+0),pad=py,x=y)[name=string("yp")];
+ tensor<fp16,[1,{3*H},1,{D}]> mp=pad(mode=string("constant"),constant_val=fp16(0x0p+0),pad=pm,x=mw)[name=string("mp")];
+ tensor<fp16,[1,{3*H},1,{D}]> dp=pad(mode=string("constant"),constant_val=fp16(0x0p+0),pad=pd,x=dw)[name=string("dp")];
+ tensor<fp16,[1,{3*H},1,{D}]> ym=add(x=yp,y=mp)[name=string("ym")];
+ tensor<fp16,[1,{3*H},1,{D}]> out=add(x=ym,y=dp)[name=string("out")];
+ }} -> (out); }}
+// pure_ane_attention_stream_blocks{N}
+'''
+        capture=io.StringIO()
+        with contextlib.redirect_stdout(capture),contextlib.redirect_stderr(capture):
+            self.program=driver.engine.compile_multiproc(mil,{},C,3*H,D)
+        if self.program is None:
+            tail="\n".join(capture.getvalue().strip().splitlines()[-10:])
+            raise RuntimeError(f"ANE {N}-block attention compile failed:\n{tail}")
+        driver.engine._ensure_io(self.program)
+
+    def __call__(self,q:np.ndarray,keys:np.ndarray,values:np.ndarray,
+                 last_valid:int)->np.ndarray:
+        expected=(self.N,self.K,self.B,self.D)
+        if keys.shape!=expected or values.shape!=expected:
+            raise ValueError(f"invalid block group {keys.shape}/{values.shape}")
+        with self.driver.view(
+            self.program._in_surf,(self.input,self.D),np.float16
+        ) as dst:
+            dst[:]=0;dst[:self.N*self.H]=np.tile(q,(self.N,1))
+            p=self.N*self.H;nkv=self.N*self.K*self.B
+            dst[p:p+nkv]=keys.reshape(-1,self.D);p+=nkv
+            dst[p:p+nkv]=values.reshape(-1,self.D);p+=nkv
+            dst[p+(self.N-1)*self.K:p+self.N*self.K,
+                last_valid:self.B]=np.float16(-1e4)
+        if not self.driver.engine.submit(self.program):
+            raise RuntimeError(f"ANE {self.N}-block attention submission failed")
         with self.driver.view(
             self.program._out_surf,(3*self.H,self.D),np.float16
         ) as src:
@@ -1696,26 +1800,31 @@ class AneLongContextAttentionCore:
     tensor<fp16,[1,{K},{B},{D}]> k=reshape(shape=tensor<int32,[4]>([1,{K},{B},{D}]),x=kf)[name=string("k")];
     tensor<fp16,[1,{K},{B},{D}]> v=reshape(shape=tensor<int32,[4]>([1,{K},{B},{D}]),x=vf)[name=string("v")];
     tensor<fp16,[1,{K},{H//K},{B}]> raw=matmul(transpose_x=bool(false),transpose_y=bool(true),x=q,y=k)[name=string("raw")];
-    tensor<fp16,[1,{K},{H//K},{B}]> score=add(x=mul(x=raw,y=fp16(0x1.0p-4))[name=string("scaled")],y=mask)[name=string("score")];
+    tensor<fp16,[1,{K},{H//K},{B}]> scaled=mul(x=raw,y=fp16(0x1.0p-4))[name=string("scaled")];
+    tensor<fp16,[1,{K},{H//K},{B}]> score=add(x=scaled,y=mask)[name=string("score")];
     tensor<int32,[1]> ax=const()[name=string("ax"),val=tensor<int32,[1]>([3])];
     tensor<fp16,[1,{K},{H//K},1]> mx=reduce_max(axes=ax,keep_dims=bool(true),x=score)[name=string("mx")];
-    tensor<fp16,[1,{K},{H//K},{B}]> ex=exp(x=sub(x=score,y=mx)[name=string("centered")])[name=string("ex")];
+    tensor<fp16,[1,{K},{H//K},{B}]> centered=sub(x=score,y=mx)[name=string("centered")];
+    tensor<fp16,[1,{K},{H//K},{B}]> ex=exp(x=centered)[name=string("ex")];
     tensor<fp16,[1,{K},{H//K},1]> den=reduce_sum(axes=ax,keep_dims=bool(true),x=ex)[name=string("den")];
     tensor<fp16,[1,{K},{H//K},{D}]> num=matmul(transpose_x=bool(false),transpose_y=bool(false),x=ex,y=v)[name=string("num")];
     tensor<fp16,[1,{K},{H//K},{D}]> yg=real_div(x=num,y=den)[name=string("yg")];
     tensor<fp16,[1,{H},1,{D}]> y0=reshape(shape=tensor<int32,[4]>([1,{H},1,{D}]),x=yg)[name=string("y0")];
     tensor<fp16,[1,{H},1,1]> mx4=reshape(shape=tensor<int32,[4]>([1,{H},1,1]),x=mx)[name=string("mx4")];
     tensor<fp16,[1,{H},1,1]> dn4=reshape(shape=tensor<int32,[4]>([1,{H},1,1]),x=den)[name=string("dn4")];
-    tensor<fp16,[1,{H},1,{D}]> one=add(x=mul(x=q4,y=fp16(0x0p+0))[name=string("zero")],y=fp16(0x1p+0))[name=string("one")];
+    tensor<fp16,[1,{H},1,{D}]> zero=mul(x=q4,y=fp16(0x0p+0))[name=string("zero")];
+    tensor<fp16,[1,{H},1,{D}]> one=add(x=zero,y=fp16(0x1p+0))[name=string("one")];
     tensor<fp16,[1,{H},1,{D}]> mw=mul(x=mx4,y=one)[name=string("mw")];
-    tensor<fp16,[1,{H},1,{D}]> dw=mul(x=dn4,y=one)[name=string("dw")];
+    tensor<fp16,[1,{H},1,1]> ds=mul(x=dn4,y=fp16(0x1p-13))[name=string("ds")];
+    tensor<fp16,[1,{H},1,{D}]> dw=mul(x=ds,y=one)[name=string("dw")];
     tensor<int32,[8]> py=const()[name=string("py"),val=tensor<int32,[8]>([0,0,0,{2*H},0,0,0,0])];
     tensor<int32,[8]> pm=const()[name=string("pm"),val=tensor<int32,[8]>([0,0,{H},{H},0,0,0,0])];
     tensor<int32,[8]> pd=const()[name=string("pd"),val=tensor<int32,[8]>([0,0,{2*H},0,0,0,0,0])];
     tensor<fp16,[1,{3*H},1,{D}]> yp=pad(mode=string("constant"),constant_val=fp16(0x0p+0),pad=py,x=y0)[name=string("yp")];
     tensor<fp16,[1,{3*H},1,{D}]> mp=pad(mode=string("constant"),constant_val=fp16(0x0p+0),pad=pm,x=mw)[name=string("mp")];
     tensor<fp16,[1,{3*H},1,{D}]> dp=pad(mode=string("constant"),constant_val=fp16(0x0p+0),pad=pd,x=dw)[name=string("dp")];
-    tensor<fp16,[1,{3*H},1,{D}]> out=add(x=add(x=yp,y=mp)[name=string("ym")],y=dp)[name=string("out")];
+    tensor<fp16,[1,{3*H},1,{D}]> ym=add(x=yp,y=mp)[name=string("ym")];
+    tensor<fp16,[1,{3*H},1,{D}]> out=add(x=ym,y=dp)[name=string("out")];
   }} -> (out);
 }}
 // pure_ane_attention_stream_B{B}
@@ -1728,20 +1837,29 @@ class AneLongContextAttentionCore:
             raise RuntimeError(f"ANE streamed attention compile failed:\n{tail}")
         driver.engine._ensure_io(self.program)
         self.combine=AneAttentionCombine(driver)
+        self.groups={n:AneAttentionStreamGroup(driver,n,B)
+                     for n in (2,4,8,16,32)}
         self.programs=[self.direct_program,self.program,self.combine.program]
-        self.keys=np.zeros((K,self.capacity,D),np.float16)
-        self.values=np.zeros((K,self.capacity,D),np.float16)
+        self.programs.extend(group.program for group in self.groups.values())
+        self.blocks=self.capacity//B
+        # Block-major makes every 256-token K/V submission contiguous.  At
+        # 256K this avoids materializing a strided copy for every KV head and
+        # leaves untouched future blocks as lazily committed virtual memory.
+        self.keys=np.zeros((self.blocks,K,B,D),np.float16)
+        self.values=np.zeros((self.blocks,K,B,D),np.float16)
         self.offset=0
         assert_standalone("long-context attention compile")
 
     def reset(self)->None:
-        self.keys[:]=0;self.values[:]=0;self.offset=0
+        # Stale entries are masked and then overwritten as offset advances, so
+        # resetting a 17 GB aggregate 256K cache must not zero all its pages.
+        self.offset=0
 
     def fork_cache(self)->"AneLongContextAttentionCore":
         other=object.__new__(AneLongContextAttentionCore)
-        for name in ("driver","Hq","Hkv","D","L","B","capacity",
+        for name in ("driver","Hq","Hkv","D","L","B","capacity","blocks",
                      "direct_program","direct_input","input","program",
-                     "combine","programs"):
+                     "combine","groups","programs"):
             setattr(other,name,getattr(self,name))
         other.keys=np.zeros_like(self.keys);other.values=np.zeros_like(self.values)
         other.offset=0
@@ -1752,8 +1870,8 @@ class AneLongContextAttentionCore:
             self.direct_program._in_surf,(self.direct_input,self.D),np.float16
         ) as dst:
             dst[:]=0;dst[:self.Hq]=q;p=self.Hq
-            dst[p:p+self.Hkv*self.B]=self.keys[:,:self.B].reshape(-1,self.D);p+=self.Hkv*self.B
-            dst[p:p+self.Hkv*self.B]=self.values[:,:self.B].reshape(-1,self.D);p+=self.Hkv*self.B
+            dst[p:p+self.Hkv*self.B]=self.keys[0].reshape(-1,self.D);p+=self.Hkv*self.B
+            dst[p:p+self.Hkv*self.B]=self.values[0].reshape(-1,self.D);p+=self.Hkv*self.B
             dst[p,valid:self.B]=np.float16(-1e4)
         if not self.driver.engine.submit(self.direct_program):
             raise RuntimeError("ANE direct attention submission failed")
@@ -1762,13 +1880,13 @@ class AneLongContextAttentionCore:
         ) as src:
             return np.array(src,np.float16)
 
-    def _run_block(self,q:np.ndarray,start:int,valid:int)->np.ndarray:
+    def _run_block(self,q:np.ndarray,block_index:int,valid:int)->np.ndarray:
         with self.driver.view(
             self.program._in_surf,(self.input,self.D),np.float16
         ) as dst:
-            dst[:]=0;dst[:self.Hq]=q;p=self.Hq;end=start+self.B
-            dst[p:p+self.Hkv*self.B]=self.keys[:,start:end].reshape(-1,self.D);p+=self.Hkv*self.B
-            dst[p:p+self.Hkv*self.B]=self.values[:,start:end].reshape(-1,self.D);p+=self.Hkv*self.B
+            dst[:]=0;dst[:self.Hq]=q;p=self.Hq
+            dst[p:p+self.Hkv*self.B]=self.keys[block_index].reshape(-1,self.D);p+=self.Hkv*self.B
+            dst[p:p+self.Hkv*self.B]=self.values[block_index].reshape(-1,self.D);p+=self.Hkv*self.B
             dst[p,valid:self.B]=np.float16(-1e4)
         if not self.driver.engine.submit(self.program):
             raise RuntimeError("ANE streamed attention submission failed")
@@ -1777,19 +1895,34 @@ class AneLongContextAttentionCore:
         ) as src:
             return np.array(src,np.float16)
 
+    def _run_group(self,q:np.ndarray,block_index:int,count:int,
+                   last_valid:int)->np.ndarray:
+        if count==1:return self._run_block(q,block_index,last_valid)
+        return self.groups[count](
+            q,self.keys[block_index:block_index+count],
+            self.values[block_index:block_index+count],last_valid
+        )
+
     def __call__(self,q:np.ndarray,k:np.ndarray,v:np.ndarray)->np.ndarray:
         if self.offset>=self.L:
             raise RuntimeError(f"attention cache exceeds configured limit {self.L}")
-        self.keys[:,self.offset]=k;self.values[:,self.offset]=v
+        block_index,token_index=divmod(self.offset,self.B)
+        self.keys[block_index,:,token_index]=k
+        self.values[block_index,:,token_index]=v
         valid=self.offset+1
         if valid<=self.B:
             out=self._run_direct(q,valid)
         else:
-            state=None
-            for start in range(0,valid,self.B):
-                block_valid=min(self.B,valid-start)
-                current=self._run_block(q,start,block_valid)
+            state=None;block_index=0
+            remaining=-(-valid//self.B)
+            while remaining:
+                count=next(n for n in (32,16,8,4,2,1) if n<=remaining)
+                reaches_end=block_index+count== -(-valid//self.B)
+                last_valid=(valid-(block_index+count-1)*self.B
+                            if reaches_end else self.B)
+                current=self._run_group(q,block_index,count,last_valid)
                 state=current if state is None else self.combine(state,current)
+                block_index+=count;remaining-=count
             assert state is not None
             out=state[:self.Hq]
         self.offset=valid
@@ -2948,6 +3081,37 @@ def attention_core_smoke(checkpoint: Checkpoint, engine_path: str,
     assert_standalone("attention core smoke test")
 
 
+def long_attention_core_smoke(engine_path:str,context:int=512,
+                              valid:int=257)->None:
+    """Validate the integrated streamed core and ANE online-softmax merge."""
+    if context<=256:
+        raise ValueError("long attention smoke requires --context over 256")
+    if not 257<=valid<=context:
+        raise ValueError("long attention --valid must be 257..context")
+    driver=AneDriver(engine_path);core=AneLongContextAttentionCore(driver,context)
+    rng=np.random.default_rng(20_480+valid)
+    q=rng.normal(0,.3,(24,256)).astype(np.float16)
+    k=rng.normal(0,.3,(4,valid,256)).astype(np.float16)
+    v=rng.normal(0,.3,(4,valid,256)).astype(np.float16)
+    for block,start in enumerate(range(0,valid-1,core.B)):
+        count=min(core.B,valid-1-start)
+        core.keys[block,:,:count]=k[:,start:start+count]
+        core.values[block,:,:count]=v[:,start:start+count]
+    core.offset=valid-1
+    got=core(q,k[:,-1],v[:,-1]).astype(np.float32)
+    qg=q.astype(np.float32).reshape(4,6,256)
+    scores=np.matmul(qg,k.astype(np.float32).swapaxes(-1,-2))*.0625
+    scores-=scores.max(axis=-1,keepdims=True)
+    prob=np.exp(scores);prob/=prob.sum(axis=-1,keepdims=True)
+    ref=np.matmul(prob,v.astype(np.float32)).reshape(24,256)
+    rel=float(np.max(np.abs(got-ref))/(np.max(np.abs(ref))+1e-9))
+    if not np.isfinite(got).all() or rel>=2e-2:
+        raise RuntimeError(f"long-context attention validation failed rel={rel}")
+    print(f"PURE_ANE_LONG_ATTENTION=PASS context={context} valid={valid} "
+          f"relative_error={rel:.6g} programs={len(core.programs)}")
+    assert_standalone("long attention core smoke test")
+
+
 def attention_layer_smoke(checkpoint: Checkpoint, engine_path: str,
                           token_id: int, bits: int) -> None:
     """Execute a complete full-attention decoder layer on ANE."""
@@ -3006,7 +3170,7 @@ def main() -> None:
     p.add_argument("--model", default=os.environ.get(
         "Q38_MODEL", "/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B"))
     p.add_argument("--engine-path", default=os.environ.get(
-        "Q38_ANE_ENGINE", "/Users/true/AppleLLM/q38_native_engine"))
+        "Q38_ANE_ENGINE", _REPO_ROOT))
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("inspect")
     smoke = sub.add_parser("loader-smoke")
@@ -3026,11 +3190,17 @@ def main() -> None:
     acore = sub.add_parser("attention-core-smoke")
     acore.add_argument("--token-id", type=int, default=9419)
     acore.add_argument("--bits", type=int, choices=(4, 8, 16), default=4)
+    along = sub.add_parser("attention-long-smoke")
+    along.add_argument("--context",type=int,default=512)
+    along.add_argument("--valid",type=int,default=257,
+                       help="populated positions to validate")
     alayer = sub.add_parser("attention-layer-smoke")
     alayer.add_argument("--token-id", type=int, default=9419)
     alayer.add_argument("--bits", type=int, choices=(4, 8, 16), default=4)
     infer = sub.add_parser("infer")
     infer.add_argument("--prompt", default="Reply with exactly: OK")
+    infer.add_argument("--prompt-file",
+                       help="read the prompt from a UTF-8 file (overrides --prompt)")
     infer.add_argument("--tokens", type=int, default=4)
     infer.add_argument("--bits", type=int, choices=(4,8,16), default=16)
     infer.add_argument("--raw-prompt", action="store_true")
@@ -3060,10 +3230,14 @@ def main() -> None:
         gdn_layer_smoke(checkpoint, args.engine_path, args.token_id, args.bits)
     elif args.command == "attention-core-smoke":
         attention_core_smoke(checkpoint, args.engine_path, args.token_id, args.bits)
+    elif args.command == "attention-long-smoke":
+        long_attention_core_smoke(args.engine_path,args.context,args.valid)
     elif args.command == "attention-layer-smoke":
         attention_layer_smoke(checkpoint, args.engine_path, args.token_id, args.bits)
     elif args.command == "infer":
-        pure_infer(checkpoint,args.engine_path,args.prompt,args.tokens,
+        prompt=(Path(args.prompt_file).read_text(encoding="utf-8")
+                if args.prompt_file else args.prompt)
+        pure_infer(checkpoint,args.engine_path,prompt,args.tokens,
                    args.bits,args.raw_prompt,args.verify_reference,args.mtp_draft,
                    args.context)
 

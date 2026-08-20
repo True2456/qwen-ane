@@ -2252,7 +2252,9 @@ def main():
                    help="MoE layers to run on the ANE; -1 = all, 0 = GPU baseline")
     p.add_argument("--ane-seq", type=int, default=ANE_MIN_SEQ,
                    help=f"ANE program width; clamped to >={ANE_MIN_SEQ} (zeros below)")
-    p.add_argument("--engine", default="~/AppleLLM/q38_native_engine")
+    p.add_argument("--engine", default=os.environ.get(
+        "Q38_ANE_ENGINE",
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     p.add_argument("--port", type=int, default=1239)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--name", default=None, help="model id reported to clients")

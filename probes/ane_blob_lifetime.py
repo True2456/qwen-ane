@@ -6,7 +6,8 @@ holding those files is pure waste -- deleting them would roughly halve the
 memory a build consumes.
 """
 import os, sys, shutil, subprocess, numpy as np, importlib.util
-sys.path.insert(0, os.path.expanduser("~/AppleLLM/q38_native_engine"))
+sys.path.insert(0, os.environ.get("Q38_ANE_ENGINE",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 spec = importlib.util.spec_from_file_location("ane_serve",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools", "ane_serve.py"))
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)

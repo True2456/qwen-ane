@@ -1,6 +1,7 @@
 """Where does the fused layer's 30 ms come from? Build it up piece by piece."""
 import os, sys, io, time, contextlib, numpy as np
-sys.path.insert(0, os.path.expanduser("~/AppleLLM/q38_native_engine"))
+sys.path.insert(0, os.environ.get("Q38_ANE_ENGINE",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import runtime.q38_ane_engine as E
 from runtime.q38_ane_engine import AneEngine, _iosurface_view
 

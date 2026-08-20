@@ -5,7 +5,8 @@ on computing mean(x^2) over C in the [1, C, 1, S] planar layout. Tries several
 MIL formulations and checks each against numpy.
 """
 import os, sys, io, contextlib, numpy as np
-sys.path.insert(0, os.path.expanduser("~/AppleLLM/q38_native_engine"))
+sys.path.insert(0, os.environ.get("Q38_ANE_ENGINE",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import runtime.q38_ane_engine as E
 from runtime.q38_ane_engine import AneEngine, _iosurface_view
 
