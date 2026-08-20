@@ -1,0 +1,43 @@
+#!/bin/zsh
+# Launcher for the ANE tools. Hybrid commands use oMLX's isolated interpreter.
+# The pure-* commands deliberately use system Python with PYTHONPATH removed;
+# they do not import or link MLX/oMLX, PyTorch, Core ML, or Metal compute.
+#
+#   tools/ane serve  --dense-layers 64 --ane-lm-head --dense-bits 4
+#   tools/ane spec   --ane-layers 64 --ane-lm-head --draft 2 --tokens 48
+#   tools/ane bench  --dense-layers 64 --ane-lm-head --dense-bits 4
+#   tools/ane pure-inspect
+#   tools/ane pure-loader-smoke --text 'hello'
+#   tools/ane pure-projection-smoke --bits 4
+#   tools/ane pure-gdn-conv-smoke --bits 4
+#   tools/ane pure-gdn-recurrence-smoke --bits 4
+#   tools/ane pure-gdn-layer-smoke --bits 4
+#   tools/ane pure-attention-core-smoke --bits 4
+#   tools/ane pure-attention-layer-smoke --bits 4
+#   tools/ane pure-infer --prompt 'Reply with exactly: OK' --tokens 4 --bits 16
+#   tools/ane pure-infer --prompt 'Reply with exactly: OK' --tokens 32 --bits 4 --mtp-draft 2
+#
+set -u
+REPO=${0:A:h:h}
+O=/Applications/oMLX.app/Contents/Resources
+PY="$O/Python/cpython-3.11/bin/python3.11"
+MODEL=${Q38_MODEL:-/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B}
+export PYTHONPATH="$O/Python/framework-mlx-base/lib/python3.11/site-packages:$O:$HOME/AppleLLM/q38_native_engine"
+[[ -x "$PY" ]] || { echo "oMLX python not found at $PY"; exit 1; }
+
+cmd=${1:-serve}; shift 2>/dev/null || true
+case "$cmd" in
+  serve) exec "$PY" -u -P "$REPO/tools/ane_serve.py" --model "$MODEL" "$@" ;;
+  bench) exec "$PY" -u -P "$REPO/tools/ane_serve.py" --model "$MODEL" --bench "$@" ;;
+  spec)  exec "$PY" -u -P "$REPO/tools/mtp_specdec.py" --model "$MODEL" "$@" ;;
+  pure-inspect) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane.py" --model "$MODEL" inspect "$@" ;;
+  pure-loader-smoke) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane.py" --model "$MODEL" loader-smoke "$@" ;;
+  pure-projection-smoke) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane.py" --model "$MODEL" projection-smoke "$@" ;;
+  pure-gdn-conv-smoke) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane.py" --model "$MODEL" gdn-conv-smoke "$@" ;;
+  pure-gdn-recurrence-smoke) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane.py" --model "$MODEL" gdn-recurrence-smoke "$@" ;;
+  pure-gdn-layer-smoke) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane.py" --model "$MODEL" gdn-layer-smoke "$@" ;;
+  pure-attention-core-smoke) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane.py" --model "$MODEL" attention-core-smoke "$@" ;;
+  pure-attention-layer-smoke) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane.py" --model "$MODEL" attention-layer-smoke "$@" ;;
+  pure-infer) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane.py" --model "$MODEL" infer "$@" ;;
+  *)     echo "usage: tools/ane {serve|bench|spec|pure-inspect|pure-loader-smoke|pure-projection-smoke|pure-gdn-conv-smoke|pure-gdn-recurrence-smoke|pure-gdn-layer-smoke|pure-attention-core-smoke|pure-attention-layer-smoke|pure-infer} [args...]"; exit 2 ;;
+esac
