@@ -366,11 +366,11 @@ def _rms(x, w, eps):
 
 
 def _silu(x):
-    return x / (1.0 + np.exp(-x, dtype=np.float64)).astype(x.dtype)
+    return x / (1.0 + np.exp(-x, dtype=np.float32))
 
 
 def _sigmoid(x):
-    return (1.0 / (1.0 + np.exp(-x.astype(np.float64)))).astype(np.float32)
+    return 1.0 / (1.0 + np.exp(-np.asarray(x, np.float32)))
 
 
 class LingReference:
@@ -396,6 +396,22 @@ class LingReference:
             self._w[name] = self.ck.tensor(name, np.float32)
         return self._w[name]
 
+    def wt(self, name: str) -> np.ndarray:
+        """The transpose, cached contiguously.
+
+        Every projection here is `x @ W.T`. `W.T` is a non-contiguous view, so
+        numpy materializes a fresh copy on each call -- 966 MB per token for
+        lm_head alone. Only the transpose is kept, so this costs no extra
+        memory over caching W.
+        """
+        key = name + "\x00T"
+        if key not in self._w:
+            src = self._w.pop(name, None)
+            if src is None:
+                src = self.ck.tensor(name, np.float32)
+            self._w[key] = np.ascontiguousarray(src.T)
+        return self._w[key]
+
     def reset(self) -> None:
         for v in self.state.values():
             v[:] = 0
@@ -420,8 +436,8 @@ class LingReference:
             _silu(conv[2*P:]).reshape(H, D)
         q = q / np.linalg.norm(q, axis=-1, keepdims=True)
         k = k / np.linalg.norm(k, axis=-1, keepdims=True)
-        f = (x @ self.w(n["f"]).T).reshape(H, D)
-        beta = _sigmoid(x @ self.w(n["b"]).T)                   # [H]
+        f = (x @ self.wt(n["f"])).reshape(H, D)
+        beta = _sigmoid(x @ self.wt(n["b"]))                   # [H]
         a = np.exp(self.w(n["a_log"]))[:, None]
         z = a * (f + self.w(n["dt_bias"]).reshape(H, D))
         g = np.exp(s.kda_lower_bound * _sigmoid(z))             # [H, D] per key channel
@@ -434,17 +450,17 @@ class LingReference:
         # o_norm is an RMSNorm applied to y, and RMSNorm is scale invariant, so
         # the reference kernel's q * D**-0.5 is absorbed here with eps * D.
         y = _rms(y, self.w(n["o_norm"]), s.rms_eps * D)
-        gate = _sigmoid(x @ self.w(n["gate"]).T).reshape(H, D)
-        return (y * gate).reshape(-1) @ self.w(n["out"]).T
+        gate = _sigmoid(x @ self.wt(n["gate"])).reshape(H, D)
+        return (y * gate).reshape(-1) @ self.wt(n["out"])
 
     # ------------------------------------------------------------------ MLA
     def mla(self, x, layer):
         s, n = self.spec, self.attention_names_cached(layer)
         H, Dn, Dr, Dv = s.heads, s.qk_nope, s.qk_rope, s.v_head_dim
-        q = _rms(x @ self.w(n["q_a"]).T, self.w(n["q_a_norm"]), s.rms_eps)
-        q = (q @ self.w(n["q_b"]).T).reshape(H, s.qk_head_dim)
+        q = _rms(x @ self.wt(n["q_a"]), self.w(n["q_a_norm"]), s.rms_eps)
+        q = (q @ self.wt(n["q_b"])).reshape(H, s.qk_head_dim)
         q_nope, q_rope = q[:, :Dn], q[:, Dn:]
-        c = x @ self.w(n["kv_a"]).T
+        c = x @ self.wt(n["kv_a"])
         lat, k_rope = c[:s.kv_lora_rank], c[s.kv_lora_rank:]
         lat = _rms(lat, self.w(n["kv_a_norm"]), s.rms_eps)
         inv = 1.0 / (s.rope_theta ** (np.arange(0, Dr, 2, np.float64) / Dr))
@@ -469,14 +485,14 @@ class LingReference:
         p /= p.sum(-1, keepdims=True)
         ctx = p @ L
         attn = np.einsum("hl,hvl->hv", ctx, W_V)
-        gate = _sigmoid(x @ self.w(n["gate"]).T)                # [H] head_wise
-        return (attn * gate[:, None]).reshape(-1) @ self.w(n["out"]).T
+        gate = _sigmoid(x @ self.wt(n["gate"]))                # [H] head_wise
+        return (attn * gate[:, None]).reshape(-1) @ self.wt(n["out"])
 
     # ------------------------------------------------------------------ MoE
     def route(self, x, layer):
         """BailingMoeV3Gate. fp32; sigmoid scoring; group-limited top-k."""
         s, m = self.spec, self.mlp_names_cached(layer)
-        logits = x.astype(np.float32) @ self.w(m["router"]).T.astype(np.float32)
+        logits = x.astype(np.float32) @ self.wt(m["router"]).astype(np.float32)
         scores = _sigmoid(logits)                                # NOT softmax
         routing = scores + self.w(m["expert_bias"])              # selection only
         grp = routing.reshape(s.n_group, -1)
@@ -496,19 +512,37 @@ class LingReference:
         idx, wts = self.route(x, layer)
         out = np.zeros_like(x)
         for e, wt in zip(idx, wts):
-            g = self.w(self.spec.expert_name(layer, int(e), "gate"))
-            u = self.w(self.spec.expert_name(layer, int(e), "up"))
-            d = self.w(self.spec.expert_name(layer, int(e), "down"))
-            out += wt * ((_silu(x @ g.T) * (x @ u.T)) @ d.T)
+            e = int(e)
+            g = self.wt(self.spec.expert_name(layer, e, "gate"))
+            u = self.wt(self.spec.expert_name(layer, e, "up"))
+            d = self.wt(self.spec.expert_name(layer, e, "down"))
+            out += wt * ((_silu(x @ g) * (x @ u)) @ d)
         m = self.mlp_names_cached(layer)
         sg, su, sd = (self.w(m["shared_gate"]), self.w(m["shared_up"]),
                       self.w(m["shared_down"]))
         return out + (_silu(x @ sg.T) * (x @ su.T)) @ sd.T       # unscaled
 
+    def expert_stack(self, layer, idx):
+        """gate|up rows for the routed experts, stacked into one [2*K*M, H]."""
+        parts = [self.w(self.spec.expert_name(layer, int(e), k))
+                 for k in ("gate", "up") for e in idx]
+        return np.concatenate(parts)
+
+    def expert_down(self, layer, idx):
+        """down for the routed experts, concatenated along its INPUT axis.
+
+        sum_e down_e @ a_e == [down_0|...|down_7] @ [a_0;...;a_7], so the expert
+        sum falls out of one matmul -- the same identity the ANE stacked-expert
+        layout uses (docs/ANE-MOE-HANDOFF.md).
+        """
+        return np.concatenate(
+            [self.w(self.spec.expert_name(layer, int(e), "down")) for e in idx],
+            axis=1)
+
     def dense_mlp(self, x, layer):
         m = self.mlp_names_cached(layer)
-        return (_silu(x @ self.w(m["gate"]).T) * (x @ self.w(m["up"]).T)) \
-            @ self.w(m["down"]).T
+        return (_silu(x @ self.wt(m["gate"])) * (x @ self.wt(m["up"]))) \
+            @ self.wt(m["down"])
 
     # ---------------------------------------------------------------- caches
     def attention_names_cached(self, layer):
@@ -537,7 +571,7 @@ class LingReference:
                      else self.dense_mlp(p, layer))
         self.pos += 1
         h = _rms(h, self.w("model.norm.weight"), s.rms_eps)
-        return h @ self.w("lm_head.weight").T
+        return h @ self.wt("lm_head.weight")
 
 
 def reference_generate(model_dir: str, prompt: str, tokens: int,
