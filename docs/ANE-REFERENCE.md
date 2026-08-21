@@ -17,6 +17,7 @@ expect — so measure, don't assume.
 | depthwise spatial `conv`, `groups=C`, kernel 1×4 | works at Qwen's real C=10240 shape |
 | `slice_by_index`, `transpose`, `pad`, `identity`, `matmul` | work |
 | `constexpr_blockwise_shift_scale` (int4/int8 dequant) | works, per-output-channel scales only |
+| `matmul` with a 1x1 inner shape, `[1,H,1,1] x [1,H,1,1]` | **compile fails** — use `mul` |
 | `concat` | **compile fails** |
 | `stack` | **compile fails** |
 | `rsqrt` | **compile fails** — use `sqrt` + `real_div` |
@@ -228,6 +229,19 @@ attention bank.
   7–20 GB/s.
 * **Decode cost is flat from 1 to 32 tokens** — the hardware pads to width 32,
   so a 1-token step computes 32 lanes and discards 31.
+
+## Compiler-service failures cascade
+
+`Error Domain=NSCocoaErrorDomain Code=4097 "connection to service named
+com.apple.ANECompilerService"` is usually **not** the real error. Once
+`ANECompilerService` dies, every later compile reports that instead of its own
+diagnosis, including in freshly started processes.
+
+The same graph that reported the service error reported `InvalidMILProgram`
+when compiled first in a clean process. Kill the service (`pkill -f
+ANECompilerService`) or compile the suspect graph first, or you will attribute
+a plain MIL rejection to a compiler crash and go looking for a size limit that
+is not there.
 
 ## Debugging notes
 

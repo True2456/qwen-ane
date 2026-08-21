@@ -215,6 +215,19 @@ def chunk_mil(module, tokens: int) -> tuple[str, int, int]:
 
     current = "a0"
     for i in range(1, tokens):
+        if i == 1:
+            # The i=1 correction is a 1x1 matmul, which the compiler rejects
+            # with InvalidMILProgram -- and since every token count runs this
+            # iteration, it is why the chunk graph failed at every size, T=2
+            # included. At i=1 the product is a per-head scalar, so `mul` is
+            # exact and accepted.
+            lines.append(f'''    tensor<fp16, [1, {H}, 1, 1]> row1 = slice_by_index(begin=tensor<int32, [4]>([0,0,1,0]), end=tensor<int32, [4]>([1,{H},2,1]), x={current})[name=string("row1")];
+    tensor<fp16, [1, {H}, 1, 1]> sub1 = slice_by_index(begin=tensor<int32, [4]>([0,0,0,0]), end=tensor<int32, [4]>([1,{H},1,1]), x={current})[name=string("sub1")];
+    tensor<fp16, [1, {H}, 1, 1]> corr1 = mul(x=row1, y=sub1)[name=string("corr1")];
+    tensor<fp16, [1, {H}, {tokens}, {tokens}]> cp1 = pad(mode=string("constant"), constant_val=fp16(0x0p+0), pad=tensor<int32, [8]>([0,0,0,0,1,{tokens-2},0,{tokens-1}]), x=corr1)[name=string("cp1")];
+    tensor<fp16, [1, {H}, {tokens}, {tokens}]> a1 = add(x={current}, y=cp1)[name=string("a1")];''')
+            current = "a1"
+            continue
         lines.append(f'''    tensor<fp16, [1, {H}, 1, {i}]> row{i} = slice_by_index(begin=tensor<int32, [4]>([0,0,{i},0]), end=tensor<int32, [4]>([1,{H},{i+1},{i}]), x={current})[name=string("row{i}")];
     tensor<fp16, [1, {H}, {i}, {i}]> sub{i} = slice_by_index(begin=tensor<int32, [4]>([0,0,0,0]), end=tensor<int32, [4]>([1,{H},{i},{i}]), x={current})[name=string("sub{i}")];
     tensor<fp16, [1, {H}, 1, {i}]> corr{i} = matmul(transpose_x=bool(false), transpose_y=bool(false), x=row{i}, y=sub{i})[name=string("corr{i}")];
