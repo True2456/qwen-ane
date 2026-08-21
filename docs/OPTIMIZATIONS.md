@@ -414,3 +414,66 @@ env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P probes/ane_decode_budget.py
 
 Nothing else may be using the ANE while these run (O6), or every compile
 returns `0x50004` and the probe reports "rejected" for shapes that are fine.
+
+
+## Solving the recurrence: what is tractable and what is not
+
+Both ports end at the same wall from opposite directions. The gated-delta scan
+is flat per token no matter how wide the programs get, so it is what stops
+prefill from reaching the ANE's arithmetic rate (19.1 TFLOP/s at S=512 against
+8.9 at S=32). The fix is the chunked/WY formulation, which replaces the
+sequential scan with matmuls:
+
+```text
+G_t   = prod_{s<=t} g_s                     cumulative decay
+A[t,s] = (k_s . k_t) * (G_t/G_s)   s < t    strictly lower triangular
+delta  = (I + diag(beta) A)^-1 u            one triangular solve
+Y      = Q~ S_0^T + tril(Q~ K~^T) delta     matmuls
+```
+
+Everything is a matmul over `[C, Dk]` and `[C, C]`, which the ANE does well,
+and the state is never materialized per position.
+
+### Qwen's GDN: tractable
+
+Its decay is a **per-head scalar**, so `G_t/G_s` is one number per (head, t, s)
+and `A = (K K^T) * D` is a plain masked matmul. Nothing in it is
+fp16-hostile. This is the version worth building.
+
+### Ling's KDA: blocked in fp16, measured
+
+Its decay is per **(head, key-channel)**, so the relative decay is a
+`[C, C, Dk]` tensor and the contraction is no longer a plain matmul. The usual
+way around that is to form `k~ = k / G` and keep plain matmuls -- but `G`
+underflows. Measured against the real layer-1 `A_log`/`dt_bias`:
+
+| chunk C | median G | 1st pct | min | % of channels below fp16 min normal |
+|---:|---:|---:|---:|---:|
+| 8 | 4.19e-03 | 4.43e-12 | 6.03e-16 | **33.6%** |
+| 16 | 5.91e-06 | 1.75e-21 | 8.39e-29 | **56.2%** |
+| 32 | 1.25e-11 | 2.90e-38 | 0 | **72.3%** |
+| 64 | 3.28e-23 | 0 | 0 | **82.3%** |
+
+At C=8 a third of channels already underflow, so `k/G` overflows. The relative
+form `G_t/G_s` is bounded by 1 and underflows harmlessly -- zero means fully
+decayed, which is correct -- but it is the form that is not a plain matmul.
+On fp16-only hardware this needs the log-space `chunk_kda` treatment, and it
+should be treated as research rather than porting.
+
+### What solving it for Qwen would be worth
+
+The recurrence is 21.8% of prefill, so removing it alone is only ~1.2x. The
+larger effect is second-order: the recurrence is the term that does **not**
+scale with program width, which is why widening to 64 measured exactly neutral
+(the tail's per-token cost halved and the recurrence's did not). Take it out and
+width finally pays, letting the projections run at 19 TFLOP/s instead of 8.9.
+
+Estimated end state, from measured components: **Qwen prefill ~40-55 tok/s
+against the GPU's 304.** Still 6x behind, because the ANE's sustained 19
+TFLOP/s is 2.4x under the GPU's ~45 and that part is irreducible.
+
+At roughly 6 W against 60-84 W, that 6x gap is about 1.7x **better** per joule,
+which is the same ratio `docs/PERFORMANCE.md` already measures for the isolated
+kernels. Whether that holds end-to-end has not been measured here -- it needs
+`sudo powermetrics` over the generation window, and no power number in this
+document was measured this session.
