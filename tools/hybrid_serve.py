@@ -325,12 +325,10 @@ class HybridEngine:
                     accepted_total += len(drafts) + 1
                 else:
                     restore_caches(c, gsnap)
-                    for x, off in zip([y for y in c if y.is_trimmable()], kv_before):
-                        x.offset = off + 1 + n_ok
                     restore_caches([mc], msnap)
                     keep = drafts[:n_ok]
                     fix = preds[n_ok]
-                    hv2 = hv[:, :n_ok + 1]
+                    hv2 = self.inner(mx.array([[cur] + keep]), cache=c)
                     nxt = keep + [fix]
                     self.mtp_layer(mx.concatenate([self.pre_e(self.embed(mx.array([nxt]))),
                                                   self.pre_h(hv2)], -1) @ self.fcw.T, cache=mc)
@@ -700,6 +698,7 @@ def main():
                             self.wfile.flush()
                         except (BrokenPipeError, ConnectionResetError):
                             pass
+                        self.close_connection = True
                         return
 
                     try:
