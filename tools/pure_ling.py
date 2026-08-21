@@ -413,6 +413,8 @@ class LingReference:
         return self._w[key]
 
     def reset(self) -> None:
+        if getattr(self, "recur", None) is not None:
+            self.recur.reset(self.spec.linear_attention_layers)
         for v in self.state.values():
             v[:] = 0
         for v in self.conv.values():
@@ -1018,6 +1020,9 @@ class LingPrefill(LingRuntime):
                        if ane_absorb else None)
         if self.absorb:
             self.programs += self.absorb.programs
+        self.recur = AneKdaRecurrence(self.driver, self.spec)
+        self.recur.reset(self.spec.linear_attention_layers)
+        self.programs += self.recur.programs
         self.head = AneVocabHead(self.driver, self.ck, self.spec,
                                  self.bits, 4, self.width)
         self.programs += self.head.programs
@@ -1055,14 +1060,18 @@ class LingPrefill(LingRuntime):
         g = np.exp(s.kda_lower_bound * _sigmoid(
             a * (fl.T.reshape(T, H, D) + self.w(n["dt_bias"]).reshape(H, D))))
 
-        S = self.state[layer]
         Y = np.empty((T, H, D), np.float32)
-        for t in range(T):                                  # the one serial part
-            S = S * g[t][:, None, :]
-            delta = (v[t] - np.einsum("hvd,hd->hv", S, k[t])) * beta[t][:, None]
-            S = S + delta[:, :, None] * k[t][:, None, :]
-            Y[t] = np.einsum("hvd,hd->hv", S, q[t])
-        self.state[layer] = S
+        if getattr(self, "recur", None) is not None:
+            for t in range(T):          # serial, but the arithmetic is on the ANE
+                Y[t] = self.recur.step(layer, g[t], k[t], q[t], v[t], beta[t])
+        else:
+            S = self.state[layer]
+            for t in range(T):
+                S = S * g[t][:, None, :]
+                delta = (v[t] - np.einsum("hvd,hd->hv", S, k[t])) * beta[t][:, None]
+                S = S + delta[:, :, None] * k[t][:, None, :]
+                Y[t] = np.einsum("hvd,hd->hv", S, q[t])
+            self.state[layer] = S
         Y = _rms_rows(Y, self.w(n["o_norm"]), s.rms_eps * D)
         Y = (Y * _sigmoid(gate_r).T.reshape(T, H, D)).reshape(T, -1)
         return _cols(self.proj.kda_out.run(i, Y.T.astype(np.float16))).astype(np.float32).T
@@ -1266,3 +1275,112 @@ class AneMlaAbsorb:
         T = ctx.shape[0]
         r = self._run(self.v_progs[layer], ctx.reshape(T, -1))
         return r.reshape(T, s.heads, s.v_head_dim)
+
+
+class AneKdaRecurrence:
+    """The gated-delta recurrence on the ANE, one shared program, resident state.
+
+    Validated in probes/ane_ling_kda_step.py: y rel 1.4e-3, state rel 1.1e-3
+    over six dependent steps, no drift. Two bound outputs rather than
+    pad+pad+add, which that probe measured at 0.508 ms against 0.138.
+
+    State stays in a per-layer IOSurface. The program reads it from the input
+    surface's first Dv columns and writes the updated state to the secondary
+    output, which is copied back in place -- 512 KB, far cheaper than moving
+    [16,128,128] through numpy every position.
+
+    Layout is Qwen's: state[h,dv,dk] at channel h*Dk+dk, width dv. Decay is per
+    (h,dk), which IS the channel index, so it rides in as a width-1 column.
+    """
+
+    def __init__(self, driver, spec):
+        import contextlib, io, re
+        from pure_ane import _bind_secondary_output, _submit_bound
+        self.driver, self.spec = driver, spec
+        self._submit_bound = _submit_bound
+        E = driver.module
+        H, Dk, Dv = spec.heads, spec.head_dim, spec.head_dim
+        self.H, self.Dk, self.Dv = H, Dk, Dv
+        self.HK = HK = H * Dk
+        self.CIN = CIN = HK + 2 * H
+        self.GCOL, self.KCOL, self.QCOL, self.BCOL = Dv, Dv + 1, Dv + 2, Dv + 3
+        self.W = W = ((Dv + 5 + 31) // 32) * 32
+
+        def sl(name, c0, c1, w0, w1):
+            return (f'    tensor<fp16, [1, {c1-c0}, 1, {w1-w0}]> {name} = '
+                    f'slice_by_index(begin=tensor<int32, [4]>([0,{c0},0,{w0}]), '
+                    f'end=tensor<int32, [4]>([1,{c1},1,{w1}]), x=x)'
+                    f'[name=string("{name}")];')
+
+        blobs = {"sum.bin": np.ones((H, Dk, 1, 1), np.float16).tobytes(),
+                 "rep.bin": np.ones((HK, 1, 1, 1), np.float16).tobytes()}
+        mil = f'''program(1.3)
+{E._BUILD_INFO}
+{{
+  func main<ios18>(tensor<fp16, [1, {CIN}, 1, {W}]> x) {{
+    string pt=const()[name=string("pt"),val=string("valid")];
+    tensor<int32,[2]> st=const()[name=string("st"),val=tensor<int32,[2]>([1,1])];
+    tensor<int32,[4]> pd=const()[name=string("pd"),val=tensor<int32,[4]>([0,0,0,0])];
+    tensor<int32,[2]> dl=const()[name=string("dl"),val=tensor<int32,[2]>([1,1])];
+    int32 gh=const()[name=string("gh"),val=int32({H})];
+    tensor<fp16, [{H}, {Dk}, 1, 1]> sw = const()[name=string("sw"), val=tensor<fp16, [{H}, {Dk}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/sum.bin"), offset=uint64(64)))];
+    tensor<fp16, [{HK}, 1, 1, 1]> rw = const()[name=string("rw"), val=tensor<fp16, [{HK}, 1, 1, 1]>(BLOBFILE(path=string("@model_path/weights/rep.bin"), offset=uint64(64)))];
+{sl("s0", 0, HK, 0, Dv)}
+{sl("gc", 0, HK, self.GCOL, self.GCOL+1)}
+{sl("kc", 0, HK, self.KCOL, self.KCOL+1)}
+{sl("qc", 0, HK, self.QCOL, self.QCOL+1)}
+{sl("vv", HK, HK+H, 0, Dv)}
+{sl("bb", HK+H, HK+2*H, self.BCOL, self.BCOL+1)}
+    tensor<fp16,[1,{HK},1,{Dv}]> sd=mul(x=s0,y=gc)[name=string("sd")];
+    tensor<fp16,[1,{HK},1,{Dv}]> sk=mul(x=sd,y=kc)[name=string("sk")];
+    tensor<fp16,[1,{H},1,{Dv}]> kv=conv(dilations=dl,groups=gh,pad=pd,pad_type=pt,strides=st,weight=sw,x=sk)[name=string("kv")];
+    tensor<fp16,[1,{H},1,{Dv}]> df=sub(x=vv,y=kv)[name=string("df")];
+    tensor<fp16,[1,{H},1,{Dv}]> dd=mul(x=df,y=bb)[name=string("dd")];
+    tensor<fp16,[1,{HK},1,{Dv}]> db=conv(dilations=dl,groups=gh,pad=pd,pad_type=pt,strides=st,weight=rw,x=dd)[name=string("db")];
+    tensor<fp16,[1,{HK},1,{Dv}]> dkk=mul(x=db,y=kc)[name=string("dkk")];
+    tensor<fp16,[1,{HK},1,{Dv}]> s2=add(x=sd,y=dkk)[name=string("s2")];
+    tensor<fp16,[1,{HK},1,{Dv}]> sq=mul(x=s2,y=qc)[name=string("sq")];
+    tensor<fp16,[1,{H},1,{Dv}]> yy=conv(dilations=dl,groups=gh,pad=pd,pad_type=pt,strides=st,weight=sw,x=sq)[name=string("yy")];
+    tensor<fp16,[1,{H},1,{Dv}]> y=identity(x=yy)[name=string("y")];
+    tensor<fp16,[1,{HK},1,{Dv}]> y2=identity(x=s2)[name=string("y2")];
+  }} -> (y, y2);
+}}
+'''
+        cap = io.StringIO()
+        with contextlib.redirect_stdout(cap), contextlib.redirect_stderr(cap):
+            self.program = driver.engine.compile_multiproc(mil, blobs, CIN, H, W)
+        if self.program is None:
+            raise RuntimeError("kda recurrence compile failed:\n"
+                               f"{cap.getvalue().strip()[-300:]}")
+        driver.engine._ensure_io(self.program)
+        # the helper sizes the second surface for width 32; state is width Dv
+        orig = E._iosurface_alloc_size
+        E._iosurface_alloc_size = lambda n: orig(n // 32 * Dv)
+        self.state_surf, self.request = _bind_secondary_output(
+            driver, self.program, HK)
+        E._iosurface_alloc_size = orig
+        driver.discard_compiler_files(self.program)
+        self.programs = 1
+        self.states = {}
+
+    def reset(self, layers):
+        self.states = {l: np.zeros((self.HK, self.Dv), np.float16) for l in layers}
+
+    def step(self, layer, g, k, q, v, beta):
+        """One position. g/k/q are [H,Dk]; v is [H,Dv]; beta is [H]."""
+        HK, H, Dv, W = self.HK, self.H, self.Dv, self.W
+        x = np.zeros((self.CIN, W), np.float16)
+        x[:HK, :Dv] = self.states[layer]
+        x[:HK, self.GCOL] = g.reshape(-1)
+        x[:HK, self.KCOL] = k.reshape(-1)
+        x[:HK, self.QCOL] = q.reshape(-1)
+        x[HK:HK + H, :Dv] = v
+        x[HK + H:HK + 2 * H, self.BCOL] = beta
+        with self.driver.view(self.program._in_surf, (self.CIN, W),
+                              np.float16) as d:
+            np.copyto(d, x)
+        self._submit_bound(self.driver, self.program, self.request)
+        with self.driver.view(self.state_surf, (HK, Dv), np.float16) as o:
+            self.states[layer] = np.array(o, np.float16)
+        with self.driver.view(self.program._out_surf, (H, Dv), np.float16) as o:
+            return np.array(o, np.float32)
