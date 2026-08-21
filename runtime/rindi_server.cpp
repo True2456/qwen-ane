@@ -70,28 +70,37 @@ void handle_client(int client_fd, RindiNativeChain* chain) {
 
         if (stream) {
             std::string header = "HTTP/1.1 200 OK\r\n"
-                                 "Content-Type: text/event-stream\r\n"
+                                 "Content-Type: text/event-stream; charset=utf-8\r\n"
                                  "Cache-Control: no-cache\r\n"
                                  "Connection: close\r\n"
                                  "Access-Control-Allow-Origin: *\r\n\r\n";
             write(client_fd, header.c_str(), header.size());
 
-            // Initial role chunk
-            std::string chunk0 = "data: {\"id\":\"chatcmpl-native\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n";
+            // 1. Initial role chunk
+            std::string chunk0 = "data: {\"id\":\"chatcmpl-native\",\"object\":\"chat.completion.chunk\",\"created\":1787300000,\"model\":\"Qwen3.8-27B\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n";
             write(client_fd, chunk0.c_str(), chunk0.size());
 
-            // Stream response
+            // 2. Stream content chunks
             std::string greeting = "Hello! The Rindi Standalone C++ Engine is active with zero Python overhead.";
             std::istringstream iss(greeting);
             std::string word;
             while (iss >> word) {
-                std::string c = "data: {\"id\":\"chatcmpl-native\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"" + word + " \"},\"finish_reason\":null}]}\n\n";
+                std::string c = "data: {\"id\":\"chatcmpl-native\",\"object\":\"chat.completion.chunk\",\"created\":1787300000,\"model\":\"Qwen3.8-27B\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + word + " \"},\"finish_reason\":null}]}\n\n";
                 write(client_fd, c.c_str(), c.size());
-                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                std::this_thread::sleep_for(std::chrono::milliseconds(15));
             }
 
-            std::string done_chunk = "data: {\"id\":\"chatcmpl-native\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-            write(client_fd, done_chunk.c_str(), done_chunk.size());
+            // 3. Final chunk with finish_reason: stop
+            std::string final_chunk = "data: {\"id\":\"chatcmpl-native\",\"object\":\"chat.completion.chunk\",\"created\":1787300000,\"model\":\"Qwen3.8-27B\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+            write(client_fd, final_chunk.c_str(), final_chunk.size());
+
+            // 4. DONE marker
+            std::string done_marker = "data: [DONE]\n\n";
+            write(client_fd, done_marker.c_str(), done_marker.size());
+            
+            // Flush and graceful TCP shutdown
+            shutdown(client_fd, SHUT_WR);
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
             close(client_fd);
             return;
         } else {
