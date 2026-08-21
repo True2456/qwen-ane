@@ -881,9 +881,12 @@ class GdnState:
     request: object
 
 
-def _bind_secondary_output(driver:AneDriver,program,channels:int):
+def _bind_secondary_output(driver:AneDriver,program,channels:int,width:int=32):
+    # `width` is the program's compiled width. It was hardcoded at 32, which
+    # silently under-allocates the secondary surface for wider programs and
+    # fails evaluation rather than the binding.
     E=driver.module;E._load_iosurface()
-    secondary=E._create_iosurface(E._iosurface_alloc_size(channels*32))
+    secondary=E._create_iosurface(E._iosurface_alloc_size(channels*width))
     inner=E._msg(program.model,"model") or program.model
     desc=E._desc(E._msg(inner,"description"))
     outputs=[(int(c),n) for c,_,n in re.findall(
@@ -1281,7 +1284,7 @@ class AneGdnTail:
             tail = "\n".join(capture.getvalue().strip().splitlines()[-10:])
             raise RuntimeError(f"ANE GDN tail compile failed:\n{tail}")
         driver.engine._ensure_io(self.program)
-        if self.has_next:self.next_surface,self.request=_bind_secondary_output(driver,self.program,self.next_output)
+        if self.has_next:self.next_surface,self.request=_bind_secondary_output(driver,self.program,self.next_output,self.width)
         self.nbytes = sum(len(x) for x in blobs.values())
         self.compile_seconds = time.time() - t0
         assert_standalone("GDN tail compile")
@@ -2335,7 +2338,7 @@ class AneAttentionTail:
             tail = "\n".join(capture.getvalue().strip().splitlines()[-10:])
             raise RuntimeError(f"ANE attention tail compile failed:\n{tail}")
         driver.engine._ensure_io(self.program)
-        if self.has_next:self.next_surface,self.request=_bind_secondary_output(driver,self.program,self.next_output)
+        if self.has_next:self.next_surface,self.request=_bind_secondary_output(driver,self.program,self.next_output,self.width)
         self.nbytes = sum(len(x) for x in blobs.values())
         self.compile_seconds = time.time()-t0
         assert_standalone("attention tail compile")
@@ -2752,7 +2755,21 @@ class PureAneRuntime:
         # so lanes below 32 leave the rest of the dispatch idle. Raising this
         # enlarges the per-lane RMSNorm MIL, so it is a parameter, not a
         # constant. Q38_ANE_LANES overrides for measurement.
-        self.active_lanes = int(os.environ.get("Q38_ANE_LANES", "16"))
+        # Program width. Blocks default to 32; a width-64 dispatch is measured
+        # to cost the same, and AneGdnConv reserves 3 columns for convolution
+        # history, so width 32 caps the batch at 29 lanes and AneGdnUnrolled's
+        # power-of-two requirement pins it to 16. Width 64 lifts the cap to 61
+        # and makes 32 lanes legal, halving the prefill passes.
+        self.program_width = int(os.environ.get("Q38_ANE_WIDTH", "32"))
+        if self.program_width % 32:
+            raise ValueError("program width must be a multiple of 32")
+        default_lanes = 16 if self.program_width == 32 else 32
+        self.active_lanes = int(
+            os.environ.get("Q38_ANE_LANES", str(default_lanes)))
+        if self.active_lanes > self.program_width - 3:
+            raise ValueError(
+                f"{self.active_lanes} lanes exceeds the convolution limit "
+                f"{self.program_width - 3} at width {self.program_width}")
         self.mtp_lanes = 3
         if not 0 <= mtp_draft < self.mtp_lanes:
             raise ValueError(f"MTP draft must be 0..{self.mtp_lanes-1}")
@@ -2817,7 +2834,8 @@ class PureAneRuntime:
         l0spec=pspec(0,False)
         layer0_head=AneNormProjection(
             self.driver,checkpoint,l0spec[0],l0spec[1],bits=bits,
-            tag="layer0_head",norm_scale=64,active_lanes=self.active_lanes
+            tag="layer0_head",norm_scale=64,active_lanes=self.active_lanes,
+            width=self.program_width
         )
         self.driver.discard_compiler_files(layer0_head.program)
         self.layers: list[_PureGdnLayer | _PureAttentionLayer] = []
@@ -2848,7 +2866,8 @@ class PureAneRuntime:
                     self.driver,checkpoint,layer,bits=bits,next_norm_name=next_norm,
                     next_projection_names=next_names,
                     active_lanes=self.active_lanes,
-                    down_proj_parts=down_proj_parts
+                    down_proj_parts=down_proj_parts,
+                    width=self.program_width
                 )
                 self.layers.append(_PureAttentionLayer(
                     head,projection_output,prepare,core,tail
@@ -2858,14 +2877,16 @@ class PureAneRuntime:
                 self.blob_bytes += tail.nbytes
             else:
                 conv=AneGdnConv(
-                    self.driver,checkpoint,f"{p}.linear_attn.conv1d.weight"
+                    self.driver,checkpoint,f"{p}.linear_attn.conv1d.weight",
+                    width=self.program_width
                 )
                 state=self.recurrence.new_state()
                 tail=AneGdnTail(
                     self.driver,checkpoint,layer,bits=bits,next_norm_name=next_norm,
                     next_projection_names=next_names,
                     active_lanes=self.active_lanes,
-                    down_proj_parts=down_proj_parts
+                    down_proj_parts=down_proj_parts,
+                    width=self.program_width
                 )
                 al=checkpoint.tensor(f"{p}.linear_attn.A_log",np.float16)
                 dt=checkpoint.tensor(f"{p}.linear_attn.dt_bias",np.float16)
@@ -2881,7 +2902,7 @@ class PureAneRuntime:
                   f"{time.perf_counter()-layer_started:.1f}s",flush=True)
         self.final_head=AneFinalHead(
             self.driver,checkpoint,bits=bits,chunks=4,
-            active_lanes=self.active_lanes
+            active_lanes=self.active_lanes,width=self.program_width
         )
         self.program_count += len(self.final_head.programs)
         self.blob_bytes += self.final_head.nbytes
