@@ -137,8 +137,8 @@ class HybridEngine:
             ane_serve.attach_ane_lm_head(self.model, "mil", 32, dense_bits, 4)
             print(f"  ANE resident programs: {self.ane_layers} layers (41.0 GB host RAM freed)")
         else:
-            print(f"  [Loading Base Model] {model_path}...")
-            self.model, self.tok = load(model_path)
+            print(f"  [Loading Base Model (Lazy mmap)] {model_path}...")
+            self.model, self.tok = load(model_path, lazy=True)
             self.lm = getattr(self.model, "language_model", self.model)
             self.inner = self.lm.model
             self.embed = self.inner.embed_tokens
