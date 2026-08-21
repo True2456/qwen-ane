@@ -1,6 +1,11 @@
 # Porting Ling-3.0-tiny to the pure ANE runtime
 
-Status: **The model runs and generates correct text.** A numpy reference
+Status: **The model runs and generates correct text, and is far slower
+than MLX.** See "Clean benchmark" below before quoting any figure in this
+document -- several earlier numbers were measured against a contended baseline
+and are wrong by two orders of magnitude.
+
+Status (original): **The model runs and generates correct text.** A numpy reference
 forward over the real checkpoint produces ' Paris.' for 'The capital of France
 is', which validates KDA, MLA and the MoE router together. Every ANE building
 block is separately validated on hardware. What remains is wiring those blocks
@@ -550,3 +555,56 @@ trained Medusa-style heads — none of which exist yet.
 
 Build `LingRuntime` against `LingReference`, group-limited dispatch from the
 start, and measure the batched path rather than the single-token one.
+
+
+## Clean benchmark, and a correction that matters
+
+Every MLX comparison earlier in this document was measured while an
+`omlx-server` held 25 GB at 30% CPU. Re-measured with that process idle:
+
+| | ANE port | MLX (bf16, GPU) | ratio |
+|---|---:|---:|---:|
+| prefill, 193-token prompt | 24.5-28.3 tok/s | **2112-3260 tok/s** | **0.013x** |
+| decode | 8.67 tok/s | **143-144 tok/s** | **0.061x** |
+
+**The ANE port is ~16x slower at decode and ~80-100x slower at prefill.**
+
+### Why the earlier numbers were wrong, and the ANE's were not
+
+The ANE figures barely moved: prefill 28.1 -> 28.3, decode 9.0 -> 8.67. The MLX
+figures moved by 5x for generation and 100x for prompt.
+
+That asymmetry is the whole lesson. **MLX and the competing server share the
+GPU and its memory bandwidth; the ANE is a separate engine.** So background load
+crushed one side of the comparison and left the other untouched. A benchmark run
+under load does not degrade uniformly, and "both sides were contended, so the
+ratio is roughly fair" -- which this document previously assumed -- is exactly
+the wrong inference.
+
+The claim that ANE prefill beat MLX "1.1x" was 1.1x against a baseline
+depressed 100-fold. It was never true.
+
+### What the real gap is made of
+
+Prefill: MLX processes the whole prompt as one large GEMM per projection. This
+port is capped at 32 lanes by `AneLinearProjectionBank`'s hardcoded width and
+issues ~1500 dispatches per 32-token chunk, each carrying a 0.09 ms floor and
+~0.19 ms of host marshalling. Widening the banks to 64 is worth about 2x; the
+gap is a hundred.
+
+Decode: 115 ms/token, of which `bank.run` is ~83 ms across 371 calls. The ANE
+arithmetic is a small fraction; dispatch floor and host copies dominate.
+
+This is consistent with, and worse than, `docs/ANE-MOE-HANDOFF.md` 27, which
+measured a 35B MoE at ~11x slower than the GPU and closed the line. Ling-tiny
+does not escape that verdict -- it is a smaller model with more, smaller blocks,
+so the fixed per-dispatch cost is amortized even less well.
+
+### What would have to change
+
+Not tuning. The port would need to stop being dispatch-bound: far fewer, far
+larger dispatches, which for a 1.4B-activated MoE with 24 layers of small blocks
+means fusing whole layers into single programs rather than one program per
+projection. That is the shape of the Qwen chain fusion in
+`docs/ARCHITECTURE.md`, and it is a rewrite of the runtime, not an optimization
+of it.
