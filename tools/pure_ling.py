@@ -1380,18 +1380,18 @@ class AneKdaRecurrence:
     def step(self, layer, g, k, q, v, beta):
         """One position. g/k/q are [H,Dk]; v is [H,Dv]; beta is [H]."""
         HK, H, Dv, W = self.HK, self.H, self.Dv, self.W
-        x = np.zeros((self.CIN, W), np.float16)
-        x[:HK, :Dv] = self.states[layer]
-        x[:HK, self.GCOL] = g.reshape(-1)
-        x[:HK, self.KCOL] = k.reshape(-1)
-        x[:HK, self.QCOL] = q.reshape(-1)
-        x[HK:HK + H, :Dv] = v
-        x[HK + H:HK + 2 * H, self.BCOL] = beta
         with self.driver.view(self.program._in_surf, (self.CIN, W),
                               np.float16) as d:
-            np.copyto(d, x)
+            d[:HK, :Dv] = self.states[layer]
+            d[:HK, self.GCOL] = g.reshape(-1)
+            d[:HK, self.KCOL] = k.reshape(-1)
+            d[:HK, self.QCOL] = q.reshape(-1)
+            d[HK:HK + H, :Dv] = v
+            d[HK + H:HK + 2 * H, self.BCOL] = beta
+            d[HK:, Dv:self.BCOL] = 0
+            d[HK + H:HK + 2 * H, self.BCOL + 1:] = 0
         self._submit_bound(self.driver, self.program, self.request)
         with self.driver.view(self.state_surf, (HK, Dv), np.float16) as o:
-            self.states[layer] = np.array(o, np.float16)
+            np.copyto(self.states[layer], o)
         with self.driver.view(self.program._out_surf, (H, Dv), np.float16) as o:
             return np.array(o, np.float32)
