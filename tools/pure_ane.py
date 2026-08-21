@@ -2747,7 +2747,12 @@ class PureAneRuntime:
         if down_proj_parts not in (1,4):
             raise ValueError("down_proj parts must be 1 or 4")
         self.down_proj_parts=down_proj_parts
-        self.active_lanes = 16
+        # Prefill batch width. Programs compile at width 32, and a width-32
+        # dispatch is measured to cost the same as one carrying a single lane,
+        # so lanes below 32 leave the rest of the dispatch idle. Raising this
+        # enlarges the per-lane RMSNorm MIL, so it is a parameter, not a
+        # constant. Q38_ANE_LANES overrides for measurement.
+        self.active_lanes = int(os.environ.get("Q38_ANE_LANES", "16"))
         self.mtp_lanes = 3
         if not 0 <= mtp_draft < self.mtp_lanes:
             raise ValueError(f"MTP draft must be 0..{self.mtp_lanes-1}")
