@@ -127,6 +127,9 @@ class HybridEngine:
                 self.gpu_inner.update(gpu_weights)
             mx.eval(self.gpu_inner.parameters())
 
+            # Load MTP Weights BEFORE ANE chain frees MLX layer weights
+            self._init_mtp_head()
+
             # Load ANE chain directly from packaged ane_layers directory
             print("  [ANE Engine] Registering 64 packaged ANE resident programs...")
             ane_pkg_dir = str(Path(model_path) / manifest.get("ane_layers_dir", "ane_layers"))
@@ -147,15 +150,15 @@ class HybridEngine:
             nn.quantize(self.gpu_inner, group_size=64, bits=4)
             mx.eval(self.gpu_inner.parameters())
 
-            # 5. Initialize ANE Chained Engine for Decode
+            # 5. Load MTP Weights BEFORE ANE chain frees MLX layer weights
+            self._init_mtp_head()
+
+            # 6. Initialize ANE Chained Engine for Decode
             print("  [ANE Engine] Compiling 64-layer ANE chain...")
             cr = ane_serve._bake_cache_dir(model_path, dense_bits) if bake_cache else None
             self.ane_layers = ane_serve.attach_ane_chain(self.model, "mil", 32, dense_bits, cr)
             ane_serve.attach_ane_lm_head(self.model, "mil", 32, dense_bits, 4)
             print(f"  ANE resident programs: {self.ane_layers} layers (41.0 GB host RAM freed)")
-
-        # Load MTP Weights
-        self._init_mtp_head()
 
     def _init_mtp_head(self):
         w = {}
