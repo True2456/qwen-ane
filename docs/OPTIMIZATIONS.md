@@ -477,3 +477,45 @@ which is the same ratio `docs/PERFORMANCE.md` already measures for the isolated
 kernels. Whether that holds end-to-end has not been measured here -- it needs
 `sudo powermetrics` over the generation window, and no power number in this
 document was measured this session.
+
+
+## Tree drafting: measured not to pay, and why
+
+Speculative decoding accepts ~67-72% of drafts, so branching -- verifying
+several candidates per position instead of one -- looks like the obvious next
+step. It is not, for this model family, and the reason is architectural.
+
+**The drafter's hit rate**, measured over 72 real decode steps by asking at each
+step whether the target's token was in the drafter's top-k:
+
+| drafter | hit rate | gain |
+|---|---:|---:|
+| top-1 | 72.2% | — |
+| top-2 | 87.5% | +15.3 pts |
+| top-4 | 91.7% | +4.2 pts |
+| top-8 | 94.4% | +2.8 pts |
+
+top-1 to top-4 lifts acceptance **1.27x**.
+
+**The cost.** A *linear* chain of 4 positions costs 1.52x a single position,
+because the chain shares one unrolled recurrence dispatch. A 4-*branch* tree
+cannot: 48 of Qwen's 64 layers are GDN, and a linear-attention state is
+path-dependent, so each branch needs its own 48-layer scan. That puts a
+4-branch tree near 2.5x, i.e. **~1.64x more expensive than the linear chain it
+replaces**.
+
+1.27x acceptance against 1.64x cost. Branch-2 is no better: 1.21x against ~1.5x.
+
+**This is specific to hybrid linear-attention models.** In a pure-attention
+model the branches share everything through KV-cache tree masking, and the
++15.3 points from top-2 would be close to free. Here every branch pays a full
+recurrence pass, and that is what inverts the trade.
+
+The lever that *is* free is the drafter's top-1 accuracy, currently 72.2%.
+Every point there converts directly into acceptance with no extra recurrence.
+
+### Also measured: MTP does not improve with generation length
+
+2.96 tok/s at both 32 and 128 generated tokens, acceptance 2.214 and 2.268.
+Prefill is already amortized by 32 tokens, so there is nothing further to
+collect from longer runs.
