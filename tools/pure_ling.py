@@ -941,9 +941,13 @@ class LingPrefill(LingRuntime):
     still advances one at a time. MLA attention batches with a causal mask.
     """
 
-    def __init__(self, *a, lanes=32, **k):
+    def __init__(self, *a, lanes=32, ane_absorb=True, **k):
         super().__init__(*a, **k)
         self.lanes = lanes
+        self.absorb = (AneMlaAbsorb(self.driver, self.ck, self.spec)
+                       if ane_absorb else None)
+        if self.absorb:
+            self.programs += self.absorb.programs
         for bank in (self.proj.banks if self.proj else []):
             bank.active_lanes = lanes
         for bank in (self.experts.banks if self.experts else []):
@@ -1018,9 +1022,11 @@ class LingPrefill(LingRuntime):
         k_rope = rope(k_rope, cos, sin)
         for t in range(T):
             self.kv[layer].append((lat[t].copy(), k_rope[t].copy()))
-        kv_b = self.w(n["kv_b"]).reshape(H, Dn + Dv, s.kv_lora_rank)
-        W_K, W_V = kv_b[:, :Dn, :], kv_b[:, Dn:, :]
-        q_abs = np.einsum("thn,hnl->thl", q_nope, W_K)
+        if self.absorb is not None:
+            q_abs = self.absorb.absorb(layer, q_nope)
+        else:
+            kv_b = self.w(n["kv_b"]).reshape(H, Dn + Dv, s.kv_lora_rank)
+            q_abs = np.einsum("thn,hnl->thl", q_nope, kv_b[:, :Dn, :])
         L = np.stack([x for x, _ in self.kv[layer]])
         R = np.stack([x for _, x in self.kv[layer]])
         sc = (np.einsum("thl,sl->hts", q_abs, L)
@@ -1029,7 +1035,12 @@ class LingPrefill(LingRuntime):
         mask = np.arange(L.shape[0])[None, :] <= (np.arange(T)[:, None] + past)
         sc = np.where(mask[None], sc, -np.inf)
         p = np.exp(sc - sc.max(-1, keepdims=True)); p /= p.sum(-1, keepdims=True)
-        attn = np.einsum("thl,hvl->thv", np.einsum("hts,sl->thl", p, L), W_V)
+        ctx = np.einsum("hts,sl->thl", p, L)
+        if self.absorb is not None:
+            attn = self.absorb.unabsorb(layer, ctx)
+        else:
+            kv_b = self.w(n["kv_b"]).reshape(H, Dn + Dv, s.kv_lora_rank)
+            attn = np.einsum("thl,hvl->thv", ctx, kv_b[:, Dn:, :])
         Y = (attn * gate[:, :, None]).reshape(T, -1)
         return _cols(self.proj.mla_out.run(i, Y.T.astype(np.float16))).astype(np.float32).T
 
@@ -1092,3 +1103,88 @@ class LingPrefill(LingRuntime):
             X = _rms_rows(X, self.w("model.norm.weight"), s.rms_eps)
             logits = X[-1] @ self.wt("lm_head.weight")
         return logits
+
+
+class AneMlaAbsorb:
+    """The absorbed MLA maps as grouped convolutions, one program per direction.
+
+    q_abs[h] = q_nope[h] @ W_K[h]  ([128]->[512])
+    out[h]   = W_V[h] @ ctx[h]     ([512]->[128])
+
+    Both are block-diagonal over the heads, so `groups=H`. Validated in
+    probes/ane_ling_mla_absorb.py at fp16 rel 2.95e-04 and 2.38e-03, with a
+    head-isolation check proving the blocks really are diagonal.
+
+    These were 12% of prefill while still in numpy: 737 ms of einsum against
+    roughly 4 ms of ANE work once batched.
+    """
+
+    CONST = ('    string pt=const()[name=string("pt"),val=string("valid")];\n'
+             '    tensor<int32,[2]> st=const()[name=string("st"),val=tensor<int32,[2]>([1,1])];\n'
+             '    tensor<int32,[4]> pd=const()[name=string("pd"),val=tensor<int32,[4]>([0,0,0,0])];\n'
+             '    tensor<int32,[2]> dl=const()[name=string("dl"),val=tensor<int32,[2]>([1,1])];')
+
+    def __init__(self, driver, checkpoint, spec, width=32):
+        import contextlib, io
+        self.driver, self.spec, self.width = driver, spec, width
+        E = driver.module
+        H, Dn, Dv, L = spec.heads, spec.qk_nope, spec.v_head_dim, spec.kv_lora_rank
+        self.k_progs, self.v_progs = {}, {}
+        for layer in spec.full_attention_layers:
+            kv_b = checkpoint.tensor(spec.attention_names(layer)["kv_b"], np.float32)
+            kv_b = kv_b.reshape(H, Dn + Dv, L)
+            for tag, w, ip, op, store in (
+                    ("k", kv_b[:, :Dn, :].transpose(0, 2, 1), Dn, L, self.k_progs),
+                    ("v", kv_b[:, Dn:, :], L, Dv, self.v_progs)):
+                cin, cout = H * ip, H * op
+                blobs = {"w.bin": np.ascontiguousarray(
+                    w.reshape(cout, ip)).astype(np.float16).tobytes()}
+                mil = f'''program(1.3)
+{E._BUILD_INFO}
+{{
+  func main<ios18>(tensor<fp16, [1, {cin}, 1, {width}]> x) {{
+{self.CONST}
+    int32 gh=const()[name=string("gh"),val=int32({H})];
+    tensor<fp16, [{cout}, {ip}, 1, 1]> ww = const()[name=string("ww"), val=tensor<fp16, [{cout}, {ip}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/w.bin"), offset=uint64(64)))];
+    tensor<fp16,[1,{cout},1,{width}]> y=conv(dilations=dl,groups=gh,pad=pd,pad_type=pt,strides=st,weight=ww,x=x)[name=string("mm")];
+  }} -> (y);
+}}
+'''
+                cap = io.StringIO()
+                with contextlib.redirect_stdout(cap), contextlib.redirect_stderr(cap):
+                    p = driver.engine.compile_multiproc(mil, blobs, cin, cout, width)
+                if p is None:
+                    raise RuntimeError(f"mla absorb {tag} layer {layer} failed:\n"
+                                       f"{cap.getvalue().strip()[-200:]}")
+                driver.engine._ensure_io(p)
+                driver.discard_compiler_files(p)
+                store[layer] = (p, cin, cout)
+        self.programs = len(self.k_progs) + len(self.v_progs)
+
+    def _run(self, prog, X):
+        """X is [T, cin] -> [T, cout], chunked to the program width."""
+        p, cin, cout = prog
+        T = X.shape[0]
+        out = np.empty((T, cout), np.float32)
+        for a in range(0, T, self.width):
+            blk = X[a:a + self.width]
+            with self.driver.view(p._in_surf, (cin, self.width), np.float16) as d:
+                d[:] = 0
+                d[:, :len(blk)] = blk.T.astype(np.float16)
+            if not self.driver.engine.submit(p, procedure_index=0):
+                raise RuntimeError("mla absorb submit failed")
+            with self.driver.view(p._out_surf, (cout, self.width), np.float16) as o:
+                out[a:a + len(blk)] = np.array(o[:, :len(blk)], np.float32).T
+        return out
+
+    def absorb(self, layer, q_nope):
+        s = self.spec
+        T = q_nope.shape[0]
+        r = self._run(self.k_progs[layer], q_nope.reshape(T, -1))
+        return r.reshape(T, s.heads, s.kv_lora_rank)
+
+    def unabsorb(self, layer, ctx):
+        s = self.spec
+        T = ctx.shape[0]
+        r = self._run(self.v_progs[layer], ctx.reshape(T, -1))
+        return r.reshape(T, s.heads, s.v_head_dim)
