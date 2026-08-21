@@ -171,6 +171,7 @@ class HybridEngine:
         max_tokens: int = 64,
         mode: Optional[str] = None,
         use_apc: bool = True,
+        emit_token: Optional[Any] = None,
     ) -> Dict[str, Any]:
         exec_mode = mode or self.mode
         if isinstance(prompt, list):
@@ -247,6 +248,8 @@ class HybridEngine:
 
         # ---- 3. Decode Loop -----------------------------------------------
         gen, steps, accepted_total = [cur], 0, 0
+        if emit_token:
+            emit_token(self.tok.decode([cur]))
         t_decode_start = time.perf_counter()
 
         if exec_mode == "turbo":
@@ -280,9 +283,13 @@ class HybridEngine:
                         break
 
                 if n_ok == self.draft_depth:
-                    gen.extend(drafts + [preds[-1]])
+                    new_toks = drafts + [preds[-1]]
+                    gen.extend(new_toks)
                     cur, last_h = preds[-1], hv[:, -1:]
                     accepted_total += self.draft_depth + 1
+                    if emit_token:
+                        for tok in new_toks:
+                            emit_token(self.tok.decode([tok]))
                 else:
                     restore_caches(c, gsnap)
                     for x, off in zip([y for y in c if y.is_trimmable()], kv_before):
@@ -297,6 +304,9 @@ class HybridEngine:
                     gen.extend(nxt)
                     cur, last_h = fix, hv2[:, -1:]
                     accepted_total += n_ok + 1
+                    if emit_token:
+                        for tok in nxt:
+                            emit_token(self.tok.decode([tok]))
 
                 steps += 1
                 if cur in self.tok.eos_token_ids:
@@ -311,6 +321,8 @@ class HybridEngine:
                 cur = nxt
                 steps += 1
                 accepted_total += 1
+                if emit_token:
+                    emit_token(self.tok.decode([nxt]))
                 if cur in self.tok.eos_token_ids:
                     break
 
@@ -332,6 +344,51 @@ class HybridEngine:
             "apc_hit": apc_hit,
             "tokens_saved": tokens_saved,
         }
+
+
+class ReasoningStream:
+    """Route live Qwen text to reasoning/content deltas across </think>."""
+    marker = "</think>"
+
+    def __init__(self, enabled: bool, reasoning_cb: Any, content_cb: Any):
+        self.enabled = enabled
+        self.send_reasoning = reasoning_cb
+        self.send_content = content_cb
+        self.pending = ""
+        self.in_reasoning = enabled
+
+    def feed(self, delta: str):
+        if not self.enabled:
+            self.send_content(delta)
+            return
+        self.pending += delta
+        if not self.in_reasoning:
+            self.send_content(self.pending)
+            self.pending = ""
+            return
+        end = self.pending.find(self.marker)
+        if end >= 0:
+            if end > 0:
+                self.send_reasoning(self.pending[:end])
+            self.pending = self.pending[end + len(self.marker):]
+            self.in_reasoning = False
+            if self.pending:
+                self.send_content(self.pending)
+            self.pending = ""
+            return
+        safe = max(0, len(self.pending) - len(self.marker) + 1)
+        if safe > 0:
+            self.send_reasoning(self.pending[:safe])
+            self.pending = self.pending[safe:]
+
+    def finish(self):
+        if not self.pending:
+            return
+        if self.in_reasoning:
+            self.send_reasoning(self.pending)
+        else:
+            self.send_content(self.pending)
+        self.pending = ""
 
 
 _REASONING_INSTRUCTIONS = {
@@ -358,15 +415,15 @@ def main():
     p.add_argument("--context", type=int, default=262144, help="Maximum context window (default: 262144)")
     a = p.parse_args()
 
-    engine = HybridEngine(
-        model_path=a.model,
-        dense_bits=a.dense_bits,
-        bake_cache=a.bake_cache,
-        mode=a.mode,
-        draft_depth=a.draft,
-    )
-
     if a.bench:
+        engine = HybridEngine(
+            model_path=a.model,
+            dense_bits=a.dense_bits,
+            bake_cache=a.bake_cache,
+            mode=a.mode,
+            draft_depth=a.draft,
+        )
+
         print("\n" + "=" * 65)
         print("  RUNNING MULTI-TURN HYBRID BENCHMARK (APC CACHE + TURBO/SILENT)")
         print("=" * 65)
@@ -393,11 +450,76 @@ def main():
         print("=" * 65)
 
     elif a.server:
-        from http.server import HTTPServer, BaseHTTPRequestHandler
+        from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
         import threading
+        import queue
         import uuid
 
+        gen_queue = queue.Queue()
+        engine_holder = []
+        engine_ready = threading.Event()
+
+        def inference_worker():
+            """Dedicated inference thread to guarantee MLX / Metal / ANE stream affinity."""
+            eng = HybridEngine(
+                model_path=a.model,
+                dense_bits=a.dense_bits,
+                bake_cache=a.bake_cache,
+                mode=a.mode,
+                draft_depth=a.draft,
+            )
+            engine_holder.append(eng)
+            engine_ready.set()
+            while True:
+                task = gen_queue.get()
+                if task is None:
+                    break
+                fn, args, kwargs, holder, done = task
+                try:
+                    res = fn(*args, **kwargs)
+                    holder["result"] = res
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    holder["error"] = e
+                finally:
+                    done.set()
+                    gen_queue.task_done()
+
+        worker_th = threading.Thread(target=inference_worker, daemon=True)
+        worker_th.start()
+        engine_ready.wait()
+        engine = engine_holder[0]
+
+        def dispatch_generation(prompt, max_tokens, mode, use_apc, emit_token=None):
+            done = threading.Event()
+            holder = {}
+            gen_queue.put((
+                engine.generate,
+                (prompt,),
+                {
+                    "max_tokens": max_tokens,
+                    "mode": mode,
+                    "use_apc": use_apc,
+                    "emit_token": emit_token,
+                },
+                holder,
+                done,
+            ))
+            done.wait()
+            if "error" in holder:
+                raise holder["error"]
+            return holder["result"]
+
         class OpenAIServer(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def handle_one_request(self):
+                try:
+                    super().handle_one_request()
+                except (BrokenPipeError, ConnectionResetError):
+                    self.close_connection = True
+
             def log_message(self, fmt, *args):
                 print(f"  [HTTP] {fmt % args}", flush=True)
 
@@ -408,7 +530,10 @@ def main():
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
 
             def do_OPTIONS(self):
                 self.send_response(204)
@@ -422,6 +547,7 @@ def main():
                     self._json_resp({
                         "status": "ok",
                         "ready": True,
+                        "queue_depth": gen_queue.qsize(),
                         "mode": engine.mode,
                         "apc_stats": engine.apc.stats(),
                         "model": "Qwen3.8-27B"
@@ -432,13 +558,6 @@ def main():
                         "data": [
                             {
                                 "id": "Qwen3.8-27B",
-                                "object": "model",
-                                "owned_by": "rindi-hybrid",
-                                "context_length": a.context,
-                                "mode": engine.mode
-                            },
-                            {
-                                "id": "rindi/Qwen3.8-27B",
                                 "object": "model",
                                 "owned_by": "rindi-hybrid",
                                 "context_length": a.context,
@@ -466,9 +585,10 @@ def main():
                     body = json.loads(self.rfile.read(length).decode("utf-8"))
 
                     messages = body.get("messages", [])
-                    max_tokens = body.get("max_tokens", 512)
+                    max_tokens = body.get("max_tokens") or body.get("max_completion_tokens") or 512
                     effort = body.get("reasoning_effort", "xhigh")
                     enable_thinking = body.get("enable_thinking", True)
+                    stream = bool(body.get("stream", False))
 
                     # Dynamic per-request mode override if provided
                     req_mode = body.get("mode", engine.mode)
@@ -481,7 +601,71 @@ def main():
                         else:
                             messages.insert(0, {"role": "system", "content": instr})
 
-                    res = engine.generate(messages, max_tokens=max_tokens, mode=req_mode, use_apc=True)
+                    cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+                    created = int(time.time())
+                    model_name = body.get("model", "Qwen3.8-27B")
+
+                    if stream:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Connection", "keep-alive")
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+
+                        def sse_chunk(delta_dict, finish_reason=None):
+                            chunk = {
+                                "id": cid,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": delta_dict,
+                                    "finish_reason": finish_reason
+                                }]
+                            }
+                            raw = f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+                            try:
+                                self.wfile.write(raw)
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError):
+                                pass
+
+                        sse_chunk({"role": "assistant"})
+
+                        def emit_reasoning(delta):
+                            sse_chunk({"reasoning_content": delta})
+
+                        def emit_content(delta):
+                            sse_chunk({"content": delta})
+
+                        router = ReasoningStream(enable_thinking, emit_reasoning, emit_content)
+                        try:
+                            dispatch_generation(
+                                messages,
+                                max_tokens=max_tokens,
+                                mode=req_mode,
+                                use_apc=True,
+                                emit_token=router.feed,
+                            )
+                        except Exception as e:
+                            print(f"  [Generation Error] {e}", flush=True)
+                        router.finish()
+
+                        sse_chunk({}, finish_reason="stop")
+                        try:
+                            self.wfile.write(b"data: [DONE]\n\n")
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError):
+                            pass
+                        return
+
+                    try:
+                        res = dispatch_generation(messages, max_tokens=max_tokens, mode=req_mode, use_apc=True)
+                    except Exception as e:
+                        self._json_resp({"error": str(e)}, 500)
+                        return
                     text = res["generated_text"]
 
                     # Split reasoning thoughts
@@ -493,10 +677,10 @@ def main():
                         content = parts[1].strip()
 
                     resp = {
-                        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                        "id": cid,
                         "object": "chat.completion",
-                        "created": int(time.time()),
-                        "model": body.get("model", "Qwen3.8-27B"),
+                        "created": created,
+                        "model": model_name,
                         "choices": [{
                             "index": 0,
                             "message": {
@@ -523,7 +707,7 @@ def main():
                 else:
                     self._json_resp({"error": "Not Found"}, 404)
 
-        server = HTTPServer((a.host, a.port), OpenAIServer)
+        server = ThreadingHTTPServer((a.host, a.port), OpenAIServer)
 
         def cli_listener():
             """Interactive terminal command loop for live mode switching."""
