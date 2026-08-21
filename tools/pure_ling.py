@@ -1549,7 +1549,11 @@ class AneExpertDownStacked:
     Unrouted experts contribute nothing because their activation slice is zero.
     """
 
-    def __init__(self, driver, checkpoint, spec, bits=8, width=64, parts=4):
+    def __init__(self, driver, checkpoint, spec, bits=8, width=64, parts=8):
+        # `parts` also sets the quantization granularity: each per-output-row
+        # int8 scale spans experts//parts experts. Measured against an exact
+        # fp32 reference: parts=4 (32 experts/scale) gives rel 1.10e-01,
+        # parts=8 (16 experts/scale) gives 7.68e-03, parts=16 will not compile.
         import contextlib, io
         from pure_ane import _dense_decl
         self.driver, self.spec, self.width = driver, spec, width
