@@ -330,7 +330,8 @@ class HybridEngine:
                     restore_caches([mc], msnap)
                     keep = drafts[:n_ok]
                     fix = preds[n_ok]
-                    hv2 = self.inner(mx.array([[cur] + keep]), cache=c)
+                    # Fast slice from already evaluated sequence verification instead of second 64-layer pass
+                    hv2 = hv[:, :n_ok + 1]
                     nxt = keep + [fix]
                     self.mtp_layer(mx.concatenate([self.pre_e(self.embed(mx.array([nxt]))),
                                                   self.pre_h(hv2)], -1) @ self.fcw.T, cache=mc)
@@ -628,6 +629,8 @@ def main():
                     effort = body.get("reasoning_effort", "xhigh")
                     enable_thinking = body.get("enable_thinking", True)
                     stream = bool(body.get("stream", False))
+
+                    print(f"\n  📥 [RINDI HTTP] Incoming Chat Request: {len(messages)} messages, stream={stream}, effort={effort}", flush=True)
 
                     # Dynamic per-request mode override if provided
                     req_mode = body.get("mode", engine.mode)

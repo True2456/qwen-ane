@@ -10,19 +10,15 @@ export default function (api: ExtensionAPI) {
     apiKey: API_KEY,
     api: "openai-completions",
     authHeader: true,
-    async refreshModels() {
-      let resp: Response;
+    async refreshModels({ signal }: { signal?: AbortSignal } = {}) {
       try {
-        resp = await fetch(`${BASE_URL}/models`, {
+        const resp = await fetch(`${BASE_URL}/models`, {
+          signal,
           headers: { Authorization: `Bearer ${API_KEY}` },
-          signal: AbortSignal.timeout(3000),
         });
-      } catch {
-        return [];
-      }
-      if (!resp.ok) return [];
-      const data = (await resp.json()) as { data?: Array<{ id: string }> };
-      const rawModels = data.data ?? [];
+        if (!resp.ok) return [];
+        const data = (await resp.json()) as { data?: Array<{ id: string }> };
+        const rawModels = data.data ?? [];
 
       return rawModels.map((m) => {
         const id = m.id;
@@ -57,6 +53,9 @@ export default function (api: ExtensionAPI) {
           },
         };
       });
-    },
-  });
+    } catch {
+      return [];
+    }
+  },
+});
 }
