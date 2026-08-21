@@ -1025,7 +1025,7 @@ class LingPrefill(LingRuntime):
     """
 
     def __init__(self, *a, lanes=None, ane_absorb=True,
-                 ane_prepare=False, **k):
+                 ane_prepare=False, ane_stacked_down=True, **k):
         super().__init__(*a, **k)
         self.lanes = lanes or self.width
         self.absorb = (AneMlaAbsorb(self.driver, self.ck, self.spec, self.width)
@@ -1038,6 +1038,12 @@ class LingPrefill(LingRuntime):
         # two IOSurface round trips per layer per chunk to save arithmetic that
         # was never the bottleneck. Kept because it is correct (rel 2.2e-3) and
         # it is the evidence for where the ANE does and does not pay.
+        self.stacked_down = (AneExpertDownStacked(
+            self.driver, self.ck, self.spec, self.bits, self.width)
+            if ane_stacked_down else None)
+        if self.stacked_down:
+            self.programs += self.stacked_down.programs
+            self.nbytes += self.stacked_down.nbytes
         self.prep = (AneKdaPrepare(self.driver, self.ck, self.spec, self.width)
                      if ane_prepare else None)
         if self.prep:
@@ -1170,11 +1176,19 @@ class LingPrefill(LingRuntime):
                 assign.setdefault(int(e), []).append(t)
                 weights.setdefault(int(e), []).append(float(wt))
         M = s.moe_intermediate
-        for e, ts in assign.items():
-            g, u = self.experts.slice_expert(raw, e, ts)
-            h = (_silu(g) * u) * np.array(weights[e], np.float32)[:, None]
-            r = _cols(self.down.run(layer, e, h.T)).astype(np.float32).T
-            out[ts] += r.reshape(len(ts), -1)
+        if getattr(self, "stacked_down", None) is not None:
+            acts = np.zeros((s.experts * M, T), np.float16)
+            for e, ts in assign.items():
+                g, u = self.experts.slice_expert(raw, e, ts)
+                h = (_silu(g) * u) * np.array(weights[e], np.float32)[:, None]
+                acts[e*M:(e+1)*M, ts] = h.T.astype(np.float16)
+            out += self.stacked_down.run(layer, acts)
+        else:
+            for e, ts in assign.items():
+                g, u = self.experts.slice_expert(raw, e, ts)
+                h = (_silu(g) * u) * np.array(weights[e], np.float32)[:, None]
+                r = _cols(self.down.run(layer, e, h.T)).astype(np.float32).T
+                out[ts] += r.reshape(len(ts), -1)
         si = s.moe_layers.index(layer)
         sgu = _cols(self.proj.shared_gu.run(si, X.T.astype(np.float16))).astype(np.float32).T
         Ms = M * s.shared_experts
@@ -1519,3 +1533,98 @@ class AneKdaPrepare:
             v = np.array(o[:, :T], np.float32)
         return (qk[:P].T.reshape(T, H, D), qk[P:].T.reshape(T, H, D),
                 v.T.reshape(T, H, D))
+
+
+class AneExpertDownStacked:
+    """All 128 experts' `down` as one conv per layer, for batched prefill.
+
+    Expert-major dispatch is right for decode -- 8 experts, 8 small dispatches.
+    It is wrong for prefill: 64 positions x 8 experts touch ~110 of 128 experts,
+    so a layer costs ~110 dispatches at 0.105 ms = 11.5 ms. Stacked, the same
+    layer is one 1.509 ms dispatch: 7.6x less time and 110x fewer dispatches.
+
+    The experts concatenate along `down`'s INPUT axis, which is exactly the
+    identity that makes the expert sum fall out of the matmul:
+    sum_e down_e @ a_e == [down_0|...|down_127] @ [a_0;...;a_127].
+    Unrouted experts contribute nothing because their activation slice is zero.
+    """
+
+    def __init__(self, driver, checkpoint, spec, bits=8, width=64, parts=4):
+        import contextlib, io
+        from pure_ane import _dense_decl
+        self.driver, self.spec, self.width = driver, spec, width
+        self.parts = parts
+        E = driver.module
+        H, M, NE = spec.hidden, spec.moe_intermediate, spec.experts
+        self.cin = NE * M
+        per = self.cin // parts
+        self.progs, self.nbytes = {}, 0
+        for layer in spec.moe_layers:
+            blobs, decls, terms = {}, [], []
+            for i in range(parts):
+                # experts whose columns fall in this part, hstacked
+                lo, hi = i * per // M, (i + 1) * per // M
+                W = np.concatenate(
+                    [checkpoint.tensor(spec.expert_name(layer, e, "down"),
+                                       np.float32) for e in range(lo, hi)],
+                    axis=1)
+                hi_q = (1 << (bits - 1)) - 1
+                sc = np.abs(W).max(axis=1, keepdims=True) / hi_q
+                sc = np.where(sc == 0, 1, sc)
+                q = np.clip(np.rint(W / sc), -hi_q - 1, hi_q).astype(np.int8)
+                if bits == 4:
+                    nb = q.reshape(-1).astype(np.uint8) & 0x0F
+                    payload = (nb[0::2] | (nb[1::2] << 4)).tobytes()
+                else:
+                    payload = q.tobytes()
+                blobs[f"w{i}.bin"] = payload
+                blobs[f"w{i}s.bin"] = sc.astype(np.float16).tobytes()
+                decls.append(_dense_decl(f"w{i}", H, per, bits))
+                decls.append(
+                    f'    tensor<int32,[4]> b{i}=const()[name=string("b{i}"),val=tensor<int32,[4]>([0,{i*per},0,0])];\n'
+                    f'    tensor<int32,[4]> e{i}=const()[name=string("e{i}"),val=tensor<int32,[4]>([1,{(i+1)*per},1,{width}])];\n'
+                    f'    tensor<fp16,[1,{per},1,{width}]> x{i}=slice_by_index(begin=b{i},end=e{i},x=x)[name=string("s{i}")];\n'
+                    f'    tensor<fp16,[1,{H},1,{width}]> p{i}=conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=w{i}w,x=x{i})[name=string("c{i}")];')
+                terms.append(f"p{i}")
+            acc = terms[0]
+            for i in range(1, parts):
+                decls.append(f'    tensor<fp16,[1,{H},1,{width}]> a{i}=add(x={acc},y={terms[i]})[name=string("a{i}")];')
+                acc = f"a{i}"
+            decls.append(f'    tensor<fp16,[1,{H},1,{width}]> y=identity(x={acc})[name=string("id")];')
+            mil = f'''program(1.3)
+{E._BUILD_INFO}
+{{
+  func main<ios18>(tensor<fp16, [1, {self.cin}, 1, {width}]> x) {{
+    string pt=const()[name=string("pt"),val=string("valid")];
+    tensor<int32,[2]> st=const()[name=string("st"),val=tensor<int32,[2]>([1,1])];
+    tensor<int32,[4]> pd=const()[name=string("pd"),val=tensor<int32,[4]>([0,0,0,0])];
+    tensor<int32,[2]> dl=const()[name=string("dl"),val=tensor<int32,[2]>([1,1])];
+    int32 gr=const()[name=string("gr"),val=int32(1)];
+{chr(10).join(decls)}
+  }} -> (y);
+}}
+'''
+            cap = io.StringIO()
+            with contextlib.redirect_stdout(cap), contextlib.redirect_stderr(cap):
+                prog = driver.engine.compile_multiproc(mil, blobs, self.cin, H, width)
+            if prog is None:
+                raise RuntimeError(f"stacked down layer {layer} failed:\n"
+                                   f"{cap.getvalue().strip()[-220:]}")
+            driver.engine._ensure_io(prog)
+            driver.discard_compiler_files(prog)
+            self.progs[layer] = prog
+            self.nbytes += sum(len(v) for v in blobs.values())
+        self.programs = len(self.progs)
+
+    def run(self, layer, acts):
+        """acts is [experts*M, T], zero for unrouted experts. Returns [T, H]."""
+        H, W = self.spec.hidden, self.width
+        T = acts.shape[1]
+        prog = self.progs[layer]
+        with self.driver.view(prog._in_surf, (self.cin, W), np.float16) as d:
+            d[:] = 0
+            d[:, :T] = acts
+        if not self.driver.engine.submit(prog, procedure_index=0):
+            raise RuntimeError("stacked down submit failed")
+        with self.driver.view(prog._out_surf, (H, W), np.float16) as o:
+            return np.array(o[:, :T], np.float32).T
