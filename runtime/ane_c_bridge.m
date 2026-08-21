@@ -118,11 +118,15 @@ ANERequest* ane_request_create(
         NSArray* outIdx = @[@0];
         NSNumber* procNum = [NSNumber numberWithInt:procedure_index];
 
-        SEL reqSel = @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:procedureIndex:);
-        typedef id (*CreateReqFn)(id, SEL, NSArray*, NSArray*, NSArray*, NSArray*, id, NSNumber*);
-        CreateReqFn createReqMethod = (CreateReqFn)[ctx->aneRequestClass methodForSelector:reqSel];
-
-        id req = createReqMethod(ctx->aneRequestClass, reqSel, inArr, inIdx, outArr, outIdx, nil, procNum);
+        id rawReq = [ctx->aneRequestClass alloc];
+        SEL initReqSel = @selector(initWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:sharedEvents:transactionHandle:);
+        typedef id (*InitReqFn)(id, SEL, NSArray*, NSArray*, NSArray*, NSArray*, id, id, NSNumber*, id, id);
+        InitReqFn initReqMethod = (InitReqFn)[rawReq methodForSelector:initReqSel];
+        
+        id req = nil;
+        if (initReqMethod) {
+            req = initReqMethod(rawReq, initReqSel, inArr, inIdx, outArr, outIdx, nil, nil, procNum, nil, nil);
+        }
         if (!req) return NULL;
 
         ANERequest* r = (ANERequest*)calloc(1, sizeof(ANERequest));
@@ -142,21 +146,22 @@ void ane_request_release(ANERequest* req) {
 
 bool ane_request_evaluate(
     ANEContext* ctx,
+    ANEModel* model,
     ANERequest* req,
     void* wait_shared_event,
     uint64_t wait_value,
     void* signal_shared_event,
     uint64_t signal_value
 ) {
-    if (!ctx || !req || !ctx->client) return false;
+    if (!ctx || !model || !req || !model->loadedModel || !req->rawRequest) return false;
     @autoreleasepool {
-        SEL evalSel = @selector(evaluateWithModel:options:request:qos:error:);
-        typedef BOOL (*EvalFn)(id, SEL, id, NSDictionary*, id, NSInteger, NSError**);
-        EvalFn evalMethod = (EvalFn)[ctx->client methodForSelector:evalSel];
+        SEL evalSel = @selector(evaluateWithQoS:options:request:error:);
+        typedef BOOL (*EvalFn)(id, SEL, NSInteger, NSDictionary*, id, NSError**);
+        EvalFn evalMethod = (EvalFn)[model->loadedModel methodForSelector:evalSel];
         if (!evalMethod) return false;
 
         NSError* err = nil;
-        BOOL ok = evalMethod(ctx->client, evalSel, req->rawRequest, @{}, req->rawRequest, 21, &err);
+        BOOL ok = evalMethod(model->loadedModel, evalSel, 21, @{}, req->rawRequest, &err);
         return ok && (err == nil);
     }
 }

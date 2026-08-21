@@ -78,7 +78,7 @@ bool RindiNativeChain::evaluate_step(const void* input_fp16, void* output_fp16) 
         if (!entry.model) continue;
         
         ANERequest* req = use_a_as_input ? entry.req_a_to_b : entry.req_b_to_a;
-        if (!ane_request_evaluate(ane_ctx_, req, NULL, 0, NULL, 0)) {
+        if (!ane_request_evaluate(ane_ctx_, entry.model, req, NULL, 0, NULL, 0)) {
             std::cerr << "Evaluation failed at layer " << l << std::endl;
             return false;
         }

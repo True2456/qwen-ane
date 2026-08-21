@@ -60,6 +60,7 @@ void ane_request_release(ANERequest* req);
  */
 bool ane_request_evaluate(
     ANEContext* ctx,
+    ANEModel* model,
     ANERequest* req,
     void* wait_shared_event,
     uint64_t wait_value,
