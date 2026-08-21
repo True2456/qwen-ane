@@ -2770,7 +2770,13 @@ class PureAneRuntime:
             raise ValueError(
                 f"{self.active_lanes} lanes exceeds the convolution limit "
                 f"{self.program_width - 3} at width {self.program_width}")
-        self.mtp_lanes = 3
+        # Speculative draft width, so the maximum draft depth is this minus
+        # one. It was 3, capping drafting at depth 2, but the verify pass
+        # batches up to active_lanes positions and a marginal candidate costs
+        # ~23 ms against 273 ms for the first. Measured over five varied
+        # prompts: depth 2 gives 3.78 tok/s, depth 3 gives 3.98, depth 4 falls
+        # back to 3.68 as sequential drafting cost overtakes acceptance.
+        self.mtp_lanes = int(os.environ.get("Q38_ANE_MTP_LANES", "5"))
         if not 0 <= mtp_draft < self.mtp_lanes:
             raise ValueError(f"MTP draft must be 0..{self.mtp_lanes-1}")
         self.mtp_draft=mtp_draft
@@ -2816,6 +2822,8 @@ class PureAneRuntime:
             mtp_bank=AneLinearProjectionBank(
                 self.driver,checkpoint,[mtp_names],bits,"mtp_head"
             )
+            # the bank defaults to 3 active lanes; the MTP path drafts mtp_lanes
+            mtp_bank.active_lanes=self.mtp_lanes
             self.driver.discard_compiler_files(mtp_bank.program)
         if context<=256:
             shared_core=AneAttentionCore(self.driver,context)
