@@ -334,6 +334,15 @@ class HybridEngine:
         }
 
 
+_REASONING_INSTRUCTIONS = {
+    "xhigh": "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.",
+    "high": "Reasoning effort is set to high. Please think carefully and validate your assumptions before providing the final answer.",
+    "medium": "",
+    "low": "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.",
+    "none": "",
+}
+
+
 def main():
     p = argparse.ArgumentParser(description="Apple Silicon Hybrid Inference Engine (APC + Turbo/Silent)")
     p.add_argument("--model", default="/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B")
@@ -345,6 +354,9 @@ def main():
     p.add_argument("--dense-bits", type=int, default=4)
     p.add_argument("--bake-cache", action="store_true", default=True)
     p.add_argument("--bench", action="store_true", help="Run comprehensive multi-turn benchmark")
+    p.add_argument("--server", action="store_true", help="Start OpenAI-compatible HTTP server")
+    p.add_argument("--host", default="0.0.0.0", help="HTTP server bind host")
+    p.add_argument("--port", type=int, default=8000, help="HTTP server port")
     a = p.parse_args()
 
     engine = HybridEngine(
@@ -355,7 +367,109 @@ def main():
         draft_depth=a.draft,
     )
 
-    if a.bench:
+    if a.server:
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        import uuid
+
+        class OpenAIServer(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                print(f"  [HTTP] {fmt % args}", flush=True)
+
+            def _json_resp(self, data, code=200):
+                body = json.dumps(data).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_OPTIONS(self):
+                self.send_response(204)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.end_headers()
+
+            def do_GET(self):
+                if self.path in ("/", "/health", "/healthz"):
+                    self._json_resp({"status": "ok", "ready": True, "mode": engine.mode})
+                elif self.path == "/v1/models":
+                    self._json_resp({
+                        "object": "list",
+                        "data": [{"id": "Qwen3.8-27B", "object": "model", "owned_by": "ane-hybrid"}]
+                    })
+                else:
+                    self._json_resp({"error": "Not Found"}, 404)
+
+            def do_POST(self):
+                if self.path == "/v1/chat/completions":
+                    length = int(self.headers.get("Content-Length", 0))
+                    body = json.loads(self.rfile.read(length).decode("utf-8"))
+
+                    messages = body.get("messages", [])
+                    max_tokens = body.get("max_tokens", 512)
+                    effort = body.get("reasoning_effort", "medium")
+                    enable_thinking = body.get("enable_thinking", True)
+
+                    # Inject thinking instruction if applicable
+                    if enable_thinking and effort in _REASONING_INSTRUCTIONS and _REASONING_INSTRUCTIONS[effort]:
+                        instr = _REASONING_INSTRUCTIONS[effort]
+                        if messages and messages[0].get("role") == "system":
+                            messages[0]["content"] = instr + "\n\n" + messages[0]["content"]
+                        else:
+                            messages.insert(0, {"role": "system", "content": instr})
+
+                    res = engine.generate(messages, max_tokens=max_tokens, use_apc=True)
+                    text = res["generated_text"]
+
+                    # Split reasoning thoughts
+                    reasoning_content = None
+                    content = text
+                    if "</think>" in text:
+                        parts = text.split("</think>", 1)
+                        reasoning_content = parts[0].replace("<think>", "").strip()
+                        content = parts[1].strip()
+
+                    resp = {
+                        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": body.get("model", "Qwen3.8-27B"),
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": content,
+                                "reasoning_content": reasoning_content,
+                            },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": res.get("tokens_saved", 0),
+                            "completion_tokens": res["generated_tokens"],
+                            "total_tokens": res.get("tokens_saved", 0) + res["generated_tokens"]
+                        },
+                        "hybrid_stats": {
+                            "ttft_ms": res["ttft_ms"],
+                            "decode_tps": res["decode_tps"],
+                            "accepted_per_step": res["accepted_per_step"],
+                            "apc_hit": res["apc_hit"]
+                        }
+                    }
+                    self._json_resp(resp)
+                else:
+                    self._json_resp({"error": "Not Found"}, 404)
+
+        server = HTTPServer((a.host, a.port), OpenAIServer)
+        print(f"\n" + "=" * 65)
+        print(f"  HYBRID OPENAI HTTP SERVER LISTENING ON http://{a.host}:{a.port}/v1")
+        print(f"  Mode: {a.mode.upper()} | Model: Qwen3.8-27B | APC: Active")
+        print(f"  Supported Thinking Levels: none, low, medium, high, xhigh")
+        print(f"=" * 65 + "\n")
+        server.serve_forever()
+
+    elif a.bench:
         print("\n" + "=" * 65)
         print("  RUNNING MULTI-TURN HYBRID BENCHMARK (APC CACHE + TURBO/SILENT)")
         print("=" * 65)
