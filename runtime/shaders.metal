@@ -60,122 +60,24 @@ kernel void rmsnorm_fp16(
 }
 
 // ============================================================================
-// Rotary Position Embedding (RoPE) FP16
-// ============================================================================
-kernel void rope_fp16(
-    device half*        q            [[buffer(0)]],
-    device half*        k            [[buffer(1)]],
-    device const half*  cos_tab      [[buffer(2)]],
-    device const half*  sin_tab      [[buffer(3)]],
-    constant uint&      head_dim     [[buffer(4)]],
-    constant uint&      num_q_heads  [[buffer(5)]],
-    constant uint&      num_k_heads  [[buffer(6)]],
-    uint3               pos          [[thread_position_in_grid]]
-) {
-    // pos.x = half_head_dim idx [0..head_dim/2 - 1]
-    // pos.y = head idx
-    // pos.z = token/sequence idx
-    uint half_dim = head_dim / 2;
-    uint d = pos.x;
-    if (d >= half_dim) return;
-
-    uint head = pos.y;
-    uint seq = pos.z;
-
-    half cos_val = cos_tab[seq * half_dim + d];
-    half sin_val = sin_tab[seq * half_dim + d];
-
-    if (head < num_q_heads) {
-        uint offset = seq * (num_q_heads * head_dim) + head * head_dim;
-        half x0 = q[offset + d];
-        half x1 = q[offset + d + half_dim];
-        q[offset + d]            = x0 * cos_val - x1 * sin_val;
-        q[offset + d + half_dim] = x0 * sin_val + x1 * cos_val;
-    }
-
-    if (head < num_k_heads) {
-        uint offset = seq * (num_k_heads * head_dim) + head * head_dim;
-        half x0 = k[offset + d];
-        half x1 = k[offset + d + half_dim];
-        k[offset + d]            = x0 * cos_val - x1 * sin_val;
-        k[offset + d + half_dim] = x0 * sin_val + x1 * cos_val;
-    }
-}
-
-// ============================================================================
-// Dynamic MoE Expert Gather FP16
-// Gathers [num_tokens, hidden_dim] -> [num_tokens * top_k, hidden_dim]
-// ============================================================================
-kernel void moe_gather_fp16(
-    device const half*  src_activations [[buffer(0)]], // [num_tokens, hidden_dim]
-    device const int*   expert_indices  [[buffer(1)]], // [num_tokens, top_k]
-    device half*        dst_gathered    [[buffer(2)]], // [num_tokens * top_k, hidden_dim]
-    constant uint&      hidden_dim      [[buffer(3)]],
-    constant uint&      top_k           [[buffer(4)]],
-    uint2               pos             [[thread_position_in_grid]]
-) {
-    uint token_k_idx = pos.y; // [0 .. num_tokens * top_k - 1]
-    uint token_idx = token_k_idx / top_k;
-    uint d = pos.x;
-
-    if (d >= hidden_dim) return;
-
-    half val = src_activations[token_idx * hidden_dim + d];
-    dst_gathered[token_k_idx * hidden_dim + d] = val;
-}
-
-// ============================================================================
-// Dynamic MoE Expert Scatter & Weighted Accumulation FP16
-// Combines [num_tokens * top_k, hidden_dim] -> [num_tokens, hidden_dim]
-// ============================================================================
-kernel void moe_scatter_fp16(
-    device const half*  expert_outputs  [[buffer(0)]], // [num_tokens * top_k, hidden_dim]
-    device const float* expert_weights  [[buffer(1)]], // [num_tokens, top_k] (fp32)
-    device const int*   expert_indices  [[buffer(2)]], // [num_tokens, top_k] (int32)
-    device half*        dst_combined    [[buffer(3)]], // [num_tokens, hidden_dim]
-    constant uint&      hidden_dim      [[buffer(4)]],
-    constant uint&      top_k           [[buffer(5)]],
-    uint2               pos             [[thread_position_in_grid]]
-) {
-    uint token_idx = pos.y; // [0 .. num_tokens - 1]
-    uint d = pos.x;
-
-    if (d >= hidden_dim) return;
-
-    float acc = 0.0f;
-    for (uint k = 0; k < top_k; ++k) {
-        float weight = expert_weights[token_idx * top_k + k];
-        half out_val = expert_outputs[(token_idx * top_k + k) * hidden_dim + d];
-        acc += weight * float(out_val);
-    }
-
-    dst_combined[token_idx * hidden_dim + d] = half(acc);
-}
-
-// ============================================================================
-// Zero-Overhead ANE Layout Transforms FP16
-// Mode 0: Linear [S, C] -> ANE Planar [1, C, 1, S]
-// In ANE layout, channel c has stride S (i.e. out[c * S + s] = in[s * C + c])
+// Layout Conversion: Linear FP16 [S, C] -> ANE Spatial FP16 [1, C, 1, S]
 // ============================================================================
 kernel void layout_linear_to_ane_fp16(
-    device const half* in_linear  [[buffer(0)]], // [S, C]
-    device half*       out_ane    [[buffer(1)]], // [1, C, 1, S]
-    constant uint&     C          [[buffer(2)]],
-    constant uint&     S          [[buffer(3)]],
-    uint2              pos        [[thread_position_in_grid]]
+    device const half* in_linear [[buffer(0)]], // [S, C]
+    device half*       out_ane   [[buffer(1)]], // [1, C, 1, S]
+    constant uint&     C         [[buffer(2)]],
+    constant uint&     S         [[buffer(3)]],
+    uint2              pos       [[thread_position_in_grid]]
 ) {
     uint c = pos.x;
     uint s = pos.y;
     if (c >= C || s >= S) return;
 
-    // Linear offset: s * C + c
-    // ANE offset:    c * S + s
     out_ane[c * S + s] = in_linear[s * C + c];
 }
 
 // ============================================================================
-// Mode 1: ANE Planar [1, C, 1, S] -> Linear [S, C]
-// in_ane[c * S + s] -> out_linear[s * C + c]
+// Layout Conversion: ANE Spatial FP16 [1, C, 1, S] -> Linear FP16 [S, C]
 // ============================================================================
 kernel void layout_ane_to_linear_fp16(
     device const half* in_ane     [[buffer(0)]], // [1, C, 1, S]
@@ -237,6 +139,51 @@ kernel void gemm_fp16(
 }
 
 // ============================================================================
+// Direct ANE Spatial Tiled 4-Bit GEMM on Metal GPU
+// Reads ANE (K/64, N/64, 64, 64) 4-bit packed weights directly from 12.1 GB pool!
+// ============================================================================
+kernel void gemm_ane_tiled_4bit_fp16(
+    device const half*  A           [[buffer(0)]], // Input: [M, K]
+    device const uchar* B_ane_tiled [[buffer(1)]], // ANE 4-bit Packed Spatial Weights
+    device const half*  scales      [[buffer(2)]], // Per-channel / group scales
+    device half*        C           [[buffer(3)]], // Output: [M, N]
+    constant uint&      M           [[buffer(4)]], // Sequence length (e.g. 10,500)
+    constant uint&      N           [[buffer(5)]], // Output channels
+    constant uint&      K           [[buffer(6)]], // Input channels
+    uint2               pos         [[thread_position_in_grid]]
+) {
+    uint col = pos.x; // Output feature index [0 .. N-1]
+    uint row = pos.y; // Sequence token index [0 .. M-1]
+    if (row >= M || col >= N) return;
+
+    float sum = 0.0f;
+    uint n_block = col / 64;
+    uint in_n = col % 64;
+
+    for (uint k_block = 0; k_block < K / 64; ++k_block) {
+        // Compute base offset for 64x64 ANE spatial tile
+        uint tile_idx = n_block * (K / 64) + k_block;
+        uint tile_byte_offset = tile_idx * (64 * 64 / 2); // 4-bit packed
+
+        for (uint in_k = 0; in_k < 64; in_k += 2) {
+            uint byte_pos = tile_byte_offset + (in_k * 64 + in_n) / 2;
+            uchar packed_val = B_ane_tiled[byte_pos];
+
+            int w0 = int(packed_val & 0x0F) - 8;
+            int w1 = int((packed_val >> 4) & 0x0F) - 8;
+
+            uint global_k0 = k_block * 64 + in_k;
+            uint global_k1 = global_k0 + 1;
+
+            float s = float(scales[col]);
+            sum += float(A[row * K + global_k0]) * (float(w0) * s);
+            sum += float(A[row * K + global_k1]) * (float(w1) * s);
+        }
+    }
+    C[row * N + col] = half(sum);
+}
+
+// ============================================================================
 // Fast GPU Argmax for Speculative Drafting
 // ============================================================================
 kernel void argmax_fp16(
@@ -248,5 +195,17 @@ kernel void argmax_fp16(
 ) {
     uint seq_idx = pos.x;
     if (seq_idx >= B) return;
-    out_tokens[seq_idx] = 999;
+
+    device const half* row = logits + seq_idx * V;
+    half max_val = row[0];
+    int max_idx = 0;
+
+    for (uint i = 1; i < V; ++i) {
+        half val = row[i];
+        if (val > max_val) {
+            max_val = val;
+            max_idx = int(i);
+        }
+    }
+    out_tokens[seq_idx] = max_idx;
 }
