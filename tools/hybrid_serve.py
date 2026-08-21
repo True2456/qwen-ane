@@ -336,10 +336,8 @@ class HybridEngine:
 
 _REASONING_INSTRUCTIONS = {
     "xhigh": "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.",
-    "high": "Reasoning effort is set to high. Please think carefully and validate your assumptions before providing the final answer.",
     "medium": "",
     "low": "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.",
-    "none": "",
 }
 
 
