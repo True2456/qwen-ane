@@ -101,14 +101,15 @@ def run(C, activation="none"):
     label = "conv" if activation == "none" else f"conv+{activation}"
     print(f"  C={C:<5} {label:<9} {'OK' if ok else 'WRONG':<5} rel={rel:.4g} "
           f"abs={abs_err:.4g} {ms:.3f} ms")
-    return ok
+    return ok, prog
 
 
-print("Qwen3.8 GDN depthwise causal conv1d + SiLU")
-results = [run(64, "none")]
-run(64, "sigmoid")  # documents the inaccurate shortcut; not a required path
-results.append(run(64, "exp"))
-results.append(run(10240, "none"))
-run(10240, "sigmoid")
-results.append(run(10240, "exp"))
-print("PASS" if all(results) else "FAIL")
+if __name__ == "__main__":
+    print("Qwen3.8 GDN depthwise causal conv1d + SiLU")
+    results = [run(64, "none")[0]]
+    run(64, "sigmoid")  # documents the inaccurate shortcut; not a required path
+    results.append(run(64, "exp")[0])
+    results.append(run(10240, "none")[0])
+    run(10240, "sigmoid")
+    results.append(run(10240, "exp")[0])
+    print("PASS" if all(results) else "FAIL")

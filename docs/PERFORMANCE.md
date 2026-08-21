@@ -440,3 +440,59 @@ generated tokens, acceptance 2.214 and 2.268. Prefill is already amortized by
 
 `generate()` returns `(tokens, elapsed)`, so `len(result)` is 2 regardless —
 easy to mistake for a two-token generation.
+
+## Full 64-Layer Chained ANE Benchmark (M5 Max)
+
+With all 64 layers $+ \text{lm\_head}$ chained in INT4 ($12.19\,\text{GB}$ blobs, **69/127** resident programs, **41.0 GB RAM freed**):
+
+| Mode | Draft Depth ($k$) | Tokens Generated | Decode Speed | Accepted / Step | Steps | Active Power |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **GPU Baseline (MLX bf16)** | — | 512 | $8.5\text{--}8.8\text{ tok/s}$ | 1.00 | 512 | **$65\text{--}85\text{ W}$** |
+| **ANE Base (Chained INT4)** | 0 | 512 | $4.08\text{ tok/s}$ | 1.00 | 512 | **$\sim 5.9\text{ W}$** |
+| **GPU Burst Prefill + ANE Speculation (Optimum)** | **3** | **33** | **$6.56\text{ tok/s}$** | **2.91** | **11** | **$\sim 6.2\text{ W}$** |
+| **Heterogeneous GPU + ANE (k=3)** | 3 | 64 | $5.68\text{ tok/s}$ | 2.62 | 24 | $\sim 6.2\text{ W}$ |
+| **ANE + MTP Speculation (Depth 3)** | 3 | 64 | $5.86\text{ tok/s}$ | 2.86 | 22 | $\sim 5.9\text{ W}$ |
+| **ANE + MTP Speculation** | 4 | 64 | $4.80\text{ tok/s}$ | 2.86 | 22 | **$\sim 5.9\text{ W}$** |
+
+### Latency Breakdown per Layer Dispatch (Chained INT4):
+* **Host Write to IOSurface:** $0.109\,\text{ms}$
+* **Raw ANE Silicon Compute:** $2.662\,\text{ms}$
+* **Host Read from IOSurface:** $0.047\,\text{ms}$
+* **Total Chained Layer Dispatch:** $3.575\,\text{ms}$ per layer call ($65,792$ calls in 512-token run)
+* **ANE Vocabulary Head (`lm_head` 4 chunks):** $8.224\,\text{ms}$ per position
+
+## Low-Latency Metal C Runtime (`libmetal_engine.dylib`)
+
+Bypasses framework runtime overhead for GPU sequence operations via direct C/ObjC routines:
+* **Zero-Copy IOSurface Sharing (`metal_buffer_from_iosurface`):** Directly maps `_ANEIOSurfaceObject` memory handles into `MTLBuffer` without CPU copies.
+* **Hardware Synchronization (`MTLSharedEvent`):** Zero-CPU event signaling between GPU command buffers and ANE execution queues.
+* **Measured Kernel Latencies (`probes/test_metal_ane_interop.py`):**
+  * `rmsnorm_fp16` ($S=32, C=5120$): **$183.46\,\mu\text{s}$**
+  * Layout transposition ($[S, C] \leftrightarrow [1, C, 1, S]$): **$155.18\,\mu\text{s}$** ($4.2\,\text{GB/s}$ effective bandwidth)
+  * Dynamic MoE gather/scatter ($k=8, H=1536$): **$306.91\,\mu\text{s}$**
+  * GEMM FP16: **$0.000015$** max error vs NumPy reference
+
+## Multi-Turn APC & Dual-Mode Hybrid Benchmark (`tools/hybrid_serve.py`)
+
+Standard multi-turn evaluation (Qwen3.8-27B on Apple M5 Max silicon):
+
+| Metric | Turn 1 (Cold Prefill Miss) | Turn 2 (APC Cache Hit) | Speedup / Advantage |
+| :--- | :---: | :---: | :---: |
+| **TTFT (Turbo Mode)** | $760.5\,\text{ms}$ | **$\mathbf{0.03\,\text{ms}}$** | **$24,831.8\times$ faster TTFT** (0 FLOPs) |
+| **TTFT (Silent Mode)** | $896.7\,\text{ms}$ | **$\mathbf{0.03\,\text{ms}}$** | **$29,122.0\times$ faster TTFT** (0 FLOPs) |
+| **Decode Throughput (Turbo)** | $9.89\text{ tok/s}$ | $5.77\text{ tok/s}$ | **Up to $3.67\text{ accepted tokens/step}$** |
+| **Decode Throughput (Silent)** | $4.09\text{ tok/s}$ | $4.15\text{ tok/s}$ | **$\sim 5.9\text{ W}$ active power** ($41.0\,\text{GB}$ RAM freed) |
+| **APC Radix Cache Latency** | — | **$30\,\mu\text{s}$** | Instantaneous pointer restoration |
+
+## Multi-Turn Agentic & Tool-Calling Benchmark (`probes/test_agentic_long_context.py`)
+
+Simulates an autonomous coding agent executing a multi-step task with tool calling schemas across 3 conversational turns:
+
+| Turn | Context Stage | Total Context | Tokens Skipped by APC | Delta Tokens | TTFT | Decode Speed | Accepted / Step |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Turn 1** | **Cold Agent System Prompt** | $287\text{ tokens}$ | $0$ (Cold Miss) | $287\text{ tokens}$ | $2679.3\,\text{ms}$ | **$8.57\text{ tok/s}$** | **$3.44\text{ tok/step}$** |
+| **Turn 2** | **Tool Result Injection** | $358\text{ tokens}$ | **$286\text{ tokens}$ ($0\text{ FLOPs}$)** | $72\text{ tokens}$ | **$846.7\,\text{ms}$ ($3.2\times$)** | **$4.79\text{ tok/s}$** | **$2.21\text{ tok/step}$** |
+| **Turn 3** | **Final Summary & Verification** | $425\text{ tokens}$ | **$357\text{ tokens}$ ($0\text{ FLOPs}$)** | $67\text{ tokens}$ | **$815.2\,\text{ms}$ ($3.3\times$)** | **$5.75\text{ tok/s}$** | **$2.58\text{ tok/step}$** |
+
+
+

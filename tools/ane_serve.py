@@ -1416,8 +1416,8 @@ def attach_ane_chain(model, engine_path, seq, bits, cache=None):
                 if nbox is not None and pj is not None:
                     nbox["proj"] = pj
                     nbox["shape"] = shp
-                    nbox["dtype"] = x.dtype
-                return mx.array(y.reshape(shp)).astype(x.dtype)
+                n_toks = int(np.prod(shp[:-1]))
+                return mx.array(y[:n_toks].reshape(shp)).astype(x.dtype)
             return call
 
         b.__class__ = type("AneChainLayer", (type(b),), {"__call__": make()})
@@ -1440,11 +1440,7 @@ def attach_ane_chain(model, engine_path, seq, bits, cache=None):
 
                 def rd(box=boxes[i + 1], a0=a0, a1=a1):
                     def call(self, x, *a, **k):
-                        y, shp, dt = box["proj"], box["shape"], box["dtype"]
-                        # ascontiguousarray matters: mx.array on a strided numpy
-                        # view takes a CPU path, which on the server's worker
-                        # thread dies with "There is no Stream(cpu, 0) in
-                        # current thread".
+                        y, shp, dt = box["proj"], box["shape"], box.get("dtype") or x.dtype
                         return mx.array(np.ascontiguousarray(
                             y[:, a0:a1])).reshape(*shp[:-1], a1 - a0).astype(dt)
                     return call
@@ -2314,7 +2310,6 @@ def main():
     globals()['SYNC_ONLY'] = args.sync_only
     globals()['FUSE_GU'] = not args.no_fuse_gu
     globals()['FREE_MLX'] = not args.keep_mlx_weights
-    import os
     args.engine = os.path.expanduser(args.engine)
     args.name = args.name or os.path.basename(args.model.rstrip("/"))
 

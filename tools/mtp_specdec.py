@@ -31,6 +31,10 @@ ap.add_argument("--model", default="/Users/true/.lmstudio/models/Qwen/Qwen3.8-27
 ap.add_argument("--mtp", default=None, help="separate -mtp dir; default uses the in-model head")
 ap.add_argument("--draft", type=int, default=2, help="draft depth k")
 ap.add_argument("--tokens", type=int, default=64)
+ap.add_argument("--ane-chain", action="store_true",
+                help="fuse layer tails + next-layer heads on ANE")
+ap.add_argument("--bake-cache", action="store_true",
+                help="use ~/.cache/ane_bake cache")
 ap.add_argument("--ane-layers", type=int, default=0, help="dense MLP layers to bake on ANE")
 ap.add_argument("--dense-bits", type=int, default=8)
 ap.add_argument("--ane-lm-head", action="store_true",
@@ -48,17 +52,7 @@ inner = lm.model
 embed = inner.embed_tokens
 H = inner.embed_tokens.weight.shape[1]
 
-if a.ane_layers or a.ane_lm_head:
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
-    import ane_serve
-    if a.ane_layers:
-        n = ane_serve.attach_ane_dense(model, a.ane_layers, a.engine, 32, a.dense_bits)
-        print(f"  ANE dense MLP layers: {n}", flush=True)
-    if a.ane_lm_head:
-        ane_serve.attach_ane_lm_head(model, a.engine, 32, a.dense_bits,
-                                     a.lm_head_chunks)
-
-# ---- MTP head -------------------------------------------------------------
+# ---- MTP head (initialize before freeing weights during ANE bake) ----------
 w, q = {}, {}
 if a.mtp:
     for f in sorted(glob.glob(a.mtp + "/*.safetensors")):
@@ -124,6 +118,21 @@ pre_e, pre_h, mtp_norm = (rms("pre_fc_norm_embedding"), rms("pre_fc_norm_hidden"
 mx.eval(mtp_layer.parameters(), pre_e.parameters(), pre_h.parameters(),
         mtp_norm.parameters(), fcw)
 print(f"  MTP head ready (draft depth {a.draft})", flush=True)
+
+# ---- ANE Chained Layer Baking ---------------------------------------------
+if a.ane_chain or a.ane_layers or a.ane_lm_head:
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
+    import ane_serve
+    cr = ane_serve._bake_cache_dir(a.model, a.dense_bits) if a.bake_cache else None
+    if a.ane_chain:
+        n = ane_serve.attach_ane_chain(model, a.engine, 32, a.dense_bits, cr)
+        print(f"  ANE chained layers: {n}", flush=True)
+    elif a.ane_layers:
+        n = ane_serve.attach_ane_dense(model, a.ane_layers, a.engine, 32, a.dense_bits)
+        print(f"  ANE dense MLP layers: {n}", flush=True)
+    if a.ane_lm_head:
+        ane_serve.attach_ane_lm_head(model, a.engine, 32, a.dense_bits,
+                                     a.lm_head_chunks)
 
 
 def head(x):

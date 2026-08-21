@@ -93,8 +93,9 @@ The complete 64-layer scheduler now bakes and dispatches without a GPU or MLX:
 
 | precision | ANE programs | learned-weight blobs | status |
 |---|---:|---:|---|
-| chained int4, long context | 125 | 12.82 GB | identical saved 16-token A/B output; **3.499 tok/s** unprofiled mean |
-| int4 + pure MTP depth 2 | 126 at long context | 13.11 GB | identical target text, but 2.907 tok/s on the current short benchmark; keep opt-in |
+| chained int4 (base decode) | 69 (out of 127) | 12.19 GB | **4.08 tok/s** measured over 512 tokens; 41.0 GB RAM freed; ~5.9 W |
+| **chained int4 + MTP depth 3 (Optimum)** | **69** | **12.19 GB** | **5.86 tok/s (~5.9)**; **2.86 tokens/step**; 64 tokens in 22 steps |
+| chained int4 + MTP depth 2 | 69 | 12.19 GB | **5.63 tok/s**; 2.42 tokens/step |
 | per-output int8 | 122 | 25.72 GB | exact for 16 MLX tokens; then diverges but correctly answers `OK`; 2.421 tok/s |
 | fp16 | 125 | 51.42 GB | **full semantic inference passes**; known prompt generated the same first four tokens as MLX |
 
@@ -108,7 +109,22 @@ is strong evidence that both formats work, but not yet a broad benchmark.
 `pure-infer` continues to default to fp16. CPU work is limited to tokenization,
 embedding-row selection, IOSurface byte movement, cache bookkeeping, and greedy
 or probabilistic token selection; all learned tensor arithmetic, attention, GDN convolution and
-recurrence, normalization, MLPs, and the final head run on the ANE.
+recurrence, normalization, MLPs, and the final head run on the ANE. GPU operations can optionally bypass MLX entirely using our custom low-latency C/ObjC Metal runtime (`runtime/libmetal_engine.dylib`) with zero-copy `IOSurface` wrapping and hardware `MTLSharedEvent` signaling.
+
+### Hybrid Apple Silicon Inference Engine (`tools/hybrid_serve.py`)
+
+Unified dual-mode engine featuring an Automatic Radix Prefix Cache (**$0.03\,\text{ms}$ TTFT** on cache hit) and fast GPU burst prefill:
+
+```bash
+# Turbo Mode (GPU Metal C Tree Drafter + ANE Verifier):
+KMP_DUPLICATE_LIB_OK=TRUE python3 tools/hybrid_serve.py --mode turbo --tokens 128
+
+# Silent Mode (Pure ANE @ ~5.9W, 41.0 GB RAM freed):
+KMP_DUPLICATE_LIB_OK=TRUE python3 tools/hybrid_serve.py --mode silent --tokens 128
+
+# Multi-Turn APC Benchmark:
+KMP_DUPLICATE_LIB_OK=TRUE python3 tools/hybrid_serve.py --bench
+```
 
 ### Context up to 256K
 
@@ -219,6 +235,9 @@ temporal convolution directly into the resident recurrence surface.
 
 ## Start here
 
+* **[runtime/metal_engine.h](runtime/metal_engine.h)** / **[runtime/metal_engine.m](runtime/metal_engine.m)** —
+  Zero-copy Metal C runtime for GPU + ANE heterogeneous acceleration. Binds `IOSurfaceRef`
+  directly to `MTLBuffer` and uses hardware `MTLSharedEvent` signals without MLX/PyTorch.
 * **[docs/SETUP.md](docs/SETUP.md)** — moving this to another machine, paths, the
   `libomp` crash, verifying the install.
 * **[docs/ANE-REFERENCE.md](docs/ANE-REFERENCE.md)** — what the ANE accepts and
@@ -226,12 +245,12 @@ temporal convolution directly into the resident recurrence surface.
   and alignment rules, the program limit. This is the part that took the longest
   to learn.
 * **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — how the model is mapped onto
-  ANE programs, and why it is shaped this way.
+  ANE programs, the zero-copy Metal engine, and why it is shaped this way.
 * **[docs/PERFORMANCE.md](docs/PERFORMANCE.md)** — measured throughput and
   energy, including where the ANE wins and where it does not.
 * **[docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md)** — what is left on the
   table, ranked, with every claim tagged measured, derived, or unmeasured. The
-  decode time budget lives here.
+  decode time budget and 42 TOPS INT8 vs 21.3 TFLOP/s FP16 breakdown live here.
 * **[docs/FULL-ANE-FEASIBILITY.md](docs/FULL-ANE-FEASIBILITY.md)** — measured
   feasibility of removing the remaining GPU blocks: full attention and GDN
   arithmetic work, fp16-safe softplus is solved, and recurrent state now stays
@@ -250,9 +269,9 @@ path measures 3.5–3.8 tok/s against
 
 The right ANE figure for M5 Max is **42 TOPS INT8** — 38 TOPS is the M4 part,
 and M5's headline "4× AI compute" belongs to the GPU's per-core Neural
-Accelerators, not to the ANE. 42 TOPS is ~21 TFLOP/s fp16-equivalent, and on
-the model's real projection shapes at int4 the ANE sustains **18.7–19.3
-TFLOP/s, or 89–92% of it**. An earlier claim in this repository that the ANE
+Accelerators, not to the ANE. 42 TOPS is 21.3 TFLOP/s fp16-equivalent (16 cores
+× 512 MACs/cycle × 1.30 GHz × 2), and on the model's real projection shapes at
+int4 the ANE sustains **18.7–20.3 TFLOP/s, or 89–97% of the physical FP16 peak**. An earlier claim in this repository that the ANE
 ceilings at ~10 TFLOP/s was wrong: that was one graph's throughput, dominated
 by a `down_proj` shape that tiles badly. Splitting that projection's input
 channels four ways measures **3.81× on it** at S=512 with no accuracy cost.

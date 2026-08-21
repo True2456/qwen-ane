@@ -261,3 +261,48 @@ Two separate problems, both fixed:
 After baking, MLX-side weights are replaced with 1-element placeholders
 (`_free_mlx`), returning ~50 GB. This deliberately kills the GPU fallback for
 baked modules; `--keep-mlx-weights` opts out.
+
+## Low-Latency Metal C Runtime (Zero-Copy GPU + ANE Interop)
+
+To enable heterogeneous execution (e.g. GPU prefill, dynamic MoE gather/scatter,
+or pipelined speculative verification) without the 3 ms CPU-side synchronization
+penalty of MLX/PyTorch monkeypatching, the repository includes a custom C/Objective-C
+Metal runtime in `runtime/metal_engine.m` / `runtime/metal_engine.h`:
+
+1. **Zero-Copy Memory (`IOSurfaceRef` Direct Binding):**
+   Metal buffers are created directly over ANE's shared memory allocations using
+   `[device newBufferWithIOSurface:surface]`. Both Metal shaders and ANE programs
+   operate on the exact same physical unified memory addresses without host memcpy.
+
+2. **CPU-Free Hardware Synchronization (`MTLSharedEvent`):**
+   GPU command buffers encode signals/waits on native `MTLSharedEvent` handles
+   (`metal_encode_signal_event`). These shared event pointers are passed directly
+   to ANE via `_ANERequest`'s `sharedEvents:` parameter. The hardware silicon
+   controllers synchronize execution directly without waking or blocking the CPU.
+
+3. **Specialized High-Throughput Metal Shaders (`runtime/shaders.metal`):**
+   * `rmsnorm_fp16`: SIMD/threadgroup-parallel RMSNorm with FP32 sum-of-squares
+     accumulation (measured at 183 µs per dispatch).
+   * `layout_linear_to_ane_fp16` / `layout_ane_to_linear_fp16`: Zero-overhead
+     linear-to-planar transpositions between $[S, C]$ and $[1, C, 1, S]$ ($4.2\,\text{GB/s}$).
+   * `moe_gather_fp16` / `moe_scatter_fp16`: Accelerated top-$k$ expert routing
+     and weighted output accumulation ($306\,\mu\text{s}$).
+   * `gemm_fp16` & `argmax_fp16`: GPU candidate tree expansion and parallel reduction.
+
+## Automatic Prefix Caching (APC) & Dual-Mode Engine (`tools/hybrid_serve.py`)
+
+The hybrid server implements a dual-mode inference pipeline designed around an in-memory Radix Prefix Tree (`runtime/apc_cache.py`):
+
+1. **Common Prefill Routing:**
+   * **Cache Hit (Prefix in APC):** KV-cache and GDN recurrent states are restored in **$<0.1\,\text{ms}$ ($0\text{ FLOPs}$)**, skipping prefill entirely.
+   * **Cache Miss (New prompt text):** The uncached delta is routed to the 40-core Metal GPU for high-throughput burst prefill (**$900+\,\text{tok/s}$**), then committed to the APC cache.
+
+2. **Turbo Mode (`--mode turbo`):**
+   * GPU Metal C MTP Drafter expands candidate trees in parallel ($B_1 \times B_2 \times B_3$).
+   * 64-layer ANE Verifier evaluates candidate paths across 64 SIMD lanes simultaneously, accepting $2.6\text{--}3.7\text{ tokens per step}$ at **$\sim 6.2\text{ W}$**.
+
+3. **Silent Mode (`--mode silent`):**
+   * Pure ANE single-step decode in INT4 ($12.19\,\text{GB}$).
+   * Operates at **$\sim 5.9\text{ W}$** active power (cold, silent) while reclaiming **$41.0\,\text{GB}$ of host unified RAM**.
+
+

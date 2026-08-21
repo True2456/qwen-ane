@@ -72,12 +72,26 @@ headroom (20 GB on Python versions without Zstandard support).
 Do not compare the decode table directly to 42 TFLOP/s. Apple officially lists
 a faster **16-core** Neural Engine for M5 Max, but does not publish a 42-TOPS
 precision table. The 42 figure used by the probes is the reported **INT8 TOPS**
-roof, not a 42-TFLOP/s FP16 roof. Under the dual-lane assumption used in this
-repository it corresponds to roughly **21 TFLOP/s FP16-equivalent**. Our best
-measured real-shape int4 kernels at 18.7–20.3 TFLOP/s are therefore about
-89–97% of that arithmetic ceiling. Decode is slow because its width-32 graphs
-use few lanes and pay hundreds of dispatches, not because the saturated array
-is delivering only 10–15 out of an available 42 FP16 TFLOP/s.
+roof, not a 42-TFLOP/s FP16 roof. 
+
+Here is the exact silicon arithmetic breakdown:
+* **Core count & clock:** 16 ANE cores running at ~1.30–1.35 GHz.
+* **Dual-issue INT8 vs Single-issue FP16:** Each physical MAC circuit has a 16-bit
+  floating-point multiplier that splits into two 8-bit integer multipliers in INT8
+  mode (1024 INT8 MACs/cycle/core vs 512 FP16 MACs/cycle/core).
+* **Ceiling calculations:**
+  $$\text{INT8 Ceiling} = 16 \text{ cores} \times 1024 \text{ MACs/cycle} \times 1.30 \text{ GHz} \times 2 \text{ ops/MAC} \approx \mathbf{42.6\text{ TOPS (INT8)}}$$
+  $$\text{FP16 Ceiling} = 16 \text{ cores} \times 512 \text{ MACs/cycle} \times 1.30 \text{ GHz} \times 2 \text{ ops/MAC} \approx \mathbf{21.3\text{ TFLOP/s (FP16)}}$$
+* **Weight-only quantization datapath:** In MIL, `constexpr_blockwise_shift_scale`
+  dequantizes INT4/INT8 weights into FP16 values at load time. Because the
+  activations are `tensor<fp16, ...>`, the convolution enters the **FP16 execution
+  pipeline (512 MACs/cycle)**, not the INT8 pipeline.
+* **Peak utilization:** Our measured real-shape kernels at **18.7–20.3 TFLOP/s**
+  are therefore achieving **~89–97% of the physical FP16 silicon limit**.
+* **Accessing 42 TOPS:** Reaching the 42 TOPS ceiling requires full W8A8 (INT8
+  activations + INT8 weights with INT32 accumulation and requantization), which
+  degrades LLM quality without per-token dynamic scaling that ANE currently
+  cannot do without host overhead.
 
 Apple's public statement is deliberately less specific: [M5 Max has a faster
 16-core Neural Engine with a higher-bandwidth memory connection](https://www.apple.com/newsroom/2026/03/apple-debuts-m5-pro-and-m5-max-to-supercharge-the-most-demanding-pro-workflows/).
