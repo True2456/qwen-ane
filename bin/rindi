@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# rindi - Apple Silicon Hybrid ANE + Metal GPU Inference Server
+# rindi - Apple Silicon Standalone Native C++ ANE + Metal GPU Inference Server
 
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
@@ -10,5 +10,10 @@ while [ -h "$SOURCE" ]; do
 done
 ROOT_DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 
-export KMP_DUPLICATE_LIB_OK=TRUE
-exec python3 "$ROOT_DIR/tools/hybrid_serve.py" "$@"
+# Launch Pure C++ Standalone Native Binary (Zero Python, Zero MLX)
+if [ -f "$ROOT_DIR/runtime/rindi-server" ]; then
+  exec "$ROOT_DIR/runtime/rindi-server" "$@"
+else
+  export KMP_DUPLICATE_LIB_OK=TRUE
+  exec python3 "$ROOT_DIR/tools/hybrid_serve.py" "$@"
+fi
