@@ -664,6 +664,20 @@ class AneExpertBank:
                                     f"moe_gu_c{c}"))
         self.nbytes = sum(b.nbytes for b in self.banks)
 
+    def gate_up_batch(self, layer, X, groups=None):
+        """gate|up for a whole chunk of positions: one dispatch per live group."""
+        s = self.spec
+        idx = s.moe_layers.index(layer)
+        per = s.experts // self.chunks
+        M, T = s.moe_intermediate, X.shape[0]
+        out = np.zeros((T, s.experts, 2, M), np.float32)
+        xh = X.T.astype(np.float16)
+        for c in (range(self.chunks) if groups is None else sorted(groups)):
+            r = _cols(self.banks[c].run(idx, xh)).astype(np.float32)  # [2*per*M, T]
+            out[:, c*per:(c+1)*per, 0] = r[:per*M].reshape(per, M, T).transpose(2, 0, 1)
+            out[:, c*per:(c+1)*per, 1] = r[per*M:].reshape(per, M, T).transpose(2, 0, 1)
+        return out
+
     def gate_up(self, layer, x, groups=None):
         """gate|up for the routed experts only.
 
@@ -846,8 +860,16 @@ class AneProjectionBanks:
         self.shared_dn = B(driver, checkpoint,
                            [[mn(l)["shared_down"]] for l in spec.moe_layers],
                            bits, "shared_dn")
+        dense = [l for l in range(spec.layers) if not spec.is_moe(l)]
+        self.dense_gu = B(driver, checkpoint,
+                          [[mn(l)["gate"], mn(l)["up"]] for l in dense],
+                          bits, "dense_gu")
+        self.dense_dn = B(driver, checkpoint, [[mn(l)["down"]] for l in dense],
+                          bits, "dense_dn")
+        self.dense_layers = dense
         self.banks = [self.kda_in, self.kda_out, self.mla_a, self.mla_qb,
-                      self.mla_out, self.shared_gu, self.shared_dn]
+                      self.mla_out, self.shared_gu, self.shared_dn,
+                      self.dense_gu, self.dense_dn]
         self.nbytes = sum(b.nbytes for b in self.banks)
         self.programs = len(self.banks)
 
@@ -887,3 +909,186 @@ class AneExpertDown:
         e = int(expert)
         bank = self.banks[(layer, e // self.PER_BANK)]
         return bank.run(e % self.PER_BANK, h.astype(np.float16))
+
+
+# ---------------------------------------------------------------------------
+# Batched prefill. Every projection is position-independent and the ANE pads
+# each dispatch to 32 lanes anyway, so a prompt costs almost the same as one
+# token for the weight-heavy blocks. Only the KDA recurrence is sequential.
+# ---------------------------------------------------------------------------
+
+def _rms_rows(X, w, eps):
+    return X / np.sqrt((X * X).mean(-1, keepdims=True) + eps) * w
+
+
+def _cols(r):
+    """Bank output as [out, lanes].
+
+    AneLinearProjectionBank drops the lane axis when there is exactly one lane,
+    which a trailing partial chunk always hits.
+    """
+    return r[:, None] if r.ndim == 1 else r
+
+
+class LingPrefill(LingRuntime):
+    """LingRuntime with a batched prompt path.
+
+    `AneLinearProjectionBank` already accepts a [hidden, lanes] matrix; it just
+    defaults to 3 active lanes. Raising that to the program width turns every
+    projection into one dispatch for the whole chunk.
+
+    What cannot batch: the KDA recurrence carries state across positions, so it
+    still advances one at a time. MLA attention batches with a causal mask.
+    """
+
+    def __init__(self, *a, lanes=32, **k):
+        super().__init__(*a, **k)
+        self.lanes = lanes
+        for bank in (self.proj.banks if self.proj else []):
+            bank.active_lanes = lanes
+        for bank in (self.experts.banks if self.experts else []):
+            bank.active_lanes = lanes
+        for bank in (self.down.banks.values() if self.down else []):
+            bank.active_lanes = lanes
+
+    def kda_batch(self, A, layer):
+        s, n = self.spec, self.attention_names_cached(layer)
+        H, D, P = s.heads, s.head_dim, s.kda_proj_dim
+        T = A.shape[0]
+        i = s.linear_attention_layers.index(layer)
+        f = _cols(self.proj.kda_in.run(i, A.T.astype(np.float16))).astype(np.float32)
+        qkv = f[:3 * P]                                    # [3P, T]
+        fl, gate_r, beta_r = f[3*P:4*P], f[4*P:5*P], f[5*P:5*P+H]
+
+        # causal depthwise conv over the chunk, seeded with the carried history
+        cw = np.concatenate([self.w(n[f"{k}_conv"]).reshape(P, s.conv_kernel)
+                             for k in ("q", "k", "v")])
+        padded = np.concatenate([self.conv[layer], qkv], axis=1)
+        conv = sum(padded[:, t:t + T] * cw[:, t:t + 1]
+                   for t in range(s.conv_kernel))
+        self.conv[layer] = padded[:, -(s.conv_kernel - 1):]
+        q = _silu(conv[:P]).T.reshape(T, H, D)
+        k = _silu(conv[P:2*P]).T.reshape(T, H, D)
+        v = _silu(conv[2*P:]).T.reshape(T, H, D)
+        q /= np.linalg.norm(q, axis=-1, keepdims=True)
+        k /= np.linalg.norm(k, axis=-1, keepdims=True)
+        beta = _sigmoid(beta_r).T
+        a = np.exp(self.w(n["a_log"]))[None, :, None]
+        g = np.exp(s.kda_lower_bound * _sigmoid(
+            a * (fl.T.reshape(T, H, D) + self.w(n["dt_bias"]).reshape(H, D))))
+
+        S = self.state[layer]
+        Y = np.empty((T, H, D), np.float32)
+        for t in range(T):                                  # the one serial part
+            S = S * g[t][:, None, :]
+            delta = (v[t] - np.einsum("hvd,hd->hv", S, k[t])) * beta[t][:, None]
+            S = S + delta[:, :, None] * k[t][:, None, :]
+            Y[t] = np.einsum("hvd,hd->hv", S, q[t])
+        self.state[layer] = S
+        Y = _rms_rows(Y, self.w(n["o_norm"]), s.rms_eps * D)
+        Y = (Y * _sigmoid(gate_r).T.reshape(T, H, D)).reshape(T, -1)
+        return _cols(self.proj.kda_out.run(i, Y.T.astype(np.float16))).astype(np.float32).T
+
+    def mla_batch(self, A, layer):
+        s, n = self.spec, self.attention_names_cached(layer)
+        H, Dn, Dr, Dv = s.heads, s.qk_nope, s.qk_rope, s.v_head_dim
+        T = A.shape[0]
+        i = s.full_attention_layers.index(layer)
+        f = _cols(self.proj.mla_a.run(i, A.T.astype(np.float16))).astype(np.float32).T
+        qa = _rms_rows(f[:, :s.q_lora_rank], self.w(n["q_a_norm"]), s.rms_eps)
+        kva = f[:, s.q_lora_rank:s.q_lora_rank + s.kv_lora_rank + Dr]
+        gate = _sigmoid(f[:, s.q_lora_rank + s.kv_lora_rank + Dr:])
+        q = _cols(self.proj.mla_qb.run(i, qa.T.astype(np.float16))).astype(np.float32).T
+        q = q.reshape(T, H, s.qk_head_dim)
+        q_nope, q_rope = q[..., :Dn], q[..., Dn:]
+        lat = _rms_rows(kva[:, :s.kv_lora_rank], self.w(n["kv_a_norm"]), s.rms_eps)
+        k_rope = kva[:, s.kv_lora_rank:]
+        pos = np.arange(self.pos, self.pos + T, dtype=np.float64)
+        inv = 1.0 / (s.rope_theta ** (np.arange(0, Dr, 2, np.float64) / Dr))
+        fr = pos[:, None] * inv[None, :]
+        cos = np.cos(np.concatenate([fr, fr], -1))
+        sin = np.sin(np.concatenate([fr, fr], -1))
+        half = Dr // 2
+
+        def rope(x, c, sn):
+            xd = x.reshape(*x.shape[:-1], half, 2).swapaxes(-1, -2).reshape(x.shape)
+            return xd * c + np.concatenate([-xd[..., half:], xd[..., :half]], -1) * sn
+
+        q_rope = rope(q_rope, cos[:, None, :], sin[:, None, :])
+        k_rope = rope(k_rope, cos, sin)
+        for t in range(T):
+            self.kv[layer].append((lat[t].copy(), k_rope[t].copy()))
+        kv_b = self.w(n["kv_b"]).reshape(H, Dn + Dv, s.kv_lora_rank)
+        W_K, W_V = kv_b[:, :Dn, :], kv_b[:, Dn:, :]
+        q_abs = np.einsum("thn,hnl->thl", q_nope, W_K)
+        L = np.stack([x for x, _ in self.kv[layer]])
+        R = np.stack([x for _, x in self.kv[layer]])
+        sc = (np.einsum("thl,sl->hts", q_abs, L)
+              + np.einsum("thr,sr->hts", q_rope, R)) * (s.qk_head_dim ** -0.5)
+        past = L.shape[0] - T
+        mask = np.arange(L.shape[0])[None, :] <= (np.arange(T)[:, None] + past)
+        sc = np.where(mask[None], sc, -np.inf)
+        p = np.exp(sc - sc.max(-1, keepdims=True)); p /= p.sum(-1, keepdims=True)
+        attn = np.einsum("thl,hvl->thv", np.einsum("hts,sl->thl", p, L), W_V)
+        Y = (attn * gate[:, :, None]).reshape(T, -1)
+        return _cols(self.proj.mla_out.run(i, Y.T.astype(np.float16))).astype(np.float32).T
+
+    def moe_batch(self, X, layer):
+        s = self.spec
+        T = X.shape[0]
+        per = s.experts // self.experts.chunks
+        routes = [self.route(X[t], layer) for t in range(T)]
+        groups = {int(e) // per for idx, _ in routes for e in idx}
+        gu = self.experts.gate_up_batch(layer, X, groups)     # [T, E, 2, M]
+        out = np.zeros_like(X)
+        # expert-major: one dispatch per (expert, chunk of its positions)
+        assign: dict[int, list[int]] = {}
+        weights: dict[int, list[float]] = {}
+        for t, (idx, wts) in enumerate(routes):
+            for e, wt in zip(idx, wts):
+                assign.setdefault(int(e), []).append(t)
+                weights.setdefault(int(e), []).append(float(wt))
+        M = s.moe_intermediate
+        for e, ts in assign.items():
+            h = (_silu(gu[ts, e, 0]) * gu[ts, e, 1]
+                 * np.array(weights[e], np.float32)[:, None])
+            r = _cols(self.down.run(layer, e, h.T)).astype(np.float32).T
+            out[ts] += r.reshape(len(ts), -1)
+        si = s.moe_layers.index(layer)
+        sgu = _cols(self.proj.shared_gu.run(si, X.T.astype(np.float16))).astype(np.float32).T
+        Ms = M * s.shared_experts
+        sh = _silu(sgu[:, :Ms]) * sgu[:, Ms:]
+        return out + _cols(self.proj.shared_dn.run(
+            si, sh.T.astype(np.float16))).astype(np.float32).T
+
+    def dense_batch(self, X, layer):
+        s, pj = self.spec, self.proj
+        i = pj.dense_layers.index(layer)
+        gu = _cols(pj.dense_gu.run(i, X.T.astype(np.float16))).astype(np.float32).T
+        I = s.intermediate
+        h = _silu(gu[:, :I]) * gu[:, I:]
+        return _cols(pj.dense_dn.run(i, h.T.astype(np.float16))).astype(np.float32).T
+
+    def prefill(self, ids, chunk=None):
+        """Run a prompt in chunks, returning the final logits."""
+        s = self.spec
+        chunk = chunk or self.lanes
+        logits = None
+        for a in range(0, len(ids), chunk):
+            batch = ids[a:a + chunk]
+            X = np.stack([np.asarray(self.ck.embedding(int(t)), np.float32)
+                          for t in batch])
+            for layer in range(s.layers):
+                nn = s.norm_names(layer)
+                A = _rms_rows(X, self.w(nn["input"]), s.rms_eps)
+                X = X + (self.mla_batch(A, layer) if s.is_full_attention(layer)
+                         else self.kda_batch(A, layer))
+                Pn = _rms_rows(X, self.w(nn["post_attention"]), s.rms_eps)
+                if s.is_moe(layer):
+                    X = X + self.moe_batch(Pn, layer)
+                else:
+                    X = X + self.dense_batch(Pn, layer)
+            self.pos += len(batch)
+            X = _rms_rows(X, self.w("model.norm.weight"), s.rms_eps)
+            logits = X[-1] @ self.wt("lm_head.weight")
+        return logits
