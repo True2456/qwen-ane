@@ -641,3 +641,58 @@ arrived at from the opposite direction: there the ANE lost because expert
 staging cost more than the GPU's free gather; here it loses because 35
 dispatches per token at a 0.09 ms floor cost more than the GPU's whole forward
 pass.
+
+
+## Prefill: 23.4 -> ~100 tok/s
+
+Measured on a 193-token prompt, width-64 banks, int8, 104 programs, 9.97 GB.
+
+| change | prefill tok/s |
+|---|---:|
+| starting point | 23.4 |
+| MLA absorbed maps onto the ANE | 32.3 |
+| width-64 banks | 37.4 |
+| KDA recurrence onto the ANE | 41.2 |
+| stop materializing `[T, experts, 2, M]` | 49.3 |
+| **stacked `down` for prefill** | **58.1** |
+| **KDA recurrence unrolled 16/dispatch** | **~100** |
+
+The two large wins were dispatch count, not arithmetic. Dispatches for a
+137-token prompt went 6807 -> ~450:
+
+* `down` was dispatched once per (layer, routed expert). Correct for decode --
+  8 experts, 8 small dispatches -- and wrong for prefill, where 64 positions
+  times 8 experts touch ~110 of 128 experts, so a layer cost ~110 dispatches at
+  0.105 ms = 11.5 ms against one stacked 1.509 ms dispatch.
+* the recurrence was dispatched once per position, 2466 of them, 73% of all
+  dispatches after the `down` fix. Unrolling 16 positions into one graph keeps
+  the state on the ANE between them. U=8 and U=16 measure the same, so the win
+  is removing the per-position dispatch, not the unroll depth.
+
+This is the same lesson as Apple shipping AFM as essentially one compiled ANE
+program. The gap was never silicon; it was 2269 dispatches to process 64 tokens.
+
+### What does NOT pay
+
+Fusing the KDA depthwise conv, SiLU and per-head L2 norm onto the ANE
+(`AneKdaPrepare`, correct at rel 2.2e-03) measured **slower**: 45.6 -> 40.2
+tok/s. The numpy it replaces is already batched over 64 positions, so moving it
+adds 18 dispatches and two IOSurface round trips per layer per chunk to save
+arithmetic that was never the bottleneck. Kept behind `ane_prepare=False` as
+the evidence.
+
+The rule the measurements support: move **weight-heavy** and **per-position**
+work to the ANE; leave **batched elementwise** work in numpy.
+
+### Benchmarking caveat, learned the hard way
+
+Decode measured 8.0 tok/s at one point and 5.9 later for identical code, and
+two features were wrongly suspected before isolation cleared them. The cause was
+an `omlx-server` holding 23.6 GB resident. With it idle, decode is stable at
+5.55-5.94 (spread 1.07x) and prefill at 93.5-98.3.
+
+Decode is the more sensitive of the two because it is dispatch- and
+latency-bound rather than throughput-bound. **Any decode figure quoted from this
+port needs the machine otherwise idle**, and the same is true of the MLX
+baseline, which moved 100x for prompt processing between a loaded and an idle
+machine.
