@@ -72,7 +72,7 @@ void handle_client(int client_fd, RindiNativeChain* chain) {
             std::string header = "HTTP/1.1 200 OK\r\n"
                                  "Content-Type: text/event-stream; charset=utf-8\r\n"
                                  "Cache-Control: no-cache\r\n"
-                                 "Connection: close\r\n"
+                                 "Connection: keep-alive\r\n"
                                  "Access-Control-Allow-Origin: *\r\n\r\n";
             write(client_fd, header.c_str(), header.size());
 
@@ -102,9 +102,7 @@ void handle_client(int client_fd, RindiNativeChain* chain) {
             std::string done_marker = "data: [DONE]\n\n";
             write(client_fd, done_marker.c_str(), done_marker.size());
             
-            // Flush and graceful TCP shutdown
-            shutdown(client_fd, SHUT_WR);
-            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
             close(client_fd);
             return;
         } else {
