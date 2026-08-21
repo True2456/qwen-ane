@@ -343,3 +343,57 @@ model load and a 33 s bake with the ANE idle ~85% of it, so it measured the
 plumbing, not the silicon. Sample only the generation window
 (`tools/ane_power_ab.sh` now emits `MEASURE_START`/`MEASURE_END`), and pin the
 engine before comparing (`tools/tflops_per_watt.sh`).
+
+
+## Why ANE prefill lags the GPU far more than ANE decode does
+
+Measured on the same machine, same 127-token prompt, Qwen3.8-27B:
+
+| | ANE (int4) | MLX (bf16, GPU) | ANE is |
+|---|---:|---:|---:|
+| decode | ~3.5 tok/s | 10.2 | **2.9x slower** |
+| prefill | 23.7 | 304 | **12.8x slower** |
+
+Decode is nearly competitive and prefill is 4.4x worse in relative terms. The
+two modes are limited by different things.
+
+**Decode is weight-bandwidth-bound.** Every token reads the whole model. The
+ANE reads 12.8 GB of int4; MLX reads 54 GB of bf16 (its 54.19 GB peak memory
+confirms it). The ANE therefore moves 4x fewer bytes, which nearly cancels its
+lower bandwidth: 45 GB/s effective against MLX's 551 GB/s, yet only 2.9x behind
+in tokens. **int4 is what rescues decode.**
+
+**Prefill is compute-bound**, and the ANE only reaches its arithmetic rate at
+width. An int4 conv measures 19.1 TFLOP/s at S=512 but 8.9 at S=32, and prefill
+runs at 16 lanes, so roughly half the achievable rate while the GPU runs near
+its own ~45 TFLOP/s peak.
+
+### Why widening the programs does not fix it
+
+Compiling at width 64 and running 32 lanes measured 23.69 tok/s against 23.68
+at width 32 with 16 lanes -- exactly neutral. The per-block profile explains it:
+
+| block | ms | % of prefill | scales with width? |
+|---|---:|---:|---|
+| gdn tail | 1356 | 24.4% | yes -- flat in width, so per-token cost halves |
+| gdn recurrence, unrolled | 1211 | 21.8% | **no** -- doubling U doubles the graph's work |
+| attention tail | 444 | 8.0% | yes |
+| attention prepare, per position | 355 | 6.4% | would batch, but it is only 6% |
+| gdn conv | 242 | 4.4% | yes |
+
+The projection half halves per token and the recurrence half does not, so the
+two cancel. That is a real result, not a null one.
+
+An earlier hypothesis in this repo -- that Qwen's per-position attention loop
+held a 2-3x -- is **wrong**: it is 6.4% of prefill, and batching it would move
+22.83 to 24.2 tok/s.
+
+The recurrence is the part that scales with tokens no matter how wide the
+programs get. Unrolling removes its dispatch overhead but not its arithmetic.
+Beating it needs the chunked/parallel formulation
+(`flash-linear-attention`'s `chunk_kda` shape), which is an algorithm change.
+
+Caveat: about 35% of prefill is unattributed here. `AneAttentionCore` recorded
+zero calls because at context 512 the runtime uses
+`AneLongContextAttentionCore`, a different class, so the long-context core plus
+host glue are outside this table.
