@@ -1071,6 +1071,26 @@ class LingPrefill(LingRuntime):
         for bank in (self.down.banks.values() if self.down else []):
             bank.active_lanes = self.lanes
 
+    def forward(self, token_id: int) -> np.ndarray:
+        """Decode step. Identical to the reference except the vocabulary
+        projection, which was still a numpy [1536, 157184] matmul -- 966 MB of
+        fp32 read per token, about half the decode budget."""
+        s = self.spec
+        h = np.asarray(self.ck.embedding(token_id), np.float32).reshape(-1)
+        for layer in range(s.layers):
+            nn = s.norm_names(layer)
+            a = _rms(h, self.w(nn["input"]), s.rms_eps)
+            h = h + (self.mla(a, layer) if s.is_full_attention(layer)
+                     else self.kda(a, layer))
+            pn = _rms(h, self.w(nn["post_attention"]), s.rms_eps)
+            h = h + (self.moe(pn, layer) if s.is_moe(layer)
+                     else self.dense_mlp(pn, layer))
+        self.pos += 1
+        h = _rms(h, self.w("model.norm.weight"), s.rms_eps)
+        if self.head is not None:
+            return self.head.run(h)
+        return h @ self.wt("lm_head.weight")
+
     def kda_batch(self, A, layer):
         s, n = self.spec, self.attention_names_cached(layer)
         H, D, P = s.heads, s.head_dim, s.kda_proj_dim
