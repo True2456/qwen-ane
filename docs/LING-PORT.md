@@ -608,3 +608,36 @@ means fusing whole layers into single programs rather than one program per
 projection. That is the shape of the Qwen chain fusion in
 `docs/ARCHITECTURE.md`, and it is a rewrite of the runtime, not an optimization
 of it.
+
+
+## Would the GPU help with the leftover work?
+
+Measured, identical work on the KDA prepare block `[6144, 64]`, median of 40:
+
+| | per block | per 192-token prompt |
+|---|---:|---:|
+| numpy (today) | 0.591 ms | 32 ms |
+| MLX GPU, tensors resident | 0.314 ms | 17 ms |
+| MLX GPU including both transfers | **0.313 ms** | 17 ms |
+
+**Host/GPU transfer is free** on unified memory: 0.019 ms each way, and the
+with-transfer figure is indistinguishable from the resident one. That corrects
+the note carried from the Qwen work that the "GPU->host->ANE boundary erases"
+an ANE win -- that measurement was catching MLX lazy-evaluation forcing, not
+the transfer.
+
+But it does not change the outcome. The GPU is 1.89x faster on that block, and
+the block is 32 ms of a 4200 ms prefill: 45.7 -> 45.9 tok/s. Applied to *all*
+remaining CPU work (1109 ms of the 3003 ms measured), 1.89x would give roughly
+**64 -> 77 tok/s, about 1.2x**.
+
+The reason it cannot do more is the split itself. The ANE portion is 1894 ms
+for 192 tokens. MLX runs the **entire model** in 91 ms. So the ANE doing its
+63% share is already about **20x slower than the GPU doing all of it**, and
+optimising the other 37% cannot reach that.
+
+This is the same conclusion `docs/ANE-MOE-HANDOFF.md` 27 reached for a 35B MoE,
+arrived at from the opposite direction: there the ANE lost because expert
+staging cost more than the GPU's free gather; here it loses because 35
+dispatches per token at a 0.09 ms floor cost more than the GPU's whole forward
+pass.
