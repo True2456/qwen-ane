@@ -10,5 +10,8 @@ while [ -h "$SOURCE" ]; do
 done
 ROOT_DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 
+# Prevent OpenMP duplicate runtime initialization conflict on macOS
+export KMP_DUPLICATE_LIB_OK=TRUE
+
 # Launch Unified Rindi ANE + Metal GPU Hybrid Inference Server
 exec python3 "$ROOT_DIR/tools/hybrid_serve.py" "$@"

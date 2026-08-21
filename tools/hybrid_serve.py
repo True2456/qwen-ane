@@ -4,11 +4,13 @@
 
 from __future__ import annotations
 
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import argparse
 import copy
 import glob
 import json
-import os
 import re
 import sys
 import time
