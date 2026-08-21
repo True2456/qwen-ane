@@ -28,6 +28,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from runtime.apc_cache import APCCache
 from runtime.metal_engine import MetalEngine, MetalSharedEvent
+from runtime.tui import RindiTUI
 import tools.ane_serve as ane_serve
 
 
@@ -817,6 +818,7 @@ def main():
                     content, tool_calls = parse_qwen_tool_calls(content)
                     finish_reason = "tool_calls" if tool_calls else "stop"
 
+                    tui.record_metrics(res["ttft_ms"], res["decode_tps"], res["apc_hit"], res["tokens_saved"])
                     resp = {
                         "id": cid,
                         "object": "chat.completion",
@@ -850,55 +852,16 @@ def main():
                     self._json_resp({"error": "Not Found"}, 404)
 
         server = ThreadingHTTPServer((a.host, a.port), OpenAIServer)
+        tui = RindiTUI(engine, host=a.host, port=a.port)
+        tui_thread = threading.Thread(target=tui.run_interactive_loop, args=(dispatch_generation,), daemon=True)
+        tui_thread.start()
 
-        def cli_listener():
-            """Interactive terminal command loop for live mode switching."""
-            while True:
-                try:
-                    line = sys.stdin.readline()
-                    if not line:
-                        break
-                    cmd = line.strip().lower()
-                    if cmd in ("t", "turbo"):
-                        engine.mode = "turbo"
-                        print(f"\n  ⚡ [RINDI CLI] Switched to TURBO MODE (Metal GPU Drafter + ANE Verifier)\n", flush=True)
-                    elif cmd in ("s", "silent"):
-                        engine.mode = "silent"
-                        print(f"\n  🌿 [RINDI CLI] Switched to SILENT MODE (Pure ANE @ ~5.9W)\n", flush=True)
-                    elif cmd in ("stats", "status"):
-                        st = engine.apc.stats()
-                        print(f"\n  📊 [RINDI STATUS]")
-                        print(f"     Active Mode:    {engine.mode.upper()}")
-                        print(f"     APC Hit Rate:   {st['hit_rate_pct']:.1f}% ({st['hits']}/{st['total_requests']})")
-                        print(f"     Tokens Saved:   {st['tokens_saved']}")
-                        print(f"     Tokens Cached:  {st['total_tokens_stored']}\n", flush=True)
-                    elif cmd in ("c", "clear"):
-                        engine.apc.root.children.clear()
-                        engine.apc.total_tokens_stored = 0
-                        print(f"\n  🧹 [RINDI CLI] APC Prefix Cache cleared.\n", flush=True)
-                    elif cmd in ("h", "help", "?"):
-                        print(f"\n  [RINDI Interactive Commands]")
-                        print(f"     t / turbo   - Switch to Turbo Mode (High Throughput GPU+ANE)")
-                        print(f"     s / silent  - Switch to Silent Mode (Ultra-low 5.9W on ANE)")
-                        print(f"     stats       - Show live APC and throughput statistics")
-                        print(f"     clear       - Flush the prefix cache")
-                        print(f"     help        - Show this help message")
-                        print(f"     q / quit    - Exit server\n", flush=True)
-                    elif cmd in ("q", "quit", "exit"):
-                        print("\n  [RINDI] Shutting down server...", flush=True)
-                        os._exit(0)
-                except Exception:
-                    break
-
-        t = threading.Thread(target=cli_listener, daemon=True)
-        t.start()
-
-        print(f"\n" + "=" * 65)
-        print(f"  RINDI HYBRID SERVER ACTIVE ON http://{a.host}:{a.port}/v1")
-        print(f"  Mode: {engine.mode.upper()} | Model: Qwen3.8-27B | Context: {a.context:,}")
-        print(f"  Interactive CLI Controls: [t]urbo | [s]ilent | [stats] | [help] | [q]uit")
-        print(f"=" * 65 + "\n")
-        server.serve_forever()
+        tui.print_status()
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            tui.log("Shutting down Rindi server...", tag="INFO")
+            server.shutdown()
 
 
 if __name__ == "__main__":
