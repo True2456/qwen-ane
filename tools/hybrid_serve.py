@@ -103,10 +103,16 @@ class HybridEngine:
         self.embed = self.inner.embed_tokens
         self.H = self.inner.embed_tokens.weight.shape[1]
 
-        # 4. Load MTP Weights
+        # 4. Initialize Metal GPU Parallel Prefill Engine (4-bit quantized)
+        print("  [GPU Engine] Initializing Metal GPU Matrix Cores for Prefill (4-bit)...")
+        self.gpu_inner = copy.deepcopy(self.inner)
+        nn.quantize(self.gpu_inner, group_size=64, bits=4)
+        mx.eval(self.gpu_inner.parameters())
+
+        # 5. Load MTP Weights
         self._init_mtp_head()
 
-        # 5. Initialize ANE Chained Engine
+        # 6. Initialize ANE Chained Engine for Decode
         print("  [ANE Engine] Compiling 64-layer ANE chain...")
         cr = ane_serve._bake_cache_dir(model_path, dense_bits) if bake_cache else None
         self.ane_layers = ane_serve.attach_ane_chain(self.model, "mil", 32, dense_bits, cr)
@@ -234,7 +240,12 @@ class HybridEngine:
             # Full cold prefill
             ids_arr = mx.array(remaining_tokens)
             t_prefill = time.perf_counter()
-            h = self.inner(ids_arr[None], cache=c)
+            if len(remaining_tokens) > 32 and hasattr(self, "gpu_inner"):
+                h = self.gpu_inner(ids_arr[None], cache=c)
+                tag = "Metal GPU Tensor Cores"
+            else:
+                h = self.inner(ids_arr[None], cache=c)
+                tag = "ANE Tiles"
             if len(remaining_tokens) > 1:
                 self.mtp_layer(mx.concatenate([self.pre_e(self.embed(ids_arr[None][:, 1:])),
                                               self.pre_h(h[:, :-1])], -1) @ self.fcw.T, cache=mc)
@@ -243,7 +254,7 @@ class HybridEngine:
             mx.eval(cur, last_h)
             ttft_ms = (time.perf_counter() - t_start) * 1e3
             prefill_tps = len(remaining_tokens) / max(ttft_ms / 1000, 1e-4)
-            print(f"\n  [Cold Prefill Complete] {len(remaining_tokens)} tokens in {ttft_ms:.1f} ms = {prefill_tps:.1f} tok/s | Initial: {cur} ({repr(self.tok.decode([cur]))})")
+            print(f"\n  [{tag} Cold Prefill] {len(remaining_tokens)} tokens in {ttft_ms:.1f} ms = {prefill_tps:.1f} tok/s | Initial: {cur} ({repr(self.tok.decode([cur]))})")
 
             # Store computed prefix in APC cache
             if use_apc:
@@ -253,13 +264,18 @@ class HybridEngine:
                 # Incremental delta prefill for only new user/tool tokens
                 ids_rem = mx.array(remaining_tokens)
                 t_delta = time.perf_counter()
-                h = self.inner(ids_rem[None], cache=c)
+                if len(remaining_tokens) > 32 and hasattr(self, "gpu_inner"):
+                    h = self.gpu_inner(ids_rem[None], cache=c)
+                    delta_tag = "Metal GPU Tensor Cores"
+                else:
+                    h = self.inner(ids_rem[None], cache=c)
+                    delta_tag = "ANE Tiles"
                 cur = int(mx.argmax(self.head(h[:, -1:])[0, -1]))
                 last_h = h[:, -1:]
                 mx.eval(cur, last_h)
                 ttft_ms = (time.perf_counter() - t_start) * 1e3
                 delta_tps = len(remaining_tokens) / max((time.perf_counter() - t_delta), 1e-4)
-                print(f"\n  [APC Cache Hit + Delta] Skipped {tokens_saved} tokens (0 FLOPs), computed {len(remaining_tokens)} delta tokens in {ttft_ms:.1f} ms = {delta_tps:.1f} tok/s | Initial: {cur}")
+                print(f"\n  [APC Cache Hit + {delta_tag} Delta] Skipped {tokens_saved} tokens (0 FLOPs), computed {len(remaining_tokens)} delta tokens in {ttft_ms:.1f} ms = {delta_tps:.1f} tok/s | Initial: {cur}")
 
                 # Update cache with new extended conversation prefix
                 if use_apc:
