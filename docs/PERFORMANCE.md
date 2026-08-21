@@ -397,3 +397,46 @@ Caveat: about 35% of prefill is unattributed here. `AneAttentionCore` recorded
 zero calls because at context 512 the runtime uses
 `AneLongContextAttentionCore`, a different class, so the long-context core plus
 host glue are outside this table.
+
+
+## Speculative decoding (MTP): what it is actually worth
+
+`mtp_lanes` was hardcoded to 3, capping draft depth at 2. That cap was not
+justified by cost: the verify pass batches up to `active_lanes` positions and
+measures 273.4 ms for one, 370.5 for three, 620.3 for sixteen — so the first
+candidate costs 273 ms and each **marginal** one about 23. It is now
+`Q38_ANE_MTP_LANES`, default 5, allowing depth 3. `AneLinearProjectionBank`
+also defaults to three active lanes and the MTP bank inherited that, which is
+why deeper drafts failed with `expected (5120, 1..3) lanes`.
+
+**Correctness first: MTP reproduces greedy decode exactly** — five prompts, 32
+tokens each, token-for-token identical to `mtp_draft=0`.
+
+Measured over five varied prompts:
+
+| draft depth | tok/s | accepted/cycle |
+|---:|---:|---:|
+| 0 | 3.45 | — |
+| 2 | 3.78 | 2.19 |
+| **3** | **3.98** | 2.69 |
+| 4 | 3.68 | 2.84 |
+
+**MTP is worth 1.15x**, and lifting the cap from depth 2 to 3 is 1.05x of that.
+Acceptance is 67% per token, matching the 68.8% recorded elsewhere in this
+document.
+
+### Two traps in measuring it
+
+**Do not benchmark speculation on a predictable prompt.** Depth 4 measured
+6.42 tok/s against 3.52 on `"The capital of France is"`, which continues
+`"Paris. The capital of France is Paris. The capital of France is..."`. A
+drafter predicts that almost perfectly, so acceptance ran at 4.4 of 5 and the
+apparent speedup was 1.82x — against 1.15x on varied prompts. Any speculative
+benchmark needs prompts whose continuations are not near-deterministic.
+
+**MTP does not improve with generation length.** 2.96 tok/s at both 32 and 128
+generated tokens, acceptance 2.214 and 2.268. Prefill is already amortized by
+32 tokens, so there is nothing further to collect from longer runs.
+
+`generate()` returns `(tokens, elapsed)`, so `len(result)` is 2 regardless —
+easy to mistake for a two-token generation.
