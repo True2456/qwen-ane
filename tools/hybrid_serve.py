@@ -9,8 +9,10 @@ import copy
 import glob
 import json
 import os
+import re
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -172,20 +174,19 @@ class HybridEngine:
         mode: Optional[str] = None,
         use_apc: bool = True,
         emit_token: Optional[Any] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         exec_mode = mode or self.mode
         if isinstance(prompt, list):
-            text = self.tok.apply_chat_template(
-                prompt,
-                add_generation_prompt=True,
-                tokenize=False,
-            )
+            kwargs = {"add_generation_prompt": True, "tokenize": False}
+            if tools:
+                kwargs["tools"] = tools
+            text = self.tok.apply_chat_template(prompt, **kwargs)
         else:
-            text = self.tok.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                add_generation_prompt=True,
-                tokenize=False,
-            )
+            kwargs = {"add_generation_prompt": True, "tokenize": False}
+            if tools:
+                kwargs["tools"] = tools
+            text = self.tok.apply_chat_template([{"role": "user", "content": prompt}], **kwargs)
         prompt_ids = list(self.tok.encode(text))
         c = kvcache.make_prompt_cache(self.model)
         mc = kvcache.KVCache()
@@ -383,24 +384,83 @@ class HybridEngine:
         }
 
 
+def parse_qwen_tool_calls(text: str) -> Tuple[str, List[Dict[str, Any]]]:
+    """Extract any <tool_call>...</tool_call> blocks into OpenAI-compatible tool_calls."""
+    tool_calls = []
+    content = text
+    if "<tool_call>" not in text:
+        return content, tool_calls
+
+    parts = text.split("<tool_call>")
+    content = parts[0].strip()
+    for block in parts[1:]:
+        if "</tool_call>" in block:
+            tc_str = block.split("</tool_call>")[0].strip()
+            call_id = f"call_{uuid.uuid4().hex[:8]}"
+            if tc_str.startswith("{") and tc_str.endswith("}"):
+                try:
+                    data = json.loads(tc_str)
+                    tool_calls.append({
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": data.get("name", ""),
+                            "arguments": json.dumps(data.get("arguments", {})) if isinstance(data.get("arguments"), dict) else str(data.get("arguments", "{}"))
+                        }
+                    })
+                    continue
+                except Exception:
+                    pass
+            fn_name = ""
+            params = {}
+            if "<function=" in tc_str:
+                fn_match = re.search(r"<function=([^>]+)>", tc_str)
+                if fn_match:
+                    fn_name = fn_match.group(1).strip()
+                for p_match in re.finditer(r"<parameter=([^>]+)>(.*?)</parameter>", tc_str, re.DOTALL):
+                    p_name = p_match.group(1).strip()
+                    p_val = p_match.group(2).strip()
+                    try:
+                        p_val = json.loads(p_val)
+                    except Exception:
+                        pass
+                    params[p_name] = p_val
+                if fn_name:
+                    tool_calls.append({
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": fn_name,
+                            "arguments": json.dumps(params)
+                        }
+                    })
+    return content, tool_calls
+
+
 class ReasoningStream:
-    """Route live Qwen text to reasoning/content deltas across </think>."""
+    """Route live Qwen text to reasoning/content/tool_calls deltas across </think> and <tool_call>."""
     marker = "</think>"
 
-    def __init__(self, enabled: bool, reasoning_cb: Any, content_cb: Any):
+    def __init__(self, enabled: bool, reasoning_cb: Any, content_cb: Any, tool_call_cb: Optional[Any] = None):
         self.enabled = enabled
         self.send_reasoning = reasoning_cb
         self.send_content = content_cb
+        self.send_tool_call = tool_call_cb
         self.pending = ""
         self.in_reasoning = enabled
+        self.content_accum = ""
 
     def feed(self, delta: str):
         if not self.enabled:
-            self.send_content(delta)
+            self.content_accum += delta
+            if "<tool_call>" not in self.content_accum:
+                self.send_content(delta)
             return
         self.pending += delta
         if not self.in_reasoning:
-            self.send_content(self.pending)
+            self.content_accum += self.pending
+            if "<tool_call>" not in self.content_accum:
+                self.send_content(self.pending)
             self.pending = ""
             return
         end = self.pending.find(self.marker)
@@ -410,7 +470,9 @@ class ReasoningStream:
             self.pending = self.pending[end + len(self.marker):]
             self.in_reasoning = False
             if self.pending:
-                self.send_content(self.pending)
+                self.content_accum += self.pending
+                if "<tool_call>" not in self.content_accum:
+                    self.send_content(self.pending)
             self.pending = ""
             return
         safe = max(0, len(self.pending) - len(self.marker) + 1)
@@ -419,13 +481,19 @@ class ReasoningStream:
             self.pending = self.pending[safe:]
 
     def finish(self):
-        if not self.pending:
-            return
-        if self.in_reasoning:
-            self.send_reasoning(self.pending)
-        else:
-            self.send_content(self.pending)
-        self.pending = ""
+        if self.pending:
+            if self.in_reasoning:
+                self.send_reasoning(self.pending)
+            else:
+                self.content_accum += self.pending
+            self.pending = ""
+
+        # Parse any tool calls in accumulated content
+        if "<tool_call>" in self.content_accum:
+            clean_content, tool_calls = parse_qwen_tool_calls(self.content_accum)
+            if tool_calls and self.send_tool_call:
+                for tc in tool_calls:
+                    self.send_tool_call(tc)
 
 
 _REASONING_INSTRUCTIONS = {
@@ -528,7 +596,7 @@ def main():
         engine_ready.wait()
         engine = engine_holder[0]
 
-        def dispatch_generation(prompt, max_tokens, mode, use_apc, emit_token=None):
+        def dispatch_generation(prompt, max_tokens, mode, use_apc, emit_token=None, tools=None):
             done = threading.Event()
             holder = {}
             gen_queue.put((
@@ -539,6 +607,7 @@ def main():
                     "mode": mode,
                     "use_apc": use_apc,
                     "emit_token": emit_token,
+                    "tools": tools,
                 },
                 holder,
                 done,
@@ -622,12 +691,13 @@ def main():
                     body = json.loads(self.rfile.read(length).decode("utf-8"))
 
                     messages = body.get("messages", [])
+                    tools = body.get("tools", None)
                     max_tokens = body.get("max_tokens") or body.get("max_completion_tokens") or 512
                     effort = body.get("reasoning_effort", "xhigh")
                     enable_thinking = body.get("enable_thinking", True)
                     stream = bool(body.get("stream", False))
 
-                    print(f"\n  📥 [RINDI HTTP] Incoming Chat Request: {len(messages)} messages, stream={stream}, effort={effort}", flush=True)
+                    print(f"\n  📥 [RINDI HTTP] Incoming Chat Request: {len(messages)} messages, tools={len(tools) if tools else 0}, stream={stream}, effort={effort}", flush=True)
 
                     # Dynamic per-request mode override if provided
                     req_mode = body.get("mode", engine.mode)
@@ -679,7 +749,12 @@ def main():
                         def emit_content(delta):
                             sse_chunk({"content": delta})
 
-                        router = ReasoningStream(enable_thinking, emit_reasoning, emit_content)
+                        has_tool_calls = [False]
+                        def emit_tool_call(tc):
+                            has_tool_calls[0] = True
+                            sse_chunk({"tool_calls": [tc]})
+
+                        router = ReasoningStream(enable_thinking, emit_reasoning, emit_content, emit_tool_call)
                         try:
                             dispatch_generation(
                                 messages,
@@ -687,12 +762,14 @@ def main():
                                 mode=req_mode,
                                 use_apc=True,
                                 emit_token=router.feed,
+                                tools=tools,
                             )
                         except Exception as e:
                             print(f"  [Generation Error] {e}", flush=True)
                         router.finish()
 
-                        sse_chunk({}, finish_reason="stop")
+                        finish_rsn = "tool_calls" if has_tool_calls[0] else "stop"
+                        sse_chunk({}, finish_reason=finish_rsn)
                         try:
                             self.wfile.write(b"data: [DONE]\n\n")
                             self.wfile.flush()
@@ -702,7 +779,7 @@ def main():
                         return
 
                     try:
-                        res = dispatch_generation(messages, max_tokens=max_tokens, mode=req_mode, use_apc=True)
+                        res = dispatch_generation(messages, max_tokens=max_tokens, mode=req_mode, use_apc=True, tools=tools)
                     except Exception as e:
                         self._json_resp({"error": str(e)}, 500)
                         return
@@ -716,6 +793,9 @@ def main():
                         reasoning_content = parts[0].replace("<think>", "").strip()
                         content = parts[1].strip()
 
+                    content, tool_calls = parse_qwen_tool_calls(content)
+                    finish_reason = "tool_calls" if tool_calls else "stop"
+
                     resp = {
                         "id": cid,
                         "object": "chat.completion",
@@ -725,10 +805,11 @@ def main():
                             "index": 0,
                             "message": {
                                 "role": "assistant",
-                                "content": content,
+                                "content": content if (content or not tool_calls) else None,
                                 "reasoning_content": reasoning_content,
+                                "tool_calls": tool_calls if tool_calls else None,
                             },
-                            "finish_reason": "stop"
+                            "finish_reason": finish_reason
                         }],
                         "usage": {
                             "prompt_tokens": res.get("tokens_saved", 0),
