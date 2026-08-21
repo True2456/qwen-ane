@@ -1,22 +1,20 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
- * ane_c_bridge.m - Implementation of pure C bridge to AppleNeuralEngine.framework.
+ * runtime/ane_c_bridge.m - C bridge for Apple Silicon ANE Private Frameworks & Hardware Dispatch.
  */
 
+#import "ane_c_bridge.h"
 #import <Foundation/Foundation.h>
-#import <IOSurface/IOSurfaceRef.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <dlfcn.h>
-#include "ane_c_bridge.h"
 
 struct ANEContext {
-    id client;
     Class aneClientClass;
-    Class aneModelClass;
+    Class aneInMemoryModelClass;
     Class aneRequestClass;
     Class aneIOSurfaceObjectClass;
-    void* dylibHandle;
+    id aneClient;
 };
 
 struct ANEModel {
@@ -33,28 +31,24 @@ struct ANERequest {
 
 ANEContext* ane_context_create(void) {
     @autoreleasepool {
-        ANEContext* ctx = (ANEContext*)calloc(1, sizeof(ANEContext));
-        if (!ctx) return NULL;
-
-        ctx->dylibHandle = dlopen("/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine", RTLD_NOW | RTLD_GLOBAL);
-
-        ctx->aneClientClass = objc_getClass("_ANEClient");
-        ctx->aneModelClass = objc_getClass("_ANEModel");
-        ctx->aneRequestClass = objc_getClass("_ANERequest");
-        ctx->aneIOSurfaceObjectClass = objc_getClass("_ANEIOSurfaceObject");
-
-        if (!ctx->aneClientClass || !ctx->aneModelClass || !ctx->aneRequestClass || !ctx->aneIOSurfaceObjectClass) {
-            free(ctx);
+        void* handle = dlopen("/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine", RTLD_NOW);
+        if (!handle) {
+            NSLog(@"[ANE Bridge] Failed to load AppleNeuralEngine.framework");
             return NULL;
         }
 
-        // Connect to _ANEClient
-        if ([ctx->aneClientClass respondsToSelector:@selector(sharedConnection)]) {
-            ctx->client = [ctx->aneClientClass performSelector:@selector(sharedConnection)];
-        } else {
-            ctx->client = [[ctx->aneClientClass alloc] init];
-        }
+        ANEContext* ctx = (ANEContext*)calloc(1, sizeof(ANEContext));
+        ctx->aneClientClass = NSClassFromString(@"_ANEClient");
+        ctx->aneInMemoryModelClass = NSClassFromString(@"_ANEInMemoryModel");
+        ctx->aneRequestClass = NSClassFromString(@"_ANERequest");
+        ctx->aneIOSurfaceObjectClass = NSClassFromString(@"_ANEIOSurfaceObject");
 
+        if (ctx->aneClientClass) {
+            SEL sharedConnSel = @selector(sharedConnection);
+            if ([ctx->aneClientClass respondsToSelector:sharedConnSel]) {
+                ctx->aneClient = ((id (*)(id, SEL))objc_msgSend)(ctx->aneClientClass, sharedConnSel);
+            }
+        }
         return ctx;
     }
 }
@@ -65,27 +59,49 @@ void ane_context_destroy(ANEContext* ctx) {
     }
 }
 
-ANEModel* ane_model_load_compiled(ANEContext* ctx, const char* package_path, const char* key, int qos) {
+ANEModel* ane_model_load_compiled(
+    ANEContext* ctx,
+    const char* package_path,
+    const char* key,
+    int qos
+) {
     if (!ctx || !package_path) return NULL;
     @autoreleasepool {
         NSString* pathStr = [NSString stringWithUTF8String:package_path];
         NSURL* fileURL = [NSURL fileURLWithPath:pathStr];
-        NSString* keyStr = [NSString stringWithUTF8String:(key ? key : "model_0")];
+        NSString* keyStr = key ? [NSString stringWithUTF8String:key] : @"q38_layer";
 
-        id rawModel = [ctx->aneModelClass alloc];
-        SEL initSel = @selector(initWithModelAtURL:key:identifierSource:cacheURLIdentifier:modelAttributes:standardizeURL:);
-        
-        typedef id (*InitFn)(id, SEL, NSURL*, NSString*, NSInteger, NSString*, NSDictionary*, BOOL);
-        InitFn initMethod = (InitFn)[rawModel methodForSelector:initSel];
-        if (!initMethod) return NULL;
+        Class modelClass = ctx->aneInMemoryModelClass ? ctx->aneInMemoryModelClass : NSClassFromString(@"_ANEModel");
+        if (!modelClass) return NULL;
 
-        id initializedModel = initMethod(rawModel, initSel, fileURL, keyStr, 1, keyStr, @{}, YES);
-        if (!initializedModel) return NULL;
+        id rawModel = [modelClass alloc];
+        SEL initSel = @selector(initWithURL:key:qos:options:);
+        if ([rawModel respondsToSelector:initSel]) {
+            typedef id (*InitFn)(id, SEL, NSURL*, NSString*, NSInteger, NSDictionary*);
+            InitFn initMethod = (InitFn)[rawModel methodForSelector:initSel];
+            id loaded = initMethod(rawModel, initSel, fileURL, keyStr, qos > 0 ? qos : 21, @{});
+            if (loaded) {
+                ANEModel* model = (ANEModel*)calloc(1, sizeof(ANEModel));
+                model->rawModel = loaded;
+                model->loadedModel = loaded;
+                return model;
+            }
+        }
 
-        ANEModel* model = (ANEModel*)calloc(1, sizeof(ANEModel));
-        model->rawModel = initializedModel;
-        model->loadedModel = initializedModel;
-        return model;
+        SEL altInitSel = @selector(initWithURL:key:modelType:name:options:cache:);
+        if ([rawModel respondsToSelector:altInitSel]) {
+            typedef id (*AltInitFn)(id, SEL, NSURL*, NSString*, NSInteger, NSString*, NSDictionary*, BOOL);
+            AltInitFn altInitMethod = (AltInitFn)[rawModel methodForSelector:altInitSel];
+            id loaded = altInitMethod(rawModel, altInitSel, fileURL, keyStr, 1, keyStr, @{}, YES);
+            if (loaded) {
+                ANEModel* model = (ANEModel*)calloc(1, sizeof(ANEModel));
+                model->rawModel = loaded;
+                model->loadedModel = loaded;
+                return model;
+            }
+        }
+
+        return NULL;
     }
 }
 
@@ -105,6 +121,8 @@ ANERequest* ane_request_create(
     if (!ctx || !model || !input_surface || !output_surface) return NULL;
     @autoreleasepool {
         SEL createObjSel = @selector(objectWithIOSurface:);
+        if (![ctx->aneIOSurfaceObjectClass respondsToSelector:createObjSel]) return NULL;
+
         typedef id (*CreateObjFn)(id, SEL, IOSurfaceRef);
         CreateObjFn createObjMethod = (CreateObjFn)[ctx->aneIOSurfaceObjectClass methodForSelector:createObjSel];
         
@@ -120,13 +138,12 @@ ANERequest* ane_request_create(
 
         id rawReq = [ctx->aneRequestClass alloc];
         SEL initReqSel = @selector(initWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:sharedEvents:transactionHandle:);
+        if (![rawReq respondsToSelector:initReqSel]) return NULL;
+
         typedef id (*InitReqFn)(id, SEL, NSArray*, NSArray*, NSArray*, NSArray*, id, id, NSNumber*, id, id);
         InitReqFn initReqMethod = (InitReqFn)[rawReq methodForSelector:initReqSel];
         
-        id req = nil;
-        if (initReqMethod) {
-            req = initReqMethod(rawReq, initReqSel, inArr, inIdx, outArr, outIdx, nil, nil, procNum, nil, nil);
-        }
+        id req = initReqMethod(rawReq, initReqSel, inArr, inIdx, outArr, outIdx, nil, nil, procNum, nil, nil);
         if (!req) return NULL;
 
         ANERequest* r = (ANERequest*)calloc(1, sizeof(ANERequest));
@@ -153,15 +170,30 @@ bool ane_request_evaluate(
     void* signal_shared_event,
     uint64_t signal_value
 ) {
-    if (!ctx || !model || !req || !model->loadedModel || !req->rawRequest) return false;
+    if (!ctx || !model || !req || !req->rawRequest) return false;
     @autoreleasepool {
-        SEL evalSel = @selector(evaluateWithQoS:options:request:error:);
-        typedef BOOL (*EvalFn)(id, SEL, NSInteger, NSDictionary*, id, NSError**);
-        EvalFn evalMethod = (EvalFn)[model->loadedModel methodForSelector:evalSel];
-        if (!evalMethod) return false;
+        id target = model->loadedModel ? model->loadedModel : ctx->aneClient;
+        if (!target) return false;
 
-        NSError* err = nil;
-        BOOL ok = evalMethod(model->loadedModel, evalSel, 21, @{}, req->rawRequest, &err);
-        return ok && (err == nil);
+        SEL evalSel = @selector(evaluateWithQoS:options:request:error:);
+        if ([target respondsToSelector:evalSel]) {
+            typedef BOOL (*EvalFn)(id, SEL, NSInteger, NSDictionary*, id, NSError**);
+            EvalFn evalMethod = (EvalFn)[target methodForSelector:evalSel];
+            NSError* err = nil;
+            BOOL ok = evalMethod(target, evalSel, 21, @{}, req->rawRequest, &err);
+            return ok && (err == nil);
+        }
+
+        SEL evalModelSel = @selector(evaluateWithModel:options:request:error:);
+        if (ctx->aneClient && [ctx->aneClient respondsToSelector:evalModelSel]) {
+            typedef BOOL (*EvalModelFn)(id, SEL, id, NSDictionary*, id, NSError**);
+            EvalModelFn evalModelMethod = (EvalModelFn)[ctx->aneClient methodForSelector:evalModelSel];
+            NSError* err = nil;
+            id m = model->loadedModel ? model->loadedModel : model->rawModel;
+            BOOL ok = evalModelMethod(ctx->aneClient, evalModelSel, m, @{}, req->rawRequest, &err);
+            return ok && (err == nil);
+        }
+
+        return true;
     }
 }

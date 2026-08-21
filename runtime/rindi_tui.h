@@ -74,13 +74,13 @@ struct HardwareMetrics {
     uint64_t process_virt_bytes{0};
     uint64_t system_total_ram_bytes{0};
     uint64_t system_used_ram_bytes{0};
-    uint64_t model_blobs_bytes{13087227904ULL}; // ~12.19 GB
-    uint64_t host_ram_freed_bytes{44023414784ULL}; // ~41.0 GB
+    uint64_t model_blobs_bytes{0};
+    uint64_t host_ram_freed_bytes{0};
 
-    double soc_power_w{5.9};
-    double ane_power_w{4.8};
-    double gpu_power_w{0.3};
-    double cpu_power_w{0.8};
+    double soc_power_w{1.40};
+    double ane_power_w{0.10};
+    double gpu_power_w{0.15};
+    double cpu_power_w{1.15};
 };
 
 struct ServerConfig {
@@ -124,7 +124,7 @@ public:
     void start_renderer(int refresh_rate_hz = 4);
     void stop_renderer();
 
-    // Interactive command loop
+    // Interactive command loop (with full raw-mode line editor and history)
     void run_interactive_loop(CommandHandler cmd_handler = nullptr, ChatDispatchFn chat_fn = nullptr);
 
     // Hardware polling
@@ -145,17 +145,23 @@ private:
     HardwareMetrics hardware_;
 
     std::deque<std::string> log_buffer_;
-    std::deque<std::pair<std::string, std::string>> chat_history_; // {user_prompt, assistant_resp}
     size_t max_logs_{200};
     std::mutex log_mutex_;
     std::mutex render_mutex_;
 
     std::atomic<bool> running_{true};
     std::atomic<bool> in_chat_stream_{false};
-    std::string current_chat_stream_chunk_;
     std::thread renderer_thread_;
 
+    std::atomic<uint64_t> total_eval_ns_{0};
+    uint64_t last_eval_ns_checkpoint_{0};
+    std::chrono::steady_clock::time_point last_power_sample_time_{std::chrono::steady_clock::now()};
+
+    // Live terminal input state
     std::string current_input_line_;
+    size_t cursor_pos_{0};
+    std::vector<std::string> command_history_;
+    int history_index_{-1};
     std::mutex input_mutex_;
 
     std::string format_bytes(uint64_t bytes) const;

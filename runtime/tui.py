@@ -10,7 +10,7 @@ import time
 from collections import deque
 from typing import Any, Callable, Deque, Dict, List, Optional
 
-# ANSI Color and Formatting Constants
+# ANSI Color and Formatting Constants (Zero Emojis)
 C_RESET = "\033[0m"
 C_BOLD = "\033[1m"
 C_DIM = "\033[2m"
@@ -21,6 +21,10 @@ C_BLUE = "\033[34m"
 C_MAGENTA = "\033[35m"
 C_CYAN = "\033[36m"
 C_WHITE = "\033[37m"
+C_BRIGHT_GREEN = "\033[92m"
+C_BRIGHT_YELLOW = "\033[93m"
+C_BRIGHT_CYAN = "\033[96m"
+C_BRIGHT_WHITE = "\033[97m"
 
 
 class RindiTUI:
@@ -41,19 +45,21 @@ class RindiTUI:
         self.test_dispatch_fn: Optional[Callable] = None
 
     def log(self, message: str, tag: str = "INFO"):
-        """Log a formatted message with timestamp."""
+        """Log a formatted message with timestamp and bracketed tag."""
         ts = time.strftime("%H:%M:%S")
         tag_color = {
             "INFO": f"{C_CYAN}[INFO]{C_RESET}",
             "HTTP": f"{C_BLUE}[HTTP]{C_RESET}",
-            "APC": f"{C_GREEN}[APC]{C_RESET}",
+            "APC": f"{C_BRIGHT_GREEN}[APC]{C_RESET}",
+            "ANE": f"{C_GREEN}[ANE]{C_RESET}",
+            "GPU": f"{C_YELLOW}[GPU]{C_RESET}",
             "TOOL": f"{C_MAGENTA}[TOOL]{C_RESET}",
-            "TURBO": f"{C_YELLOW}[TURBO]{C_RESET}",
-            "SILENT": f"{C_GREEN}[SILENT]{C_RESET}",
+            "TURBO": f"{C_BRIGHT_YELLOW}[TURBO]{C_RESET}",
+            "SILENT": f"{C_BRIGHT_CYAN}[SILENT]{C_RESET}",
             "ERROR": f"{C_RED}[ERROR]{C_RESET}",
         }.get(tag, f"[{tag}]")
 
-        formatted = f"{C_DIM}{ts}{C_RESET} {tag_color} {message}"
+        formatted = f"{C_DIM}[{ts}]{C_RESET} {tag_color} {message}"
         with self.lock:
             self.logs.append(formatted)
         print(formatted, flush=True)
@@ -67,29 +73,29 @@ class RindiTUI:
             self.last_tokens_saved = tokens_saved
 
     def render_dashboard(self) -> str:
-        """Render the full ANSI dashboard."""
+        """Render the full ANSI dashboard without emojis."""
         st = self.engine.apc.stats()
         mode_str = (
-            f"{C_BOLD}{C_YELLOW}⚡ TURBO (MTP+ANE){C_RESET}"
+            f"{C_BOLD}{C_BRIGHT_YELLOW}[TURBO] Metal GPU MTP + ANE{C_RESET}"
             if self.engine.mode == "turbo"
-            else f"{C_BOLD}{C_GREEN}🌿 SILENT (Pure ANE @ ~5.9W){C_RESET}"
+            else f"{C_BOLD}{C_BRIGHT_GREEN}[SILENT] Pure ANE @ ~5.9W{C_RESET}"
         )
 
         apc_color = C_GREEN if st["hit_rate_pct"] > 50 else (C_YELLOW if st["hit_rate_pct"] > 0 else C_DIM)
 
         lines = [
-            f"{C_BOLD}{C_CYAN}╔══════════════════════════════════════════════════════════════════════════════════════════════╗{C_RESET}",
-            f"{C_BOLD}{C_CYAN}║{C_RESET}  {C_BOLD}RINDI HYBRID INFERENCE ENGINE{C_RESET} │ Apple M5 Max (Metal + 64 ANE Resident Layers)           {C_BOLD}{C_CYAN}║{C_RESET}",
-            f"{C_BOLD}{C_CYAN}╠══════════════════════════════════════════════════════════════════════════════════════════════╣{C_RESET}",
-            f"{C_BOLD}{C_CYAN}║{C_RESET}  Endpoint: {C_BOLD}http://{self.host}:{self.port}/v1{C_RESET}  │ Model: {C_BOLD}Qwen3.8-27B{C_RESET}  │ Mode: {mode_str:<32} {C_BOLD}{C_CYAN}║{C_RESET}",
-            f"{C_BOLD}{C_CYAN}║{C_RESET}  Power: {C_GREEN}~5.9 W SoC{C_RESET}  │ Memory: {C_MAGENTA}12.19 GB ANE blobs{C_RESET} (41.0 GB Host RAM freed)            {C_BOLD}{C_CYAN}║{C_RESET}",
-            f"{C_BOLD}{C_CYAN}╠══════════════════════════════════════════════════════════════════════════════════════════════╣{C_RESET}",
-            f"{C_BOLD}{C_CYAN}║{C_RESET}  {C_BOLD}PERFORMANCE & METRICS{C_RESET}                                                                {C_BOLD}{C_CYAN}║{C_RESET}",
-            f"{C_BOLD}{C_CYAN}║{C_RESET}  • TTFT: {C_BOLD}{self.last_ttft_ms:.2f} ms{C_RESET} {'(APC Hit: 0 FLOPs)' if self.last_apc_hit else '(Prefill)'} │ Decode Speed: {C_BOLD}{self.last_decode_tps:.1f} tok/s{C_RESET}                {C_BOLD}{C_CYAN}║{C_RESET}",
-            f"{C_BOLD}{C_CYAN}║{C_RESET}  • APC Prefix Cache: {apc_color}{st['hit_rate_pct']:.1f}% hit rate{C_RESET} ({st['hits']}/{st['total_requests']} reqs) │ Saved: {C_GREEN}{st['tokens_saved']:,} tokens{C_RESET} ({st['total_tokens_stored']:,} cached)  {C_BOLD}{C_CYAN}║{C_RESET}",
-            f"{C_BOLD}{C_CYAN}╠══════════════════════════════════════════════════════════════════════════════════════════════╣{C_RESET}",
-            f"{C_BOLD}{C_CYAN}║{C_RESET}  {C_DIM}Commands: [t]urbo │ [s]ilent │ [c]lear-cache │ [stats] │ /chat <msg> │ [q]uit{C_RESET}             {C_BOLD}{C_CYAN}║{C_RESET}",
-            f"{C_BOLD}{C_CYAN}╚══════════════════════════════════════════════════════════════════════════════════════════════╝{C_RESET}",
+            f"{C_BOLD}{C_CYAN}┌──────────────────────────────────────────────────────────────────────────────────────────────┐{C_RESET}",
+            f"{C_BOLD}{C_CYAN}│{C_RESET}  {C_BOLD}{C_BRIGHT_WHITE}RINDI HYBRID INFERENCE ENGINE{C_RESET} │ Apple M5 Max (Metal + 64 ANE Layers)      {C_BOLD}{C_GREEN}[ONLINE]{C_RESET}  {C_BOLD}{C_CYAN}│{C_RESET}",
+            f"{C_BOLD}{C_CYAN}├──────────────────────────────────────────────────────────────────────────────────────────────┤{C_RESET}",
+            f"{C_BOLD}{C_CYAN}│{C_RESET}  Endpoint: {C_BOLD}http://{self.host}:{self.port}/v1{C_RESET}  │ Model: {C_BOLD}Qwen3.8-27B{C_RESET}  │ Mode: {mode_str:<32} {C_BOLD}{C_CYAN}│{C_RESET}",
+            f"{C_BOLD}{C_CYAN}│{C_RESET}  Power: {C_GREEN}~5.90 W SoC{C_RESET}  │ Memory: {C_MAGENTA}12.19 GB ANE blobs{C_RESET} (41.0 GB Host RAM freed)           {C_BOLD}{C_CYAN}│{C_RESET}",
+            f"{C_BOLD}{C_CYAN}├──────────────────────────────────────────────────────────────────────────────────────────────┤{C_RESET}",
+            f"{C_BOLD}{C_CYAN}│{C_RESET}  {C_BOLD}PERFORMANCE & METRICS{C_RESET}                                                                {C_BOLD}{C_CYAN}│{C_RESET}",
+            f"{C_BOLD}{C_CYAN}│{C_RESET}  • TTFT: {C_BOLD}{self.last_ttft_ms:.2f} ms{C_RESET} {'(APC Hit: 0 FLOPs)' if self.last_apc_hit else '(Prefill)'} │ Decode Speed: {C_BOLD}{self.last_decode_tps:.1f} tok/s{C_RESET}                {C_BOLD}{C_CYAN}│{C_RESET}",
+            f"{C_BOLD}{C_CYAN}│{C_RESET}  • APC Prefix Cache: {apc_color}{st['hit_rate_pct']:.1f}% hit rate{C_RESET} ({st['hits']}/{st['total_requests']} reqs) │ Saved: {C_GREEN}{st['tokens_saved']:,} tokens{C_RESET} ({st['total_tokens_stored']:,} cached)  {C_BOLD}{C_CYAN}│{C_RESET}",
+            f"{C_BOLD}{C_CYAN}├──────────────────────────────────────────────────────────────────────────────────────────────┤{C_RESET}",
+            f"{C_BOLD}{C_CYAN}│{C_RESET}  {C_DIM}Commands: [t]urbo │ [s]ilent │ [c]lear-cache │ [stats] │ /chat <msg> │ [q]uit{C_RESET}             {C_BOLD}{C_CYAN}│{C_RESET}",
+            f"{C_BOLD}{C_CYAN}└──────────────────────────────────────────────────────────────────────────────────────────────┘{C_RESET}",
         ]
         return "\n".join(lines)
 

@@ -10,5 +10,5 @@ while [ -h "$SOURCE" ]; do
 done
 ROOT_DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 
-# Launch Pure Native C++ Binary (Zero Python, Zero MLX)
-exec "$ROOT_DIR/runtime/rindi-server" "$@"
+# Launch Unified Rindi ANE + Metal GPU Hybrid Inference Server
+exec python3 "$ROOT_DIR/tools/hybrid_serve.py" "$@"
