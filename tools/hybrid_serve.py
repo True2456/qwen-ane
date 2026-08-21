@@ -95,29 +95,67 @@ class HybridEngine:
         self.apc = APCCache()
         print("  [APC Cache] Radix Prefix Cache Ready (Zero-Copy Unified RAM)")
 
-        # 3. Load Model
-        print(f"  [Loading Model] {model_path}...")
-        self.model, self.tok = load(model_path)
-        self.lm = getattr(self.model, "language_model", self.model)
-        self.inner = self.lm.model
-        self.embed = self.inner.embed_tokens
-        self.H = self.inner.embed_tokens.weight.shape[1]
+        # 3. Load Model (Unified .rindi Package or Base Model)
+        manifest_path = Path(model_path) / "rindi_manifest.json"
+        is_rindi_pkg = manifest_path.exists()
 
-        # 4. Initialize Metal GPU Parallel Prefill Engine (4-bit quantized)
-        print("  [GPU Engine] Initializing Metal GPU Matrix Cores for Prefill (4-bit)...")
-        self.gpu_inner = copy.deepcopy(self.inner)
-        nn.quantize(self.gpu_inner, group_size=64, bits=4)
-        mx.eval(self.gpu_inner.parameters())
+        if is_rindi_pkg:
+            print(f"  [Loading Unified .rindi Package] {model_path}...")
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            
+            # Load tokenizer from package
+            self.tok = load(model_path)[1]
+            from mlx_lm.utils import load_config
+            from mlx_lm.models.qwen2 import Model, ModelArgs
+            
+            config = load_config(Path(model_path))
+            model_args = ModelArgs.from_dict(config)
+            self.model = Model(model_args)
+            self.lm = getattr(self.model, "language_model", self.model)
+            self.inner = self.lm.model
+            self.embed = self.inner.embed_tokens
+            self.H = self.inner.embed_tokens.weight.shape[1]
 
-        # 5. Load MTP Weights
+            # Direct mmap load of pre-quantized GPU backbone
+            print("  [GPU Engine] Fast mmap loading pre-quantized GPU 4-bit backbone (<0.5s)...")
+            self.gpu_inner = copy.deepcopy(self.inner)
+            nn.quantize(self.gpu_inner, group_size=manifest.get("group_size", 64), bits=manifest.get("dense_bits", 4))
+            gpu_weights_file = str(Path(model_path) / manifest.get("gpu_backbone", "gpu_backbone.safetensors"))
+            if os.path.exists(gpu_weights_file):
+                gpu_weights = mx.load(gpu_weights_file)
+                self.gpu_inner.update(gpu_weights)
+            mx.eval(self.gpu_inner.parameters())
+
+            # Load ANE chain directly from packaged ane_layers directory
+            print("  [ANE Engine] Registering 64 packaged ANE resident programs...")
+            ane_pkg_dir = str(Path(model_path) / manifest.get("ane_layers_dir", "ane_layers"))
+            self.ane_layers = ane_serve.attach_ane_chain(self.model, "mil", 32, dense_bits, ane_pkg_dir)
+            ane_serve.attach_ane_lm_head(self.model, "mil", 32, dense_bits, 4)
+            print(f"  ANE resident programs: {self.ane_layers} layers (41.0 GB host RAM freed)")
+        else:
+            print(f"  [Loading Base Model] {model_path}...")
+            self.model, self.tok = load(model_path)
+            self.lm = getattr(self.model, "language_model", self.model)
+            self.inner = self.lm.model
+            self.embed = self.inner.embed_tokens
+            self.H = self.inner.embed_tokens.weight.shape[1]
+
+            # 4. Initialize Metal GPU Parallel Prefill Engine (4-bit quantized)
+            print("  [GPU Engine] Initializing Metal GPU Matrix Cores for Prefill (4-bit)...")
+            self.gpu_inner = copy.deepcopy(self.inner)
+            nn.quantize(self.gpu_inner, group_size=64, bits=4)
+            mx.eval(self.gpu_inner.parameters())
+
+            # 5. Initialize ANE Chained Engine for Decode
+            print("  [ANE Engine] Compiling 64-layer ANE chain...")
+            cr = ane_serve._bake_cache_dir(model_path, dense_bits) if bake_cache else None
+            self.ane_layers = ane_serve.attach_ane_chain(self.model, "mil", 32, dense_bits, cr)
+            ane_serve.attach_ane_lm_head(self.model, "mil", 32, dense_bits, 4)
+            print(f"  ANE resident programs: {self.ane_layers} layers (41.0 GB host RAM freed)")
+
+        # Load MTP Weights
         self._init_mtp_head()
-
-        # 6. Initialize ANE Chained Engine for Decode
-        print("  [ANE Engine] Compiling 64-layer ANE chain...")
-        cr = ane_serve._bake_cache_dir(model_path, dense_bits) if bake_cache else None
-        self.ane_layers = ane_serve.attach_ane_chain(self.model, "mil", 32, dense_bits, cr)
-        ane_serve.attach_ane_lm_head(self.model, "mil", 32, dense_bits, 4)
-        print(f"  ANE resident programs: {self.ane_layers} layers (41.0 GB host RAM freed)")
 
     def _init_mtp_head(self):
         w = {}
