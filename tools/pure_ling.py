@@ -667,18 +667,29 @@ class AneExpertBank:
         self.nbytes = sum(b.nbytes for b in self.banks)
 
     def gate_up_batch(self, layer, X, groups=None):
-        """gate|up for a whole chunk of positions: one dispatch per live group."""
+        """gate|up for a chunk of positions: one dispatch per live group.
+
+        Returns the raw per-group outputs, [2*per*M, T] each, rather than a
+        [T, experts, 2, M] tensor. Materializing that cost 33 MB per layer per
+        chunk and measured 0.46 s of prefill, for an array in which only 8 of
+        128 experts per position are ever read.
+        """
         s = self.spec
         idx = s.moe_layers.index(layer)
-        per = s.experts // self.chunks
-        M, T = s.moe_intermediate, X.shape[0]
-        out = np.zeros((T, s.experts, 2, M), np.float32)
         xh = X.T.astype(np.float16)
-        for c in (range(self.chunks) if groups is None else sorted(groups)):
-            r = _cols(self.banks[c].run(idx, xh)).astype(np.float32)  # [2*per*M, T]
-            out[:, c*per:(c+1)*per, 0] = r[:per*M].reshape(per, M, T).transpose(2, 0, 1)
-            out[:, c*per:(c+1)*per, 1] = r[per*M:].reshape(per, M, T).transpose(2, 0, 1)
-        return out
+        return {c: _cols(self.banks[c].run(idx, xh))
+                for c in (range(self.chunks) if groups is None else sorted(groups))}
+
+    def slice_expert(self, raw, expert, ts):
+        """gate and up rows for one expert at the given positions."""
+        s = self.spec
+        per, M = s.experts // self.chunks, s.moe_intermediate
+        c, j = int(expert) // per, int(expert) % per
+        r = raw[c]
+        g = r[j * M:(j + 1) * M][:, ts].astype(np.float32)
+        u = r[per * M + j * M: per * M + (j + 1) * M][:, ts].astype(np.float32)
+        return g.T, u.T
+
 
     def gate_up(self, layer, x, groups=None):
         """gate|up for the routed experts only.
@@ -1133,7 +1144,7 @@ class LingPrefill(LingRuntime):
         per = s.experts // self.experts.chunks
         routes = [self.route(X[t], layer) for t in range(T)]
         groups = {int(e) // per for idx, _ in routes for e in idx}
-        gu = self.experts.gate_up_batch(layer, X, groups)     # [T, E, 2, M]
+        raw = self.experts.gate_up_batch(layer, X, groups)
         out = np.zeros_like(X)
         # expert-major: one dispatch per (expert, chunk of its positions)
         assign: dict[int, list[int]] = {}
@@ -1144,8 +1155,8 @@ class LingPrefill(LingRuntime):
                 weights.setdefault(int(e), []).append(float(wt))
         M = s.moe_intermediate
         for e, ts in assign.items():
-            h = (_silu(gu[ts, e, 0]) * gu[ts, e, 1]
-                 * np.array(weights[e], np.float32)[:, None])
+            g, u = self.experts.slice_expert(raw, e, ts)
+            h = (_silu(g) * u) * np.array(weights[e], np.float32)[:, None]
             r = _cols(self.down.run(layer, e, h.T)).astype(np.float32).T
             out[ts] += r.reshape(len(ts), -1)
         si = s.moe_layers.index(layer)
