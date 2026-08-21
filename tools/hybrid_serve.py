@@ -354,9 +354,10 @@ def main():
     p.add_argument("--dense-bits", type=int, default=4)
     p.add_argument("--bake-cache", action="store_true", default=True)
     p.add_argument("--bench", action="store_true", help="Run comprehensive multi-turn benchmark")
-    p.add_argument("--server", action="store_true", help="Start OpenAI-compatible HTTP server")
+    p.add_argument("--server", action="store_true", default=True, help="Start OpenAI-compatible HTTP server")
     p.add_argument("--host", default="0.0.0.0", help="HTTP server bind host")
-    p.add_argument("--port", type=int, default=8000, help="HTTP server port")
+    p.add_argument("--port", type=int, default=2456, help="HTTP server port (default: 2456)")
+    p.add_argument("--context", type=int, default=262144, help="Maximum context window (default: 262144)")
     a = p.parse_args()
 
     engine = HybridEngine(
@@ -367,8 +368,35 @@ def main():
         draft_depth=a.draft,
     )
 
-    if a.server:
+    if a.bench:
+        print("\n" + "=" * 65)
+        print("  RUNNING MULTI-TURN HYBRID BENCHMARK (APC CACHE + TURBO/SILENT)")
+        print("=" * 65)
+
+        # Turn 1: Cold Cache (Prefill + Speculative Decode)
+        print("\n--- Turn 1: Cold Context (Initial Prompt) ---")
+        res1 = engine.generate(a.prompt, max_tokens=a.tokens, mode=a.mode, use_apc=True)
+        print(f"  TTFT: {res1['ttft_ms']:.1f} ms | Decode Speed: {res1['decode_tps']:.2f} tok/s | Steps: {res1['steps']} ({res1['accepted_per_step']:.2f} tok/step)")
+
+        # Turn 2: Exact Prefix Match (APC Cache Hit -> 0 ms prefill)
+        print("\n--- Turn 2: Cached Prefix (APC Cache Hit Verification) ---")
+        res2 = engine.generate(a.prompt, max_tokens=a.tokens, mode=a.mode, use_apc=True)
+        print(f"  TTFT: {res2['ttft_ms']:.2f} ms (APC HIT!) | Decode Speed: {res2['decode_tps']:.2f} tok/s | Steps: {res2['steps']}")
+
+        print("\n" + "=" * 65)
+        print("  BENCHMARK RESULTS SUMMARY")
+        print("=" * 65)
+        print(f"  Mode:                {engine.mode.upper()}")
+        print(f"  Cold Prefill TTFT:   {res1['ttft_ms']:.1f} ms")
+        print(f"  APC Cached TTFT:     {res2['ttft_ms']:.2f} ms ({res1['ttft_ms']/max(res2['ttft_ms'], 1e-2):.1f}x TTFT speedup!)")
+        print(f"  Decode Throughput:   {res2['decode_tps']:.2f} tok/s")
+        print(f"  Accepted Tokens/Step:{res2['accepted_per_step']:.2f}")
+        print(f"  APC Cache Stats:     {engine.apc.stats()}")
+        print("=" * 65)
+
+    elif a.server:
         from http.server import HTTPServer, BaseHTTPRequestHandler
+        import threading
         import uuid
 
         class OpenAIServer(BaseHTTPRequestHandler):
@@ -393,24 +421,59 @@ def main():
 
             def do_GET(self):
                 if self.path in ("/", "/health", "/healthz"):
-                    self._json_resp({"status": "ok", "ready": True, "mode": engine.mode})
+                    self._json_resp({
+                        "status": "ok",
+                        "ready": True,
+                        "mode": engine.mode,
+                        "apc_stats": engine.apc.stats(),
+                        "model": "Qwen3.8-27B"
+                    })
                 elif self.path == "/v1/models":
                     self._json_resp({
                         "object": "list",
-                        "data": [{"id": "Qwen3.8-27B", "object": "model", "owned_by": "ane-hybrid"}]
+                        "data": [
+                            {
+                                "id": "Qwen3.8-27B",
+                                "object": "model",
+                                "owned_by": "rindi-hybrid",
+                                "context_length": a.context,
+                                "mode": engine.mode
+                            },
+                            {
+                                "id": "rindi/Qwen3.8-27B",
+                                "object": "model",
+                                "owned_by": "rindi-hybrid",
+                                "context_length": a.context,
+                                "mode": engine.mode
+                            }
+                        ]
                     })
                 else:
                     self._json_resp({"error": "Not Found"}, 404)
 
             def do_POST(self):
-                if self.path == "/v1/chat/completions":
+                if self.path == "/v1/mode":
+                    length = int(self.headers.get("Content-Length", 0))
+                    body = json.loads(self.rfile.read(length).decode("utf-8"))
+                    new_mode = body.get("mode", "").lower()
+                    if new_mode in ("turbo", "silent"):
+                        engine.mode = new_mode
+                        print(f"\n  ⚡ [RINDI HTTP] Mode switched to {engine.mode.upper()}")
+                        self._json_resp({"status": "ok", "mode": engine.mode})
+                    else:
+                        self._json_resp({"error": "Mode must be 'turbo' or 'silent'"}, 400)
+
+                elif self.path == "/v1/chat/completions":
                     length = int(self.headers.get("Content-Length", 0))
                     body = json.loads(self.rfile.read(length).decode("utf-8"))
 
                     messages = body.get("messages", [])
                     max_tokens = body.get("max_tokens", 512)
-                    effort = body.get("reasoning_effort", "medium")
+                    effort = body.get("reasoning_effort", "xhigh")
                     enable_thinking = body.get("enable_thinking", True)
+
+                    # Dynamic per-request mode override if provided
+                    req_mode = body.get("mode", engine.mode)
 
                     # Inject thinking instruction if applicable
                     if enable_thinking and effort in _REASONING_INSTRUCTIONS and _REASONING_INSTRUCTIONS[effort]:
@@ -420,7 +483,7 @@ def main():
                         else:
                             messages.insert(0, {"role": "system", "content": instr})
 
-                    res = engine.generate(messages, max_tokens=max_tokens, use_apc=True)
+                    res = engine.generate(messages, max_tokens=max_tokens, mode=req_mode, use_apc=True)
                     text = res["generated_text"]
 
                     # Split reasoning thoughts
@@ -450,7 +513,8 @@ def main():
                             "completion_tokens": res["generated_tokens"],
                             "total_tokens": res.get("tokens_saved", 0) + res["generated_tokens"]
                         },
-                        "hybrid_stats": {
+                        "rindi_stats": {
+                            "mode": req_mode,
                             "ttft_ms": res["ttft_ms"],
                             "decode_tps": res["decode_tps"],
                             "accepted_per_step": res["accepted_per_step"],
@@ -462,45 +526,55 @@ def main():
                     self._json_resp({"error": "Not Found"}, 404)
 
         server = HTTPServer((a.host, a.port), OpenAIServer)
+
+        def cli_listener():
+            """Interactive terminal command loop for live mode switching."""
+            while True:
+                try:
+                    line = sys.stdin.readline()
+                    if not line:
+                        break
+                    cmd = line.strip().lower()
+                    if cmd in ("t", "turbo"):
+                        engine.mode = "turbo"
+                        print(f"\n  ⚡ [RINDI CLI] Switched to TURBO MODE (Metal GPU Drafter + ANE Verifier)\n", flush=True)
+                    elif cmd in ("s", "silent"):
+                        engine.mode = "silent"
+                        print(f"\n  🌿 [RINDI CLI] Switched to SILENT MODE (Pure ANE @ ~5.9W)\n", flush=True)
+                    elif cmd in ("stats", "status"):
+                        st = engine.apc.stats()
+                        print(f"\n  📊 [RINDI STATUS]")
+                        print(f"     Active Mode:    {engine.mode.upper()}")
+                        print(f"     APC Hit Rate:   {st['hit_rate_pct']:.1f}% ({st['hits']}/{st['total_requests']})")
+                        print(f"     Tokens Saved:   {st['tokens_saved']}")
+                        print(f"     Tokens Cached:  {st['total_tokens_stored']}\n", flush=True)
+                    elif cmd in ("c", "clear"):
+                        engine.apc.root.children.clear()
+                        engine.apc.total_tokens_stored = 0
+                        print(f"\n  🧹 [RINDI CLI] APC Prefix Cache cleared.\n", flush=True)
+                    elif cmd in ("h", "help", "?"):
+                        print(f"\n  [RINDI Interactive Commands]")
+                        print(f"     t / turbo   - Switch to Turbo Mode (High Throughput GPU+ANE)")
+                        print(f"     s / silent  - Switch to Silent Mode (Ultra-low 5.9W on ANE)")
+                        print(f"     stats       - Show live APC and throughput statistics")
+                        print(f"     clear       - Flush the prefix cache")
+                        print(f"     help        - Show this help message")
+                        print(f"     q / quit    - Exit server\n", flush=True)
+                    elif cmd in ("q", "quit", "exit"):
+                        print("\n  [RINDI] Shutting down server...", flush=True)
+                        os._exit(0)
+                except Exception:
+                    break
+
+        t = threading.Thread(target=cli_listener, daemon=True)
+        t.start()
+
         print(f"\n" + "=" * 65)
-        print(f"  HYBRID OPENAI HTTP SERVER LISTENING ON http://{a.host}:{a.port}/v1")
-        print(f"  Mode: {a.mode.upper()} | Model: Qwen3.8-27B | APC: Active")
-        print(f"  Supported Thinking Levels: none, low, medium, high, xhigh")
+        print(f"  RINDI HYBRID SERVER ACTIVE ON http://{a.host}:{a.port}/v1")
+        print(f"  Mode: {engine.mode.upper()} | Model: Qwen3.8-27B | Context: {a.context:,}")
+        print(f"  Interactive CLI Controls: [t]urbo | [s]ilent | [stats] | [help] | [q]uit")
         print(f"=" * 65 + "\n")
         server.serve_forever()
-
-    elif a.bench:
-        print("\n" + "=" * 65)
-        print("  RUNNING MULTI-TURN HYBRID BENCHMARK (APC CACHE + TURBO/SILENT)")
-        print("=" * 65)
-
-        # Turn 1: Cold Cache (Prefill + Speculative Decode)
-        print("\n--- Turn 1: Cold Context (Initial Prompt) ---")
-        res1 = engine.generate(a.prompt, max_tokens=a.tokens, mode=a.mode, use_apc=True)
-        print(f"  TTFT: {res1['ttft_ms']:.1f} ms | Decode Speed: {res1['decode_tps']:.2f} tok/s | Steps: {res1['steps']} ({res1['accepted_per_step']:.2f} tok/step)")
-
-        # Turn 2: Exact Prefix Match (APC Cache Hit -> 0 ms prefill)
-        print("\n--- Turn 2: Cached Prefix (APC Cache Hit Verification) ---")
-        res2 = engine.generate(a.prompt, max_tokens=a.tokens, mode=a.mode, use_apc=True)
-        print(f"  TTFT: {res2['ttft_ms']:.2f} ms (APC HIT!) | Decode Speed: {res2['decode_tps']:.2f} tok/s | Steps: {res2['steps']}")
-
-        print("\n" + "=" * 65)
-        print("  BENCHMARK RESULTS SUMMARY")
-        print("=" * 65)
-        print(f"  Mode:                {a.mode.upper()}")
-        print(f"  Cold Prefill TTFT:   {res1['ttft_ms']:.1f} ms")
-        print(f"  APC Cached TTFT:     {res2['ttft_ms']:.2f} ms ({res1['ttft_ms']/max(res2['ttft_ms'], 1e-2):.1f}x TTFT speedup!)")
-        print(f"  Decode Throughput:   {res2['decode_tps']:.2f} tok/s")
-        print(f"  Accepted Tokens/Step:{res2['accepted_per_step']:.2f}")
-        print(f"  APC Cache Stats:     {engine.apc.stats()}")
-        print("=" * 65)
-    else:
-        res = engine.generate(a.prompt, max_tokens=a.tokens, mode=a.mode, use_apc=True)
-        print("\n" + "=" * 65)
-        print(f"  Generated {res['generated_tokens']} tokens in {res['total_elapsed_s']:.2f}s = {res['decode_tps']:.2f} tok/s")
-        print(f"  TTFT: {res['ttft_ms']:.1f} ms | Accepted / Step: {res['accepted_per_step']:.2f} | APC Hit: {res['apc_hit']}")
-        print(f"  Sample: {repr(res['generated_text'][:120])}...")
-        print("=" * 65)
 
 
 if __name__ == "__main__":
