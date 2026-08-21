@@ -177,11 +177,32 @@ class HybridEngine:
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         exec_mode = mode or self.mode
+        def normalize_messages(msgs):
+            clean = []
+            for m in msgs:
+                m_copy = dict(m)
+                if "tool_calls" in m_copy and m_copy["tool_calls"]:
+                    clean_tcs = []
+                    for tc in m_copy["tool_calls"]:
+                        tc_copy = dict(tc)
+                        if "function" in tc_copy and isinstance(tc_copy["function"], dict):
+                            fn_copy = dict(tc_copy["function"])
+                            if isinstance(fn_copy.get("arguments"), str):
+                                try:
+                                    fn_copy["arguments"] = json.loads(fn_copy["arguments"])
+                                except Exception:
+                                    pass
+                            tc_copy["function"] = fn_copy
+                        clean_tcs.append(tc_copy)
+                    m_copy["tool_calls"] = clean_tcs
+                clean.append(m_copy)
+            return clean
+
         if isinstance(prompt, list):
             kwargs = {"add_generation_prompt": True, "tokenize": False}
             if tools:
                 kwargs["tools"] = tools
-            text = self.tok.apply_chat_template(prompt, **kwargs)
+            text = self.tok.apply_chat_template(normalize_messages(prompt), **kwargs)
         else:
             kwargs = {"add_generation_prompt": True, "tokenize": False}
             if tools:
