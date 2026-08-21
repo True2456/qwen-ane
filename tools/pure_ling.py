@@ -614,7 +614,7 @@ if __name__ == "__main__":
 # LingReference, so the model keeps generating correct text throughout.
 # ---------------------------------------------------------------------------
 
-def _bank(driver, checkpoint, sets, bits, tag):
+def _bank(driver, checkpoint, sets, bits, tag, width=32):
     """Build one projection bank and drop its compiler scratch immediately.
 
     AneLinearProjectionBank does not call discard_compiler_files, so every bank
@@ -623,7 +623,7 @@ def _bank(driver, checkpoint, sets, bits, tag):
     representation, so the scratch is rebuildable and safe to drop.
     """
     from pure_ane import AneLinearProjectionBank
-    bank = AneLinearProjectionBank(driver, checkpoint, sets, bits, tag)
+    bank = AneLinearProjectionBank(driver, checkpoint, sets, bits, tag, width)
     driver.discard_compiler_files(bank.program)
     return bank
 
@@ -641,7 +641,7 @@ class AneExpertBank:
     (docs/ANE-REFERENCE.md).
     """
 
-    def __init__(self, driver, checkpoint, spec, bits=4, chunks=None):
+    def __init__(self, driver, checkpoint, spec, bits=4, chunks=None, width=32):
         from pure_ane import AneLinearProjectionBank
         # One chunk per router group. `topk_group` of `n_group` groups are live
         # per token, so only those chunks need dispatching -- the model's own
@@ -661,7 +661,7 @@ class AneExpertBank:
                     [spec.expert_name(layer, e, "gate") for e in range(lo, hi)]
                     + [spec.expert_name(layer, e, "up") for e in range(lo, hi)])
             self.banks.append(_bank(driver, checkpoint, sets, bits,
-                                    f"moe_gu_c{c}"))
+                                    f"moe_gu_c{c}", width))
         self.nbytes = sum(b.nbytes for b in self.banks)
 
     def gate_up_batch(self, layer, X, groups=None):
@@ -707,16 +707,18 @@ class LingRuntime(LingReference):
     """
 
     def __init__(self, checkpoint, spec, engine_path=".", bits=8,
-                 ane_moe=True, ane_proj=True, ane_down=True):
+                 ane_moe=True, ane_proj=True, ane_down=True, width=32):
         super().__init__(checkpoint, spec)
         from pure_ane import AneDriver
         self.driver = AneDriver(engine_path)
         self.bits = bits
-        self.experts = (AneExpertBank(self.driver, checkpoint, spec, bits)
+        self.width = width
+        self.experts = (AneExpertBank(self.driver, checkpoint, spec, bits,
+                                     width=width)
                         if ane_moe else None)
-        self.proj = (AneProjectionBanks(self.driver, checkpoint, spec, bits)
+        self.proj = (AneProjectionBanks(self.driver, checkpoint, spec, bits, width)
                      if ane_proj else None)
-        self.down = (AneExpertDown(self.driver, checkpoint, spec, bits)
+        self.down = (AneExpertDown(self.driver, checkpoint, spec, bits, width)
                      if ane_down else None)
         self.programs = (
             (len(self.experts.banks) if self.experts else 0)
@@ -832,8 +834,8 @@ class AneProjectionBanks:
     one procedure per layer. No new MIL.
     """
 
-    def __init__(self, driver, checkpoint, spec, bits=8):
-        B = _bank
+    def __init__(self, driver, checkpoint, spec, bits=8, width=32):
+        B = lambda d, c, s, b, tg: _bank(d, c, s, b, tg, width)
         self.spec = spec
         kda, mla = spec.linear_attention_layers, spec.full_attention_layers
         an = spec.attention_names
@@ -867,11 +869,79 @@ class AneProjectionBanks:
         self.dense_dn = B(driver, checkpoint, [[mn(l)["down"]] for l in dense],
                           bits, "dense_dn")
         self.dense_layers = dense
+        # lm_head: 157184 rows is far above the 62080 single-conv limit, so it
+        # is split. It was still in numpy at 966 MB of fp32 per call.
+        V = spec.vocab
+        self.head_chunks = 4
+        step = -(-V // self.head_chunks)
+        self.head = []
+        self.head_spans = []
+        for c in range(self.head_chunks):
+            lo, hi = c * step, min(V, (c + 1) * step)
+            self.head_spans.append((lo, hi))
         self.banks = [self.kda_in, self.kda_out, self.mla_a, self.mla_qb,
                       self.mla_out, self.shared_gu, self.shared_dn,
                       self.dense_gu, self.dense_dn]
         self.nbytes = sum(b.nbytes for b in self.banks)
         self.programs = len(self.banks)
+
+
+class AneVocabHead:
+    """Final vocabulary projection, split under the single-conv output limit."""
+
+    def __init__(self, driver, checkpoint, spec, bits=8, chunks=4, width=32):
+        from pure_ane import _quantize_matrix, _dense_decl
+        import contextlib, io
+        self.driver, self.spec, self.width = driver, spec, width
+        E = driver.module
+        V, H = spec.vocab, spec.hidden
+        step = -(-V // chunks)
+        self.progs, self.spans, self.nbytes = [], [], 0
+        for c in range(chunks):
+            lo, hi = c * step, min(V, (c + 1) * step)
+            blobs = _quantize_matrix(checkpoint, "lm_head.weight", "p", bits,
+                                     row_start=lo, row_end=hi)
+            O = hi - lo
+            mil = f'''program(1.3)
+{E._BUILD_INFO}
+{{
+  func main<ios18>(tensor<fp16, [1, {H}, 1, {width}]> x) {{
+    string pt=const()[name=string("pt"),val=string("valid")];
+    tensor<int32,[2]> st=const()[name=string("st"),val=tensor<int32,[2]>([1,1])];
+    tensor<int32,[4]> pd=const()[name=string("pd"),val=tensor<int32,[4]>([0,0,0,0])];
+    tensor<int32,[2]> dl=const()[name=string("dl"),val=tensor<int32,[2]>([1,1])];
+    int32 gr=const()[name=string("gr"),val=int32(1)];
+{_dense_decl("p", O, H, bits)}
+    tensor<fp16,[1,{O},1,{width}]> y=conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=pw,x=x)[name=string("mm")];
+  }} -> (y);
+}}
+'''
+            cap = io.StringIO()
+            with contextlib.redirect_stdout(cap), contextlib.redirect_stderr(cap):
+                prog = driver.engine.compile_multiproc(mil, blobs, H, O, width)
+            if prog is None:
+                raise RuntimeError(f"vocab head chunk {c} failed:\n"
+                                   f"{cap.getvalue().strip()[-200:]}")
+            driver.engine._ensure_io(prog)
+            driver.discard_compiler_files(prog)
+            self.progs.append((prog, O))
+            self.spans.append((lo, hi))
+            self.nbytes += sum(len(v) for v in blobs.values())
+        self.programs = len(self.progs)
+
+    def run(self, x):
+        out = np.empty(self.spec.vocab, np.float32)
+        xh = np.asarray(x, np.float16)
+        for (prog, O), (lo, hi) in zip(self.progs, self.spans):
+            with self.driver.view(prog._in_surf, (self.spec.hidden, self.width),
+                                  np.float16) as d:
+                d[:] = 0; d[:, 0] = xh
+            if not self.driver.engine.submit(prog, procedure_index=0):
+                raise RuntimeError("vocab head submit failed")
+            with self.driver.view(prog._out_surf, (O, self.width),
+                                  np.float16) as o:
+                out[lo:hi] = np.array(o[:hi - lo, 0], np.float32)
+        return out
 
 
 class AneExpertDown:
@@ -889,8 +959,8 @@ class AneExpertDown:
 
     PER_BANK = 64
 
-    def __init__(self, driver, checkpoint, spec, bits=8):
-        B = _bank
+    def __init__(self, driver, checkpoint, spec, bits=8, width=32):
+        B = lambda d, c, s, b, tg: _bank(d, c, s, b, tg, width)
         self.spec = spec
         self.split = spec.experts // self.PER_BANK
         self.banks = {}
@@ -941,19 +1011,23 @@ class LingPrefill(LingRuntime):
     still advances one at a time. MLA attention batches with a causal mask.
     """
 
-    def __init__(self, *a, lanes=32, ane_absorb=True, **k):
+    def __init__(self, *a, lanes=None, ane_absorb=True, **k):
         super().__init__(*a, **k)
-        self.lanes = lanes
-        self.absorb = (AneMlaAbsorb(self.driver, self.ck, self.spec)
+        self.lanes = lanes or self.width
+        self.absorb = (AneMlaAbsorb(self.driver, self.ck, self.spec, self.width)
                        if ane_absorb else None)
         if self.absorb:
             self.programs += self.absorb.programs
+        self.head = AneVocabHead(self.driver, self.ck, self.spec,
+                                 self.bits, 4, self.width)
+        self.programs += self.head.programs
+        self.nbytes += self.head.nbytes
         for bank in (self.proj.banks if self.proj else []):
-            bank.active_lanes = lanes
+            bank.active_lanes = self.lanes
         for bank in (self.experts.banks if self.experts else []):
-            bank.active_lanes = lanes
+            bank.active_lanes = self.lanes
         for bank in (self.down.banks.values() if self.down else []):
-            bank.active_lanes = lanes
+            bank.active_lanes = self.lanes
 
     def kda_batch(self, A, layer):
         s, n = self.spec, self.attention_names_cached(layer)
@@ -1100,9 +1174,13 @@ class LingPrefill(LingRuntime):
                 else:
                     X = X + self.dense_batch(Pn, layer)
             self.pos += len(batch)
-            X = _rms_rows(X, self.w("model.norm.weight"), s.rms_eps)
-            logits = X[-1] @ self.wt("lm_head.weight")
-        return logits
+            last = X[-1]
+        # logits are only needed for the final position: projecting every
+        # chunk's last row read 966 MB of fp32 lm_head each time.
+        last = _rms_rows(last[None], self.w("model.norm.weight"), s.rms_eps)[0]
+        if self.head is not None:
+            return self.head.run(last)
+        return last @ self.wt("lm_head.weight")
 
 
 class AneMlaAbsorb:

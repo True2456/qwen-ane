@@ -2615,10 +2615,14 @@ class _BankProjection:
 
 class AneLinearProjectionBank:
     """Projection-only procedure bank using the driver's proven blob layout."""
-    def __init__(self,driver,checkpoint,projection_sets,bits,tag):
+    def __init__(self,driver,checkpoint,projection_sets,bits,tag,width=32):
         if bits not in (4,8,16):
             raise ValueError("pure procedure banks require int4, int8, or fp16")
-        self.driver=driver;self.width=32;self.active_lanes=3
+        # width is the compiled program width. A width-64 dispatch was measured
+        # to cost the same as width-32 (docs/OPTIMIZATIONS.md), so batched
+        # callers can halve their dispatch count for free. Default stays 32.
+        if width%32:raise ValueError("bank width must be a multiple of 32")
+        self.driver=driver;self.width=width;self.active_lanes=3
         infos=[checkpoint.info(n) for n in projection_sets[0]]
         self.H=infos[0].shape[1];self.O=sum(x.shape[0] for x in infos)
         raw=bytearray();offsets=[];self.nbytes=0
@@ -2644,18 +2648,18 @@ class AneLinearProjectionBank:
                 soff=append_blob(scale)
                 offsets.append((doff,soff));self.nbytes+=len(data)+len(scale)
         mil=E.generate_procedure_bank_mil(
-            self.H,self.O,32,offsets,quantized=bits!=16,
+            self.H,self.O,self.width,offsets,quantized=bits!=16,
             weight_format="fp16" if bits==16 else f"int{bits}"
         )
-        self.program=driver.engine.compile_multiproc(mil,{"weight.bin":bytes(raw)},self.H,self.O,32,raw_weight_files=frozenset({"weight.bin"}))
+        self.program=driver.engine.compile_multiproc(mil,{"weight.bin":bytes(raw)},self.H,self.O,self.width,raw_weight_files=frozenset({"weight.bin"}))
         if self.program is None:raise RuntimeError(f"{tag} linear projection bank failed")
         driver.engine._ensure_io(self.program)
     def run(self,index,hidden):
         hidden,lanes=_lane_matrix(hidden,self.H,self.active_lanes)
-        with self.driver.view(self.program._in_surf,(self.H,32),np.float16) as d:
+        with self.driver.view(self.program._in_surf,(self.H,self.width),np.float16) as d:
             d[:]=0;d[:,:lanes]=hidden
         if not self.driver.engine.submit(self.program,procedure_index=index):raise RuntimeError("linear projection bank submit failed")
-        with self.driver.view(self.program._out_surf,(self.O,32),np.float16) as o:
+        with self.driver.view(self.program._out_surf,(self.O,self.width),np.float16) as o:
             out=np.array(o[:,:lanes],np.float16)
         return _restore_lane_rank(out,lanes)
 
