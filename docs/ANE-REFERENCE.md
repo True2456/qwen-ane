@@ -165,6 +165,22 @@ The `(?!Channels =)` lookahead is required — without it the match runs from th
 
 * Quantized paths use signed int4/int8 with per-output-channel scales. `uint8`
   and unpacked int4 compile and silently return garbage; int4 must be packed.
+* **int4 is 16 signed levels, not ternary.** Measured: the ANE's output matches
+  a 16-level dequantized reference at rel 8.67e-4 and a ternary (−1,0,+1)
+  reference at 1.32, and 15 distinct values are stored spanning −7..+7.
+* **There is no sub-4-bit format.** `int2`, `uint2`, `int3` and `uint3` are all
+  rejected; only int4 and int8 are accepted. A BitNet-style ternary checkpoint
+  would have to be stored as int4, so it would read the same bytes as int4 and
+  gain nothing on the axis that limits decode.
+* **`constexpr_blockwise_shift_scale` dequantizes to fp16 before the conv**, so
+  int4/int8/fp16 are not three arithmetic modes — the maths is fp16 in all
+  three. What changes is weight *bytes*, which is why the same shape measures
+  18.7 / 13.9 / 7.0 TFLOP/s: it tracks 4x / 2x / 1x bandwidth.
+* **Per-output-channel scales only costs real accuracy.** Group-wise scales are
+  what MLX and llama.cpp ship for int4, and they are rejected here, so the
+  ANE's int4 is coarser than int4 elsewhere. RMS relative error on real
+  weights: per-row int4 0.147, int4 g=64 0.108, int8 0.008. That is 1.3-1.5x
+  worse than int4 as normally shipped, and ~18x worse than int8 either way.
 * fp16 weights work and are the current semantic-correctness path. The complete
   model uses 51.42 GB of fp16 blobs. `kANEFKeepModelMemoryWiredKey=0` is required
   so this footprint remains pageable.
@@ -175,8 +191,11 @@ The `(?!Channels =)` lookahead is required — without it the match runs from th
 
 ## Private-loader model limit versus hardware queue depth
 
-**This `_ANEInMemoryModel` path loads 127 distinct models per process.** Model
-128 fails with `Program load failure (0x50004)`. The failure was reproduced
+**This `_ANEInMemoryModel` path loads 127 distinct models, and the budget is
+SYSTEM-WIDE rather than per process.** Model 128 fails with `Program load
+failure (0x50004)`. Measured: while one process held ~122 programs, a *fresh*
+process failed to load a 16x16 program — a few KB. Two runtimes therefore
+cannot coexist, and probing alongside a running server measures a failure. The failure was reproduced
 with 9.8 GB free and with a synthetic 5.31 GB build, so the scheduler must use
 127 as its current loader-path budget.
 
@@ -247,6 +266,10 @@ is not there.
 
 * The engine swallows compiler output into a discarded buffer. Surface it on
   failure or you will be guessing.
+* `_bind_secondary_output` sized the secondary IOSurface as `channels*32` with
+  the width hardcoded, so any program compiled wider than 32 under-allocated it
+  and failed at **evaluation**, pointing nowhere near the cause. It now takes
+  the program width.
 * `identity` as a program's **sole** output returns NaN. With two outputs it is
   **required** — emitting a tensor as an output while other ops also consume it
   likewise gives NaN. Two opposite rules, both measured.

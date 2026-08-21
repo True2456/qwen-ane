@@ -5,7 +5,7 @@ There are two backends in this repository. The original hybrid server uses a
 `tools/pure_ane.py` backend uses 120 programs at direct context 256 and 125 for
 the default int4 long-context scan set, and executes every learned tensor
 operation on the ANE. Both
-designs are constrained by an empirical per-process limit in the private
+designs are constrained by an empirical system-wide limit in the private
 `_ANEInMemoryModel` loader; a naive mapping wants several hundred.
 
 The pure backend also has a persistent HTTP wrapper in
