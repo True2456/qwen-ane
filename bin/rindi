@@ -10,10 +10,5 @@ while [ -h "$SOURCE" ]; do
 done
 ROOT_DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 
-# Launch Pure C++ Standalone Native Binary (Zero Python, Zero MLX)
-if [ -f "$ROOT_DIR/runtime/rindi-server" ]; then
-  exec "$ROOT_DIR/runtime/rindi-server" "$@"
-else
-  export KMP_DUPLICATE_LIB_OK=TRUE
-  exec python3 "$ROOT_DIR/tools/hybrid_serve.py" "$@"
-fi
+# Launch Pure Native C++ Binary (Zero Python, Zero MLX)
+exec "$ROOT_DIR/runtime/rindi-server" "$@"

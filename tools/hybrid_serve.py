@@ -147,14 +147,20 @@ class HybridEngine:
             # 4. Load MTP Weights
             self._init_mtp_head()
 
-            # 5. Initialize ANE Chained Engine for Decode (Offloads 41.0 GB to ANE)
+            # 5. Initialize 4-bit Metal GPU Prefill Backbone
+            print("  [GPU Engine] Initializing 4-bit Metal GPU Matrix Cores for Prefill...")
+            self.gpu_model, _ = load(model_path, lazy=True)
+            self.gpu_inner = getattr(self.gpu_model, "language_model", self.gpu_model).model
+            nn.quantize(self.gpu_inner, group_size=64, bits=4)
+
+            # 6. Initialize ANE Chained Engine for Decode (Offloads 41.0 GB to ANE)
             print("  [ANE Engine] Registering 64 ANE resident layers (41.0 GB freed)...")
             cr = ane_serve._bake_cache_dir(model_path, dense_bits) if bake_cache else None
             self.ane_layers = ane_serve.attach_ane_chain(self.model, "mil", 32, dense_bits, cr)
             ane_serve.attach_ane_lm_head(self.model, "mil", 32, dense_bits, 4)
-            # 6. Release unquantized host RAM and clear MLX cache
+
+            # 7. Release unquantized host RAM and clear MLX cache
             import gc
-            self.gpu_inner = self.inner
             mx.clear_cache()
             gc.collect()
 

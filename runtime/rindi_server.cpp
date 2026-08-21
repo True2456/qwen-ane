@@ -80,7 +80,11 @@ void handle_client(int client_fd, RindiNativeChain* chain) {
             std::string chunk0 = "data: {\"id\":\"chatcmpl-native\",\"object\":\"chat.completion.chunk\",\"created\":1787300000,\"model\":\"Qwen3.8-27B\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n";
             write(client_fd, chunk0.c_str(), chunk0.size());
 
-            // 2. Stream content chunks
+            // 2. Reasoning content chunk for Pi compatibility (requiresReasoningContentOnAssistantMessages)
+            std::string reason_chunk = "data: {\"id\":\"chatcmpl-native\",\"object\":\"chat.completion.chunk\",\"created\":1787300000,\"model\":\"Qwen3.8-27B\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Ready to assist.\"},\"finish_reason\":null}]}\n\n";
+            write(client_fd, reason_chunk.c_str(), reason_chunk.size());
+
+            // 3. Stream content chunks
             std::string greeting = "Hello! The Rindi Standalone C++ Engine is active with zero Python overhead.";
             std::istringstream iss(greeting);
             std::string word;
@@ -90,11 +94,11 @@ void handle_client(int client_fd, RindiNativeChain* chain) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(15));
             }
 
-            // 3. Final chunk with finish_reason: stop
+            // 4. Final chunk with finish_reason: stop
             std::string final_chunk = "data: {\"id\":\"chatcmpl-native\",\"object\":\"chat.completion.chunk\",\"created\":1787300000,\"model\":\"Qwen3.8-27B\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
             write(client_fd, final_chunk.c_str(), final_chunk.size());
 
-            // 4. DONE marker
+            // 5. DONE marker
             std::string done_marker = "data: [DONE]\n\n";
             write(client_fd, done_marker.c_str(), done_marker.size());
             
