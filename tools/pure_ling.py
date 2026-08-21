@@ -415,6 +415,8 @@ class LingReference:
     def reset(self) -> None:
         if getattr(self, "recur", None) is not None:
             self.recur.reset(self.spec.linear_attention_layers)
+        if getattr(self, "recur_u", None) is not None:
+            self.recur_u.reset(self.spec.linear_attention_layers)
         for v in self.state.values():
             v[:] = 0
         for v in self.conv.values():
@@ -1025,7 +1027,8 @@ class LingPrefill(LingRuntime):
     """
 
     def __init__(self, *a, lanes=None, ane_absorb=True,
-                 ane_prepare=False, ane_stacked_down=True, **k):
+                 ane_prepare=False, ane_stacked_down=True,
+                 unroll=16, **k):
         super().__init__(*a, **k)
         self.lanes = lanes or self.width
         self.absorb = (AneMlaAbsorb(self.driver, self.ck, self.spec, self.width)
@@ -1051,6 +1054,12 @@ class LingPrefill(LingRuntime):
         self.recur = AneKdaRecurrence(self.driver, self.spec)
         self.recur.reset(self.spec.linear_attention_layers)
         self.programs += self.recur.programs
+        self.recur_u = (AneKdaRecurrenceUnrolled(self.driver, self.spec, unroll)
+                        if unroll else None)
+        if self.recur_u:
+            self.recur_u.reset(self.spec.linear_attention_layers)
+            self.recur_u.states = self.recur.states   # one state, both paths
+            self.programs += self.recur_u.programs
         self.head = AneVocabHead(self.driver, self.ck, self.spec,
                                  self.bits, 4, self.width)
         self.programs += self.head.programs
@@ -1094,7 +1103,11 @@ class LingPrefill(LingRuntime):
             a * (fl.T.reshape(T, H, D) + self.w(n["dt_bias"]).reshape(H, D))))
 
         Y = np.empty((T, H, D), np.float32)
-        if getattr(self, "recur", None) is not None:
+        if getattr(self, "recur_u", None) is not None and T > 1:
+            # U positions chained inside one graph: the state never leaves the
+            # ANE between them, so one dispatch covers U steps instead of one.
+            Y = self.recur_u.run(layer, g, k, q, v, beta)
+        elif getattr(self, "recur", None) is not None:
             for t in range(T):          # serial, but the arithmetic is on the ANE
                 Y[t] = self.recur.step(layer, g[t], k[t], q[t], v[t], beta[t])
         else:
@@ -1632,3 +1645,145 @@ class AneExpertDownStacked:
             raise RuntimeError("stacked down submit failed")
         with self.driver.view(prog._out_surf, (H, W), np.float16) as o:
             return np.array(o[:, :T], np.float32).T
+
+
+class AneKdaRecurrenceUnrolled:
+    """The gated-delta recurrence with U positions unrolled into one program.
+
+    The recurrence is serial in position, so one dispatch per position gave
+    2466 dispatches for a 137-token prompt -- 73% of all dispatches after the
+    stacked-down fix, and 222 ms of pure 0.09 ms floor.
+
+    The scan itself cannot be parallelised without the chunked/WY formulation,
+    but it can be *unrolled*: U positions chained inside a single MIL graph, so
+    the state never leaves the ANE between them and one dispatch covers U steps.
+    That divides both the dispatch count and the floor by U.
+
+    Layout extends the single-step one. State stays at channel h*Dk+dk, width
+    dv. Each position gets three width columns for its g, k and q (all per
+    (h,dk), hence per channel), and its own H channels for v and for beta.
+    """
+
+    def __init__(self, driver, spec, unroll=16):
+        import contextlib, io
+        from pure_ane import _bind_secondary_output, _submit_bound
+        self.driver, self.spec, self.U = driver, spec, unroll
+        self._submit_bound = _submit_bound
+        E = driver.module
+        H, Dk, Dv = spec.heads, spec.head_dim, spec.head_dim
+        self.H, self.Dk, self.Dv = H, Dk, Dv
+        self.HK = HK = H * Dk
+        U = unroll
+        self.VCH = HK                       # v blocks start here
+        self.BCH = HK + U * H               # beta blocks start here
+        self.CIN = CIN = HK + 2 * U * H
+        self.W = W = ((Dv + 3 * U + 31) // 32) * 32
+        self.gcol = lambda t: Dv + 3 * t
+        self.kcol = lambda t: Dv + 3 * t + 1
+        self.qcol = lambda t: Dv + 3 * t + 2
+
+        def sl(name, c0, c1, w0, w1):
+            return (f'    tensor<fp16, [1, {c1-c0}, 1, {w1-w0}]> {name} = '
+                    f'slice_by_index(begin=tensor<int32, [4]>([0,{c0},0,{w0}]), '
+                    f'end=tensor<int32, [4]>([1,{c1},1,{w1}]), x=x)'
+                    f'[name=string("{name}")];')
+
+        body, state = [], "s00"
+        body.append(sl("s00", 0, HK, 0, Dv))
+        for t in range(U):
+            g, k, q = f"g{t}", f"k{t}", f"q{t}"
+            body.append(sl(g, 0, HK, self.gcol(t), self.gcol(t) + 1))
+            body.append(sl(k, 0, HK, self.kcol(t), self.kcol(t) + 1))
+            body.append(sl(q, 0, HK, self.qcol(t), self.qcol(t) + 1))
+            body.append(sl(f"v{t}", HK + t*H, HK + (t+1)*H, 0, Dv))
+            body.append(sl(f"b{t}", self.BCH + t*H, self.BCH + (t+1)*H,
+                           self.gcol(t), self.gcol(t) + 1))
+            body.append(
+                f'    tensor<fp16,[1,{HK},1,{Dv}]> sd{t}=mul(x={state},y={g})[name=string("sd{t}")];\n'
+                f'    tensor<fp16,[1,{HK},1,{Dv}]> sk{t}=mul(x=sd{t},y={k})[name=string("sk{t}")];\n'
+                f'    tensor<fp16,[1,{H},1,{Dv}]> kv{t}=conv(dilations=dl,groups=gh,pad=pd,pad_type=pt,strides=st,weight=sw,x=sk{t})[name=string("kv{t}")];\n'
+                f'    tensor<fp16,[1,{H},1,{Dv}]> df{t}=sub(x=v{t},y=kv{t})[name=string("df{t}")];\n'
+                f'    tensor<fp16,[1,{H},1,{Dv}]> dd{t}=mul(x=df{t},y=b{t})[name=string("dd{t}")];\n'
+                f'    tensor<fp16,[1,{HK},1,{Dv}]> db{t}=conv(dilations=dl,groups=gh,pad=pd,pad_type=pt,strides=st,weight=rw,x=dd{t})[name=string("db{t}")];\n'
+                f'    tensor<fp16,[1,{HK},1,{Dv}]> dk{t}=mul(x=db{t},y={k})[name=string("dk{t}")];\n'
+                f'    tensor<fp16,[1,{HK},1,{Dv}]> s{t+1:02d}=add(x=sd{t},y=dk{t})[name=string("s{t+1:02d}")];\n'
+                f'    tensor<fp16,[1,{HK},1,{Dv}]> sq{t}=mul(x=s{t+1:02d},y={q})[name=string("sq{t}")];\n'
+                f'    tensor<fp16,[1,{H},1,{Dv}]> yy{t}=conv(dilations=dl,groups=gh,pad=pd,pad_type=pt,strides=st,weight=sw,x=sq{t})[name=string("yy{t}")];\n'
+                f'    tensor<fp16,[1,{H},1,{W}]> yp{t}=pad(mode=string("constant"),constant_val=fp16(0x0p+0),pad=tensor<int32,[8]>([0,0,0,0,0,0,{t*Dv if False else 0},{W-Dv}]),x=yy{t})[name=string("yp{t}")];')
+            state = f"s{t+1:02d}"
+        # y for all U positions leaves on one surface: U blocks of H channels
+        outs = []
+        for t in range(U):
+            outs.append(f'    tensor<fp16,[1,{U*H},1,{Dv}]> op{t}=pad(mode=string("constant"),constant_val=fp16(0x0p+0),pad=tensor<int32,[8]>([0,0,{t*H},{(U-1-t)*H},0,0,0,0]),x=yy{t})[name=string("op{t}")];')
+        acc = "op0"
+        for t in range(1, U):
+            outs.append(f'    tensor<fp16,[1,{U*H},1,{Dv}]> oa{t}=add(x={acc},y=op{t})[name=string("oa{t}")];')
+            acc = f"oa{t}"
+        outs.append(f'    tensor<fp16,[1,{U*H},1,{Dv}]> y=identity(x={acc})[name=string("y")];')
+        outs.append(f'    tensor<fp16,[1,{HK},1,{Dv}]> y2=identity(x={state})[name=string("y2")];')
+        body = [b for b in body if "yp" not in b.split("=")[0]]
+
+        blobs = {"sum.bin": np.ones((H, Dk, 1, 1), np.float16).tobytes(),
+                 "rep.bin": np.ones((HK, 1, 1, 1), np.float16).tobytes()}
+        mil = f'''program(1.3)
+{E._BUILD_INFO}
+{{
+  func main<ios18>(tensor<fp16, [1, {CIN}, 1, {W}]> x) {{
+    string pt=const()[name=string("pt"),val=string("valid")];
+    tensor<int32,[2]> st=const()[name=string("st"),val=tensor<int32,[2]>([1,1])];
+    tensor<int32,[4]> pd=const()[name=string("pd"),val=tensor<int32,[4]>([0,0,0,0])];
+    tensor<int32,[2]> dl=const()[name=string("dl"),val=tensor<int32,[2]>([1,1])];
+    int32 gh=const()[name=string("gh"),val=int32({H})];
+    tensor<fp16, [{H}, {Dk}, 1, 1]> sw = const()[name=string("sw"), val=tensor<fp16, [{H}, {Dk}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/sum.bin"), offset=uint64(64)))];
+    tensor<fp16, [{HK}, 1, 1, 1]> rw = const()[name=string("rw"), val=tensor<fp16, [{HK}, 1, 1, 1]>(BLOBFILE(path=string("@model_path/weights/rep.bin"), offset=uint64(64)))];
+{chr(10).join(body)}
+{chr(10).join(outs)}
+  }} -> (y, y2);
+}}
+'''
+        cap = io.StringIO()
+        with contextlib.redirect_stdout(cap), contextlib.redirect_stderr(cap):
+            self.program = driver.engine.compile_multiproc(mil, blobs, CIN, U*H, W)
+        if self.program is None:
+            raise RuntimeError(f"unrolled recurrence (U={U}) failed:\n"
+                               f"{cap.getvalue().strip()[-260:]}")
+        driver.engine._ensure_io(self.program)
+        orig = E._iosurface_alloc_size
+        E._iosurface_alloc_size = lambda n: orig(n // 32 * Dv)
+        self.state_surf, self.request = _bind_secondary_output(
+            driver, self.program, HK)
+        E._iosurface_alloc_size = orig
+        driver.discard_compiler_files(self.program)
+        self.programs = 1
+        self.states = {}
+
+    def reset(self, layers):
+        self.states = {l: np.zeros((self.HK, self.Dv), np.float16) for l in layers}
+
+    def run(self, layer, g, k, q, v, beta):
+        """g,k,q: [T,H,Dk]; v: [T,H,Dv]; beta: [T,H]. Returns y [T,H,Dv]."""
+        HK, H, Dv, U, W = self.HK, self.H, self.Dv, self.U, self.W
+        T = g.shape[0]
+        Y = np.empty((T, H, Dv), np.float32)
+        for a in range(0, T, U):
+            n = min(U, T - a)
+            with self.driver.view(self.program._in_surf, (self.CIN, W),
+                                  np.float16) as d:
+                d[:] = 0
+                d[:HK, :Dv] = self.states[layer]
+                for t in range(n):
+                    d[:HK, self.gcol(t)] = g[a+t].reshape(-1)
+                    d[:HK, self.kcol(t)] = k[a+t].reshape(-1)
+                    d[:HK, self.qcol(t)] = q[a+t].reshape(-1)
+                    d[HK + t*H:HK + (t+1)*H, :Dv] = v[a+t]
+                    d[self.BCH + t*H:self.BCH + (t+1)*H, self.gcol(t)] = beta[a+t]
+                for t in range(n, U):        # identity decay, zero update
+                    d[:HK, self.gcol(t)] = 1.0
+            self._submit_bound(self.driver, self.program, self.request)
+            with self.driver.view(self.state_surf, (HK, Dv), np.float16) as o:
+                np.copyto(self.states[layer], o)
+            with self.driver.view(self.program._out_surf, (U*H, Dv),
+                                  np.float16) as o:
+                blk = np.array(o[:n*H], np.float32)
+            Y[a:a+n] = blk.reshape(n, H, Dv)
+        return Y
