@@ -40,11 +40,10 @@ export default function (api: ExtensionAPI) {
             supportsReasoningEffort: true,
             maxTokensField: "max_tokens",
             requiresReasoningContentOnAssistantMessages: true,
-            thinkingFormat: "chat-template",
             chatTemplateKwargs: {
               enable_thinking: { $var: "thinking.enabled" },
               reasoning_effort: { $var: "thinking.effort" },
-              preserve_thinking: false,
+              preserve_thinking: true,
             },
           },
           thinkingLevelMap: {

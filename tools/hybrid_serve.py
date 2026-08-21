@@ -246,7 +246,28 @@ class HybridEngine:
                 ttft_ms = (time.perf_counter() - t_start) * 1e3
                 print(f"\n  [APC Exact Cache Hit] Restored {tokens_saved}/{len(prompt_ids)} tokens in {ttft_ms:.2f} ms (0 FLOPs)")
 
+        # Stop on any EOS / special boundary tokens (<|im_end|>, <|endoftext|>, <|im_start|>)
+        self.eos_tokens = {151645, 151643, 151644}
+        if hasattr(self.tok, "eos_token_id") and self.tok.eos_token_id is not None:
+            self.eos_tokens.add(self.tok.eos_token_id)
+        if hasattr(self.tok, "all_special_ids") and self.tok.all_special_ids is not None:
+            self.eos_tokens.update(self.tok.all_special_ids)
+
         # ---- 3. Decode Loop -----------------------------------------------
+        if cur in self.eos_tokens:
+            return {
+                "mode": exec_mode,
+                "generated_tokens": 0,
+                "generated_text": "",
+                "ttft_ms": ttft_ms,
+                "decode_tps": 0.0,
+                "total_elapsed_s": time.perf_counter() - t_start,
+                "steps": 0,
+                "accepted_per_step": 0.0,
+                "apc_hit": apc_hit,
+                "tokens_saved": tokens_saved,
+            }
+
         gen, steps, accepted_total = [cur], 0, 0
         if emit_token:
             emit_token(self.tok.decode([cur]))
@@ -261,6 +282,10 @@ class HybridEngine:
                     d = self.mtp_layer(mx.concatenate([self.pre_e(self.embed(mx.array([[dtok]]))),
                                                       self.pre_h(dh)], -1) @ self.fcw.T, cache=mc)
                     dtok = int(mx.argmax(self.lm.lm_head(self.mtp_norm(d))[0, -1]))
+                    if dtok in self.eos_tokens:
+                        drafts.append(dtok)
+                        dh = d
+                        break
                     drafts.append(dtok)
                     dh = d
 
@@ -282,14 +307,22 @@ class HybridEngine:
                     else:
                         break
 
-                if n_ok == self.draft_depth:
+                if n_ok == len(drafts):
                     new_toks = drafts + [preds[-1]]
-                    gen.extend(new_toks)
-                    cur, last_h = preds[-1], hv[:, -1:]
-                    accepted_total += self.draft_depth + 1
+                    filtered, hit_eos = [], False
+                    for tok in new_toks:
+                        if tok in self.eos_tokens:
+                            hit_eos = True
+                            break
+                        filtered.append(tok)
+                    gen.extend(filtered)
                     if emit_token:
-                        for tok in new_toks:
+                        for tok in filtered:
                             emit_token(self.tok.decode([tok]))
+                    if hit_eos:
+                        break
+                    cur, last_h = preds[-1], hv[:, -1:]
+                    accepted_total += len(drafts) + 1
                 else:
                     restore_caches(c, gsnap)
                     for x, off in zip([y for y in c if y.is_trimmable()], kv_before):
@@ -301,30 +334,36 @@ class HybridEngine:
                     nxt = keep + [fix]
                     self.mtp_layer(mx.concatenate([self.pre_e(self.embed(mx.array([nxt]))),
                                                   self.pre_h(hv2)], -1) @ self.fcw.T, cache=mc)
-                    gen.extend(nxt)
+                    filtered, hit_eos = [], False
+                    for tok in nxt:
+                        if tok in self.eos_tokens:
+                            hit_eos = True
+                            break
+                        filtered.append(tok)
+                    gen.extend(filtered)
+                    if emit_token:
+                        for tok in filtered:
+                            emit_token(self.tok.decode([tok]))
+                    if hit_eos:
+                        break
                     cur, last_h = fix, hv2[:, -1:]
                     accepted_total += n_ok + 1
-                    if emit_token:
-                        for tok in nxt:
-                            emit_token(self.tok.decode([tok]))
 
                 steps += 1
-                if cur in self.tok.eos_token_ids:
-                    break
 
         else:
             # Silent Mode: Pure ANE Single-Step Decode at ~5.9 W
             while len(gen) < max_tokens:
                 hv = self.inner(mx.array([[cur]]), cache=c)
                 nxt = int(mx.argmax(self.head(hv)[0, -1]))
+                if nxt in self.eos_tokens:
+                    break
                 gen.append(nxt)
                 cur = nxt
                 steps += 1
                 accepted_total += 1
                 if emit_token:
                     emit_token(self.tok.decode([nxt]))
-                if cur in self.tok.eos_token_ids:
-                    break
 
         total_elapsed = time.perf_counter() - t_start
         decode_elapsed = time.perf_counter() - t_decode_start
