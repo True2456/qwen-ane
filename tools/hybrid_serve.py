@@ -326,11 +326,10 @@ class HybridEngine:
                 else:
                     restore_caches(c, gsnap)
                     for x, off in zip([y for y in c if y.is_trimmable()], kv_before):
-                        x.offset = off
+                        x.offset = off + 1 + n_ok
                     restore_caches([mc], msnap)
                     keep = drafts[:n_ok]
                     fix = preds[n_ok]
-                    # Fast slice from already evaluated sequence verification instead of second 64-layer pass
                     hv2 = hv[:, :n_ok + 1]
                     nxt = keep + [fix]
                     self.mtp_layer(mx.concatenate([self.pre_e(self.embed(mx.array([nxt]))),
@@ -441,8 +440,8 @@ _REASONING_INSTRUCTIONS = {
 def main():
     p = argparse.ArgumentParser(description="Apple Silicon Hybrid Inference Engine (APC + Turbo/Silent)")
     p.add_argument("--model", default="/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B")
-    p.add_argument("--mode", choices=["turbo", "silent"], default="turbo",
-                   help="turbo: GPU Metal Tree Drafter + ANE Verifier; silent: Pure ANE at ~5.9W")
+    p.add_argument("--mode", default="silent", choices=["turbo", "silent"],
+                   help="Default execution mode: 'silent' (Pure ANE @ ~5.9W) or 'turbo' (MTP+ANE)")
     p.add_argument("--tokens", type=int, default=64)
     p.add_argument("--draft", type=int, default=3)
     p.add_argument("--prompt", default="Explain how a transformer language model works.")
