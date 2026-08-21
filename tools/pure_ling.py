@@ -1024,13 +1024,24 @@ class LingPrefill(LingRuntime):
     still advances one at a time. MLA attention batches with a causal mask.
     """
 
-    def __init__(self, *a, lanes=None, ane_absorb=True, **k):
+    def __init__(self, *a, lanes=None, ane_absorb=True,
+                 ane_prepare=False, **k):
         super().__init__(*a, **k)
         self.lanes = lanes or self.width
         self.absorb = (AneMlaAbsorb(self.driver, self.ck, self.spec, self.width)
                        if ane_absorb else None)
         if self.absorb:
             self.programs += self.absorb.programs
+        # MEASURED SLOWER, off by default. Fusing conv+SiLU+L2norm onto the
+        # ANE cost 49.3 -> 40.6 tok/s: the numpy it replaces is already batched
+        # and vectorised over 64 positions, so moving it adds 18 dispatches and
+        # two IOSurface round trips per layer per chunk to save arithmetic that
+        # was never the bottleneck. Kept because it is correct (rel 2.2e-3) and
+        # it is the evidence for where the ANE does and does not pay.
+        self.prep = (AneKdaPrepare(self.driver, self.ck, self.spec, self.width)
+                     if ane_prepare else None)
+        if self.prep:
+            self.programs += self.prep.programs
         self.recur = AneKdaRecurrence(self.driver, self.spec)
         self.recur.reset(self.spec.linear_attention_layers)
         self.programs += self.recur.programs
@@ -1054,18 +1065,23 @@ class LingPrefill(LingRuntime):
         qkv = f[:3 * P]                                    # [3P, T]
         fl, gate_r, beta_r = f[3*P:4*P], f[4*P:5*P], f[5*P:5*P+H]
 
-        # causal depthwise conv over the chunk, seeded with the carried history
-        cw = np.concatenate([self.w(n[f"{k}_conv"]).reshape(P, s.conv_kernel)
-                             for k in ("q", "k", "v")])
-        padded = np.concatenate([self.conv[layer], qkv], axis=1)
-        conv = sum(padded[:, t:t + T] * cw[:, t:t + 1]
-                   for t in range(s.conv_kernel))
-        self.conv[layer] = padded[:, -(s.conv_kernel - 1):]
-        q = _silu(conv[:P]).T.reshape(T, H, D)
-        k = _silu(conv[P:2*P]).T.reshape(T, H, D)
-        v = _silu(conv[2*P:]).T.reshape(T, H, D)
-        q /= np.linalg.norm(q, axis=-1, keepdims=True)
-        k /= np.linalg.norm(k, axis=-1, keepdims=True)
+        # causal depthwise conv + SiLU + per-head L2 norm, on the ANE
+        if getattr(self, "prep", None) is not None and T <= self.prep.width:
+            q, k, v = self.prep.run(layer, qkv, self.conv[layer])
+            self.conv[layer] = np.concatenate(
+                [self.conv[layer], qkv], axis=1)[:, -(s.conv_kernel - 1):]
+        else:
+            cw = np.concatenate([self.w(n[f"{k}_conv"]).reshape(P, s.conv_kernel)
+                                 for k in ("q", "k", "v")])
+            padded = np.concatenate([self.conv[layer], qkv], axis=1)
+            conv = sum(padded[:, t:t + T] * cw[:, t:t + 1]
+                       for t in range(s.conv_kernel))
+            self.conv[layer] = padded[:, -(s.conv_kernel - 1):]
+            q = _silu(conv[:P]).T.reshape(T, H, D)
+            k = _silu(conv[P:2*P]).T.reshape(T, H, D)
+            v = _silu(conv[2*P:]).T.reshape(T, H, D)
+            q /= np.linalg.norm(q, axis=-1, keepdims=True)
+            k /= np.linalg.norm(k, axis=-1, keepdims=True)
         beta = _sigmoid(beta_r).T
         a = np.exp(self.w(n["a_log"]))[None, :, None]
         g = np.exp(s.kda_lower_bound * _sigmoid(
@@ -1395,3 +1411,111 @@ class AneKdaRecurrence:
             np.copyto(self.states[layer], o)
         with self.driver.view(self.program._out_surf, (H, Dv), np.float16) as o:
             return np.array(o, np.float32)
+
+
+class AneKdaPrepare:
+    """KDA conv + SiLU + per-head L2 norm, on the ANE, batched over positions.
+
+    Takes the projection bank's q|k|v rows with three carried history columns
+    prepended, and returns q,k,v ready for the recurrence:
+
+        depthwise K=4 causal conv  ->  SiLU  ->  L2 normalise q and k per head
+
+    SiLU is spelled x/(1+exp(-x)); MIL's sigmoid measured 4e-2 relative error on
+    a real depthwise-conv shape (docs/ANE-REFERENCE.md). The per-head L2 norm is
+    a reduction over Dk within each head, so it is a grouped conv Dk->1 for the
+    sum of squares and a grouped conv 1->Dk to broadcast the norm back.
+    """
+
+    K = 4
+
+    def __init__(self, driver, checkpoint, spec, width=64):
+        import contextlib, io
+        self.driver, self.spec, self.width = driver, spec, width
+        E = driver.module
+        H, D = spec.heads, spec.head_dim
+        P = spec.kda_proj_dim
+        self.P, self.C = P, 3 * P
+        W = width + 32                # multiple of 32, and >= width
+        self.Win = W
+        off = 32 - (self.K - 1)       # history sits just before the positions
+        self.progs = {}
+        # q and k are normalised together, so the groups span 2H heads
+        ones_g = np.ones((2 * H, D, 1, 1), np.float16)      # Dk -> 1 per head
+        rep = np.ones((2 * H * D, 1, 1, 1), np.float16)     # 1 -> Dk per head
+        for layer in spec.linear_attention_layers:
+            n = spec.attention_names(layer)
+            cw = np.concatenate([
+                checkpoint.tensor(n[f"{k}_conv"], np.float32).reshape(P, self.K)
+                for k in ("q", "k", "v")])
+            blobs = {"cw.bin": cw.astype(np.float16).reshape(
+                        self.C, 1, 1, self.K).tobytes(),
+                     "og.bin": ones_g.tobytes(), "rp.bin": rep.tobytes()}
+            mil = f'''program(1.3)
+{E._BUILD_INFO}
+{{
+  func main<ios18>(tensor<fp16, [1, {self.C}, 1, {W}]> x) {{
+    string pt=const()[name=string("pt"),val=string("valid")];
+    tensor<int32,[2]> st=const()[name=string("st"),val=tensor<int32,[2]>([1,1])];
+    tensor<int32,[4]> pd=const()[name=string("pd"),val=tensor<int32,[4]>([0,0,0,0])];
+    tensor<int32,[2]> dl=const()[name=string("dl"),val=tensor<int32,[2]>([1,1])];
+    int32 gc=const()[name=string("gc"),val=int32({self.C})];
+    int32 gh=const()[name=string("gh"),val=int32({H})];
+    int32 g2=const()[name=string("g2"),val=int32({2*H})];
+    tensor<fp16, [{self.C}, 1, 1, {self.K}]> cw = const()[name=string("cw"), val=tensor<fp16, [{self.C}, 1, 1, {self.K}]>(BLOBFILE(path=string("@model_path/weights/cw.bin"), offset=uint64(64)))];
+    tensor<fp16, [{2*H}, {D}, 1, 1]> og = const()[name=string("og"), val=tensor<fp16, [{2*H}, {D}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/og.bin"), offset=uint64(64)))];
+    tensor<fp16, [{2*P}, 1, 1, 1]> rp = const()[name=string("rp"), val=tensor<fp16, [{2*P}, 1, 1, 1]>(BLOBFILE(path=string("@model_path/weights/rp.bin"), offset=uint64(64)))];
+    tensor<fp16,[1,{self.C},1,{width+self.K-1}]> xs = slice_by_index(begin=tensor<int32,[4]>([0,0,0,{off}]),end=tensor<int32,[4]>([1,{self.C},1,{off+width+self.K-1}]),x=x)[name=string("xs")];
+    tensor<fp16,[1,{self.C},1,{width}]> c = conv(dilations=dl,groups=gc,pad=pd,pad_type=pt,strides=st,weight=cw,x=xs)[name=string("c")];
+    tensor<fp16,[1,{self.C},1,{width}]> nc = mul(x=c,y=fp16(-0x1p+0))[name=string("nc")];
+    tensor<fp16,[1,{self.C},1,{width}]> ec = exp(x=nc)[name=string("ec")];
+    tensor<fp16,[1,{self.C},1,{width}]> de = add(x=ec,y=fp16(0x1p+0))[name=string("de")];
+    tensor<fp16,[1,{self.C},1,{width}]> a = real_div(x=c,y=de)[name=string("a")];
+    tensor<fp16,[1,{2*P},1,{width}]> qk = slice_by_index(begin=tensor<int32,[4]>([0,0,0,0]),end=tensor<int32,[4]>([1,{2*P},1,{width}]),x=a)[name=string("qk")];
+    tensor<fp16,[1,{P},1,{width}]> vv = slice_by_index(begin=tensor<int32,[4]>([0,{2*P},0,0]),end=tensor<int32,[4]>([1,{3*P},1,{width}]),x=a)[name=string("vv")];
+    tensor<fp16,[1,{2*P},1,{width}]> sq = mul(x=qk,y=qk)[name=string("sq")];
+    tensor<fp16,[1,{2*H},1,{width}]> ss = conv(dilations=dl,groups=g2,pad=pd,pad_type=pt,strides=st,weight=og,x=sq)[name=string("ss")];
+    tensor<fp16,[1,{2*H},1,{width}]> se = add(x=ss,y=fp16(0x1p-24))[name=string("se")];
+    tensor<fp16,[1,{2*H},1,{width}]> sr = sqrt(x=se)[name=string("sr")];
+    tensor<fp16,[1,{2*P},1,{width}]> sb = conv(dilations=dl,groups=g2,pad=pd,pad_type=pt,strides=st,weight=rp,x=sr)[name=string("sb")];
+    tensor<fp16,[1,{2*P},1,{width}]> qn = real_div(x=qk,y=sb)[name=string("qn")];
+    tensor<fp16,[1,{2*P},1,{W}]> y = pad(mode=string("constant"),constant_val=fp16(0x0p+0),pad=tensor<int32,[8]>([0,0,0,0,0,0,0,{W-width}]),x=qn)[name=string("y")];
+    tensor<fp16,[1,{P},1,{W}]> y2 = pad(mode=string("constant"),constant_val=fp16(0x0p+0),pad=tensor<int32,[8]>([0,0,0,0,0,0,0,{W-width}]),x=vv)[name=string("y2")];
+  }} -> (y, y2);
+}}
+'''
+            cap = io.StringIO()
+            with contextlib.redirect_stdout(cap), contextlib.redirect_stderr(cap):
+                prog = driver.engine.compile_multiproc(mil, blobs, self.C, 2*P, W)
+            if prog is None:
+                raise RuntimeError(f"kda prepare layer {layer} failed:\n"
+                                   f"{cap.getvalue().strip()[-250:]}")
+            driver.engine._ensure_io(prog)
+            from pure_ane import _bind_secondary_output
+            orig = E._iosurface_alloc_size
+            E._iosurface_alloc_size = lambda n: orig(n // 32 * W)
+            surf, req = _bind_secondary_output(driver, prog, P)
+            E._iosurface_alloc_size = orig
+            driver.discard_compiler_files(prog)
+            self.progs[layer] = (prog, surf, req)
+        self.programs = len(self.progs)
+
+    def run(self, layer, qkv, history):
+        """qkv is [3P, T]; history is [3P, K-1]. Returns q, k, v as [T,H,D]."""
+        from pure_ane import _submit_bound
+        s, Win, K = self.spec, self.Win, self.K
+        H, D, P = s.heads, s.head_dim, self.P
+        T = qkv.shape[1]
+        off = 32 - (K - 1)
+        prog, surf, req = self.progs[layer]
+        with self.driver.view(prog._in_surf, (self.C, Win), np.float16) as d:
+            d[:] = 0
+            d[:, off:off + K - 1] = history
+            d[:, off + K - 1:off + K - 1 + T] = qkv[:, :T]
+        _submit_bound(self.driver, prog, req)
+        with self.driver.view(prog._out_surf, (2 * P, Win), np.float16) as o:
+            qk = np.array(o[:, :T], np.float32)
+        with self.driver.view(surf, (P, Win), np.float16) as o:
+            v = np.array(o[:, :T], np.float32)
+        return (qk[:P].T.reshape(T, H, D), qk[P:].T.reshape(T, H, D),
+                v.T.reshape(T, H, D))
