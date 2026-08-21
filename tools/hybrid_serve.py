@@ -485,45 +485,56 @@ class ReasoningStream:
         self.send_content = content_cb
         self.send_tool_call = tool_call_cb
         self.pending = ""
-        self.in_reasoning = enabled
+        self.in_reasoning = True  # Always parse reasoning tags to prevent leakage
         self.content_accum = ""
 
     def feed(self, delta: str):
-        if not self.enabled:
-            self.content_accum += delta
-            if "<tool_call>" not in self.content_accum:
-                self.send_content(delta)
-            return
         self.pending += delta
         if not self.in_reasoning:
-            self.content_accum += self.pending
+            # Strip any residual <think> or </think> tags
+            clean = self.pending.replace("<think>", "").replace("</think>", "")
+            self.content_accum += clean
             if "<tool_call>" not in self.content_accum:
-                self.send_content(self.pending)
+                self.send_content(clean)
             self.pending = ""
             return
+        
+        # We are inside reasoning
         end = self.pending.find(self.marker)
         if end >= 0:
-            if end > 0:
-                self.send_reasoning(self.pending[:end])
+            thought = self.pending[:end].replace("<think>", "")
+            if thought and self.enabled:
+                self.send_reasoning(thought)
             self.pending = self.pending[end + len(self.marker):]
             self.in_reasoning = False
             if self.pending:
-                self.content_accum += self.pending
+                clean = self.pending.replace("<think>", "").replace("</think>", "")
+                self.content_accum += clean
                 if "<tool_call>" not in self.content_accum:
-                    self.send_content(self.pending)
+                    self.send_content(clean)
             self.pending = ""
             return
+        
         safe = max(0, len(self.pending) - len(self.marker) + 1)
         if safe > 0:
-            self.send_reasoning(self.pending[:safe])
+            thought = self.pending[:safe].replace("<think>", "")
+            if thought and self.enabled:
+                self.send_reasoning(thought)
             self.pending = self.pending[safe:]
 
     def finish(self):
         if self.pending:
             if self.in_reasoning:
-                self.send_reasoning(self.pending)
+                thought = self.pending.replace("<think>", "").replace("</think>", "")
+                if thought and self.enabled:
+                    self.send_reasoning(thought)
+                elif thought and not self.enabled:
+                    pass  # Suppress thoughts when thinking is disabled
             else:
-                self.content_accum += self.pending
+                clean = self.pending.replace("<think>", "").replace("</think>", "")
+                self.content_accum += clean
+                if "<tool_call>" not in self.content_accum:
+                    self.send_content(clean)
             self.pending = ""
 
         # Parse any tool calls in accumulated content
