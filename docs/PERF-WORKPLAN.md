@@ -84,17 +84,29 @@ the server or TUI reports must come from a measured timer.
       decode (probes/test_mtp.cpp, MTP_EXACT=PASS); max_tokens cap honored
 - [x] Measured: accepted/step 1.8-2.0 at depth 2; net speedup ~0.98x (break-even)
 
-### Why break-even (measured, not guessed)
-- verify (3 lanes through 64 layers): 229-233 ms - barely more than one
-  1-lane step (tails are lane-parallel). This is the unit of progress.
-- draft (2 MTP forwards): ~25-50 ms - cheap enough.
-- partial-rejection rounds replay the proven prefix through the full stack:
-  another ~230 ms. At ~1/3 rejections per depth this consumes the gain.
-- The lever that flips this positive: pipelined ANE submission (layer N+1
-  submitted while N runs; the driver queue is 127 deep) which cuts the 229 ms
-  verify floor AND plain-decode latency alike. Next work item.
+### Decode economics (measured on the current verified build)
+- RINDI_DEBUG_TIMING decode forward: per layer core_ms=0.8 + tail_ms=2.7
+  (~3.5 ms) x 64 layers = ~224 ms/forward = ~4.5 tok/s decode. Layer 63
+  (no next-proj) tail_ms=2.1: the ~0.6 ms delta is next-proj GEM compute;
+  ~2.1 ms is the fused MLP tail on the NPU itself.
+- probes/ane_decode_budget.py: convolution ~174.6 ms/token (48%),
+  "everything else" ~186.4 ms (52%), per-dispatch submit floor only
+  0.091 ms x ~324 = ~29.4 ms (8% of the token budget).
+- CONCLUSION (revises prior plan): decode is ANE-COMPUTE-BOUND, not
+  submit-bound. Pipelined ANE submit recovers at most ~8% (the submit
+  floor), NOT the 229->120 ms hoped. The "pipelined submission" lever is
+  retired on evidence.
+- RINDI_ENABLE_METAL_TAIL=1 is much SLOWER than ANE (0.6 vs 4.5 tok/s).
+  The ANE fused tail is the right backend; do not chase the Metal GEM tail
+  as a decode speed-up.
+- REVERTED a failed optimization: per-lane checkpoint-replay (GDN
+  recurrence ckpts + arithmetic conv-window rebuild + adaptive depth) broke
+  MTP exactness (MTP_EXACT=FAIL, diverged at token 14). Restored verified
+  HEAD (MTP_EXACT=PASS, 0.93x). Reintroduce only with a per-token golden
+  replay test.
 
 ## Targets
-- decode ≥ 6 tok/s after P1+P2 (from ~4), ≥ 8-10 with P3 (lane occupancy)
-- prefill ≥ 150 tok/s @1-2K ctx after P2 (from ~40)
-- every reported number traceable to a timer in this repo
+- decode: ~4.5 tok/s measured now (was 4.0->4.3). Single forward near the
+  per-layer ANE floor; >6 needs concurrency, not submit-rate.
+- prefill >= 150 tok/s @1-2K ctx after P2 (from ~40)
+- every metric traceable to a timer in this repo (tools/bench_latency.py)
