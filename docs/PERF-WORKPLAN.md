@@ -105,6 +105,31 @@ the server or TUI reports must come from a measured timer.
   HEAD (MTP_EXACT=PASS, 0.93x). Reintroduce only with a per-token golden
   replay test.
 
+## P4 — Metal GEMM kernel — DONE, 3x, bit-exact (prefill still ANE-bound)
+- [x] Root cause: the batched prefill path (lanes>1) used the naive
+  gemm_int4_groupwise/rowwise: one thread per (row, lane) dots the full K
+  serially, so the 34836x5120 gate took ~16 ms vs MLX's ~0.6 ms on the same
+  GPU (gpu_saturate.py: full MLP int4 @ S=32 = 1.62 ms = ~0.5 ms/projection).
+  The old tiled kernel was dead code (no dispatch) AND was roWWise-layout,
+  not the groupwise the path actually hit.
+- [x] New gemm_int4_groupwise_batch + gemm_int4_rowwise_batched: one
+  threadgroup per output row; threads tile [lane, kpar]; W word loaded once
+  into threadgroup (kills the lanes-redundant re-read) and K split across a
+  power-of-two slice with an exact per-lane tree reduction.
+- [x] Wired in RindiAneProjection::metal_dispatch for lanes>1/offset==0
+  (env kill RINDI_DISABLE_BATCH_GEMM); folded next_proj (offset!=0) still
+  uses the offset kernels.
+- [x] CORRECTNESS: probes/test_metal_gemm_micro.cpp asserts bit-exact vs the
+  old kernel: groupwise mismatches=0/1114112 maxdiff=0;
+  rowwise-batched vs naive mismatches=0/557056. MTP_EXACT=PASS.
+- [x] SPEED: 15.9 -> 5.4 ms/call for the 34816x5120 gateways (3.0x),
+  tail_ms/layer 30 -> 18 ms, Metal prefill 12.6 -> 19.6 tok/s.
+- HONEST REMAINDER: Metal-tail prefill is now 19.6 tok/s vs ANE's ~71. The
+  K-parallel kernel still leaves 5.4 ms/call (MLX ~0.5 ms). Next lever is
+  2D row-tiling (one threadgroup cycles several output rows to amortize the
+  A load and cut the per-kernel grid to ~2ms), then a shared-K-load across
+  the group. Until that lands, ANE fused tails stay the prefill backend.
+
 ## Targets
 - decode: ~4.5 tok/s measured now (was 4.0->4.3). Single forward near the
   per-layer ANE floor; >6 needs concurrency, not submit-rate.
