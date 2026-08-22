@@ -86,7 +86,12 @@ bool RindiGdnRecurrence::compile_prepared(ANEContext* ctx, size_t heads,
     if (!input_surface_ || !output_surface_ || !state_surface_) return false;
     metal_ctx_ = shared_recurrence_metal_context();
     if (metal_ctx_) {
-        metal_state_ = metal_buffer_create(metal_ctx_, hidden_keys_ * value_dim_ * sizeof(uint16_t));
+        // One authoritative state store: the Metal buffer WRAPS the ANE
+        // output IOSurface, so the batched (Metal) and single-lane (ANE)
+        // recurrence paths read and write the same bytes. A separate buffer
+        // here silently forked state: prefill advanced the Metal copy while
+        // decode started every token from the untouched ANE surface.
+        metal_state_ = metal_buffer_from_iosurface(metal_ctx_, state_surface_);
         metal_decay_ = metal_buffer_create(metal_ctx_, heads_ * 32 * sizeof(uint16_t));
         metal_key_ = metal_buffer_create(metal_ctx_, hidden_keys_ * 32 * sizeof(uint16_t));
         metal_query_ = metal_buffer_create(metal_ctx_, hidden_keys_ * 32 * sizeof(uint16_t));
@@ -212,13 +217,32 @@ bool RindiGdnRecurrence::compile(ANEContext* ctx, size_t heads, size_t key_dim,
 
 void RindiGdnRecurrence::reset() {
     if (!state_surface_) return;
-    IOSurfaceLock(state_surface_, 0, nullptr);
-    std::memset(IOSurfaceGetBaseAddress(state_surface_), 0, hidden_keys_ * value_dim_ * 2);
-    IOSurfaceUnlock(state_surface_, 0, nullptr);
+    std::memset(IOSurfaceGetBaseAddress(state_surface_), 0,
+                hidden_keys_ * value_dim_ * 2);
     if (metal_state_) {
+        // metal_state_ aliases state_surface_; one clear covers both views.
         std::memset(metal_buffer_get_contents(metal_state_), 0,
                     hidden_keys_ * value_dim_ * sizeof(uint16_t));
     }
+}
+
+void RindiGdnRecurrence::snapshot_state(std::vector<uint16_t>& out) const {
+    out.resize(hidden_keys_ * value_dim_);
+    if (metal_state_) {
+        std::memcpy(out.data(), metal_buffer_get_contents(metal_state_),
+                    out.size() * sizeof(uint16_t));
+    } else {
+        std::memcpy(out.data(), IOSurfaceGetBaseAddress(state_surface_),
+                    out.size() * sizeof(uint16_t));
+    }
+}
+
+void RindiGdnRecurrence::restore_state(const std::vector<uint16_t>& in) {
+    if (in.size() != hidden_keys_ * value_dim_) return;
+    void* dst = metal_state_
+        ? metal_buffer_get_contents(metal_state_)
+        : IOSurfaceGetBaseAddress(state_surface_);
+    std::memcpy(dst, in.data(), in.size() * sizeof(uint16_t));
 }
 
 bool RindiGdnRecurrence::step_batch(const uint16_t* decay, const uint16_t* key,
@@ -255,16 +279,14 @@ bool RindiGdnRecurrence::step_batch(const uint16_t* decay, const uint16_t* key,
 
 bool RindiGdnRecurrence::step(const uint16_t* packed_inputs, std::vector<uint16_t>& output) {
     if (!request_ || !packed_inputs) return false;
-    IOSurfaceLock(input_surface_, 0, nullptr);
+    // Every byte of the input surface is written below (state block, prepared
+    // lanes, tail channels), so a full-surface memset here was dead work.
     uint16_t* dst = static_cast<uint16_t*>(IOSurfaceGetBaseAddress(input_surface_));
-    std::memset(dst, 0, input_channels_ * width_ * 2);
-    IOSurfaceLock(state_surface_, kIOSurfaceLockReadOnly, nullptr);
     const uint16_t* state = static_cast<const uint16_t*>(IOSurfaceGetBaseAddress(state_surface_));
     for (size_t c = 0; c < hidden_keys_; ++c) {
         std::memcpy(dst + c * width_, state + c * value_dim_,
                     value_dim_ * sizeof(uint16_t));
     }
-    IOSurfaceUnlock(state_surface_, kIOSurfaceLockReadOnly, nullptr);
     // The first HK rows contain recurrent state in columns [0,V), and the
     // prepared k/q/decay lanes in columns [V,W). Preserve both groups.
     for (size_t c = 0; c < hidden_keys_; ++c) {
@@ -274,19 +296,14 @@ bool RindiGdnRecurrence::step(const uint16_t* packed_inputs, std::vector<uint16_
     }
     std::memcpy(dst + hidden_keys_ * width_, packed_inputs + hidden_keys_ * width_,
                 (input_channels_ - hidden_keys_) * width_ * sizeof(uint16_t));
-    IOSurfaceUnlock(input_surface_, 0, nullptr);
     if (!ane_request_evaluate(ctx_, model_, request_, nullptr, 0, nullptr, 0)) return false;
     output.resize(heads_ * value_dim_);
-    IOSurfaceLock(output_surface_, kIOSurfaceLockReadOnly, nullptr);
     const uint16_t* output_base = static_cast<const uint16_t*>(IOSurfaceGetBaseAddress(output_surface_));
     std::memcpy(output.data(), output_base, output.size()*2);
-    IOSurfaceUnlock(output_surface_, kIOSurfaceLockReadOnly, nullptr);
     if (std::getenv("RINDI_DEBUG_GDN_RECURRENCE")) {
-        IOSurfaceLock(state_surface_, kIOSurfaceLockReadOnly, nullptr);
         const uint16_t* state_base = static_cast<const uint16_t*>(IOSurfaceGetBaseAddress(state_surface_));
         std::fprintf(stderr, "[RindiGdnRecurrence] y=%04x,%04x state=%04x,%04x\n",
                      output_base[0], output_base[1], state_base[0], state_base[1]);
-        IOSurfaceUnlock(state_surface_, kIOSurfaceLockReadOnly, nullptr);
     }
     return true;
 }

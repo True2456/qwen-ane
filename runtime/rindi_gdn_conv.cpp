@@ -60,19 +60,23 @@ void RindiGdnConv::reset() { std::fill(history_.begin(), history_.end(), 0); }
 bool RindiGdnConv::evaluate(const uint16_t* current, size_t lanes,
                             std::vector<uint16_t>& output) {
     if (!request_ || !current || lanes == 0 || lanes > width_ - 3) return false;
-    IOSurfaceLock(input_surface_, 0, nullptr);
     uint16_t* dst = static_cast<uint16_t*>(IOSurfaceGetBaseAddress(input_surface_));
-    std::memset(dst, 0, channels_ * width_ * sizeof(uint16_t));
+    // History [0,3) and the live lanes [3, 3+lanes) are fully rewritten every
+    // call. Columns beyond 3+lanes feed conv outputs that are never gathered,
+    // so a per-call full-surface memset is only needed when the lane count
+    // changes and would otherwise expose stale values in the read window.
+    if (written_lanes_ != lanes) {
+        std::memset(dst, 0, channels_ * width_ * sizeof(uint16_t));
+        written_lanes_ = lanes;
+    }
     for (size_t c = 0; c < channels_; ++c) {
         std::memcpy(dst + c * width_, history_.data() + c * 3,
                     3 * sizeof(uint16_t));
         std::memcpy(dst + c * width_ + 3, current + c * lanes,
                     lanes * sizeof(uint16_t));
     }
-    IOSurfaceUnlock(input_surface_, 0, nullptr);
     if (!ane_request_evaluate(ctx_, model_, request_, nullptr, 0, nullptr, 0)) return false;
     output.resize(channels_ * lanes);
-    IOSurfaceLock(output_surface_, kIOSurfaceLockReadOnly, nullptr);
     const uint16_t* src = static_cast<const uint16_t*>(IOSurfaceGetBaseAddress(output_surface_));
     // IOSurface tensors are channel-major: each channel owns a contiguous
     // width row.  The live decode lanes begin at column 3 after the causal
@@ -82,7 +86,6 @@ bool RindiGdnConv::evaluate(const uint16_t* current, size_t lanes,
                     src + c * width_ + 3,
                     lanes * sizeof(uint16_t));
     }
-    IOSurfaceUnlock(output_surface_, kIOSurfaceLockReadOnly, nullptr);
     // The IOSurface and `history_` are channel-major ([channel, time]), not
     // time-major ([time, channel]).  Shift each channel's causal window so a
     // multi-channel projection cannot become the next channel's history.

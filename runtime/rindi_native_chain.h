@@ -102,6 +102,7 @@ private:
         size_t projection_channels;
         size_t core_dim{0};
         size_t intermediate{0};
+        size_t written_lanes{0};   // lanes currently valid in input_surface
         bool attention{false};
         std::unique_ptr<MetalTail> metal_tail;
     };

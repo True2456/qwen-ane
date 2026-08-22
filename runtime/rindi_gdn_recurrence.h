@@ -23,6 +23,11 @@ public:
                    const uint16_t* beta, size_t lanes,
                    std::vector<uint16_t>& output);
     void reset();
+    // Byte-exact capture/rollback of the recurrent state (one shared store
+    // for the Metal and ANE execution paths).
+    void snapshot_state(std::vector<uint16_t>& out) const;
+    void restore_state(const std::vector<uint16_t>& in);
+    size_t state_elems() const { return hidden_keys_ * value_dim_; }
 
 private:
     bool compile_prepared(ANEContext* ctx, size_t heads, size_t key_dim,

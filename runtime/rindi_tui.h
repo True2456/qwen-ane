@@ -100,7 +100,17 @@ struct ServerConfig {
 class RindiTUI {
 public:
     using CommandHandler = std::function<std::string(const std::string& cmd, const std::string& args)>;
-    using ChatDispatchFn = std::function<void(const std::string& prompt, std::function<void(const std::string& token)> stream_cb)>;
+
+    // Real per-turn counters returned by the dispatcher. The TUI renders only
+    // these; it never estimates tokens or throughput itself.
+    struct ChatTurnStats {
+        size_t prompt_tokens{0};
+        size_t generated_tokens{0};
+        double ttft_ms{0.0};
+        double prefill_tps{0.0};
+        double decode_tps{0.0};
+    };
+    using ChatDispatchFn = std::function<ChatTurnStats(const std::string& prompt, std::function<void(const std::string& token)> stream_cb)>;
 
     RindiTUI(const ServerConfig& config = ServerConfig());
     ~RindiTUI();

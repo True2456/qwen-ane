@@ -163,6 +163,150 @@ bool RindiAneProjection::compile_chain_int4(
     return true;
 }
 
+bool RindiAneProjection::compile_bf16_metal(MetalContext* ctx,
+                                            const SafeTensorsLoader& loader,
+                                            const std::string& tensor_name) {
+    const TensorInfo* info = loader.get_tensor_info(tensor_name);
+    if (!ctx || !info || info->dtype != "BF16" || info->shape.size() != 2) return false;
+    const size_t rows = static_cast<size_t>(info->shape[0]);
+    const size_t cols = static_cast<size_t>(info->shape[1]);
+    if (rows == 0 || cols == 0 || info->nbytes != rows * cols * sizeof(uint16_t)) return false;
+    const void* data = loader.get_tensor_data(tensor_name);
+    if (!data) return false;
+    metal_ctx_ = ctx;
+    input_dim_ = cols;
+    output_dim_ = rows;
+    width_ = 32;
+    host_ready_ = false;
+    host_groupwise_ = false;
+    metal_ready_ = false;
+    metal_rowwise_ = false;
+    bf16_ready_ = true;
+    metal_weights_ = metal_buffer_create(ctx, info->nbytes);
+    metal_input_ = metal_buffer_create(ctx, cols * 32 * sizeof(uint16_t));
+    metal_output_ = metal_buffer_create(ctx, rows * 32 * sizeof(uint16_t));
+    if (!metal_weights_ || !metal_input_ || !metal_output_) {
+        bf16_ready_ = false;
+        return false;
+    }
+    std::memcpy(metal_buffer_get_contents(metal_weights_), data, info->nbytes);
+    metal_packed_cols_ = 0;
+    metal_groups_ = 0;
+    return true;
+}
+
+bool RindiAneProjection::compile_int4_from_bf16_fused(
+    MetalContext* ctx, const SafeTensorsLoader& loader,
+    const std::vector<std::pair<std::string, size_t>>& tensors) {
+    if (!ctx || tensors.empty()) return false;
+    size_t rows = 0, cols = 0;
+    for (const auto& t : tensors) {
+        const TensorInfo* info = loader.get_tensor_info(t.first);
+        if (!info || info->dtype != "BF16" || info->shape.size() != 2 ||
+            static_cast<size_t>(info->shape[0]) != t.second) return false;
+        if (cols == 0) cols = static_cast<size_t>(info->shape[1]);
+        else if (static_cast<size_t>(info->shape[1]) != cols) return false;
+        rows += t.second;
+    }
+    if (rows == 0 || cols == 0 || cols % 64 != 0) return false;
+    std::vector<uint16_t> joined(rows * cols);
+    size_t row_off = 0;
+    for (const auto& t : tensors) {
+        const void* data = loader.get_tensor_data(t.first);
+        if (!data) return false;
+        std::memcpy(joined.data() + row_off * cols, data,
+                    t.second * cols * sizeof(uint16_t));
+        row_off += t.second;
+    }
+    return compile_int4_from_bf16_rows(ctx, joined.data(), rows, cols);
+}
+
+bool RindiAneProjection::compile_int4_from_bf16(MetalContext* ctx,
+                                                const SafeTensorsLoader& loader,
+                                                const std::string& tensor_name) {
+    const TensorInfo* info = loader.get_tensor_info(tensor_name);
+    if (!ctx || !info || info->dtype != "BF16" || info->shape.size() != 2) return false;
+    const size_t rows = static_cast<size_t>(info->shape[0]);
+    const size_t cols = static_cast<size_t>(info->shape[1]);
+    if (rows == 0 || cols == 0 || cols % 64 != 0 ||
+        info->nbytes != rows * cols * sizeof(uint16_t)) return false;
+    const void* data = loader.get_tensor_data(tensor_name);
+    if (!data) return false;
+    return compile_int4_from_bf16_rows(ctx, data, rows, cols);
+}
+
+bool RindiAneProjection::compile_int4_from_bf16_rows(MetalContext* ctx,
+                                                     const void* data,
+                                                     size_t rows, size_t cols) {
+    if (rows == 0 || cols == 0 || cols % 64 != 0) return false;
+    const size_t groups = cols / 64;
+    std::vector<uint8_t> packed(rows * cols / 2);
+    std::vector<uint16_t> scales(rows * groups);
+    std::vector<uint16_t> biases(rows * groups);
+    const uint16_t* src = static_cast<const uint16_t*>(data);
+
+    auto bf = [](uint16_t bits) {
+        uint32_t v = static_cast<uint32_t>(bits) << 16;
+        float f; std::memcpy(&f, &v, 4); return f;
+    };
+    auto to_bf = [](float f) {
+        uint32_t b; std::memcpy(&b, &f, 4);
+        return static_cast<uint16_t>(b >> 16);
+    };
+    for (size_t r = 0; r < rows; ++r) {
+        const uint16_t* row = src + r * cols;
+        uint8_t* prow = packed.data() + r * cols / 2;
+        for (size_t g = 0; g < groups; ++g) {
+            float mn = 3.0e38f, mx = -3.0e38f;
+            for (size_t j = 0; j < 64; ++j) {
+                const float v = bf(row[g * 64 + j]);
+                mn = std::min(mn, v); mx = std::max(mx, v);
+            }
+            float scale = (mx - mn) / 15.0f;
+            if (!(scale > 0.0f)) scale = 1.0f;
+            scales[r * groups + g] = to_bf(scale);
+            biases[r * groups + g] = to_bf(mn);
+            const float inv = 1.0f / scale;
+            for (size_t j = 0; j < 64; ++j) {
+                const float v = bf(row[g * 64 + j]);
+                int q = static_cast<int>(std::lrint((v - mn) * inv));
+                q = std::max(0, std::min(15, q));
+                const size_t cidx = g * 64 + j;
+                if ((cidx & 1) == 0) prow[cidx / 2] = static_cast<uint8_t>(q & 0xF);
+                else prow[cidx / 2] |= static_cast<uint8_t>((q & 0xF) << 4);
+            }
+        }
+    }
+
+    metal_ctx_ = ctx;
+    input_dim_ = cols;
+    output_dim_ = rows;
+    width_ = 32;
+    host_ready_ = false;
+    host_groupwise_ = false;
+    metal_ready_ = true;
+    metal_rowwise_ = false;
+    bf16_ready_ = false;
+    metal_weights_ = metal_buffer_create(ctx, packed.size());
+    metal_scales_ = metal_buffer_create(ctx, scales.size() * sizeof(uint16_t));
+    metal_biases_ = metal_buffer_create(ctx, biases.size() * sizeof(uint16_t));
+    metal_input_ = metal_buffer_create(ctx, cols * 32 * sizeof(uint16_t));
+    metal_output_ = metal_buffer_create(ctx, rows * 32 * sizeof(uint16_t));
+    if (!metal_weights_ || !metal_scales_ || !metal_biases_ ||
+        !metal_input_ || !metal_output_) {
+        metal_ready_ = false;
+        return false;
+    }
+    std::memcpy(metal_buffer_get_contents(metal_weights_), packed.data(), packed.size());
+    std::memcpy(metal_buffer_get_contents(metal_scales_), scales.data(),
+                scales.size() * sizeof(uint16_t));
+    std::memcpy(metal_buffer_get_contents(metal_biases_), biases.data(),
+                biases.size() * sizeof(uint16_t));
+    metal_packed_cols_ = cols / 8;
+    metal_groups_ = groups;
+    return true;
+}
+
 bool RindiAneProjection::init_metal_int4(const SafeTensorsLoader& loader,
                                          const std::string& tensor_name) {
     const TensorInfo* info = loader.get_tensor_info(tensor_name);
@@ -282,16 +426,52 @@ bool RindiAneProjection::compile_int4(ANEContext* ctx, const SafeTensorsLoader& 
 bool RindiAneProjection::evaluate(const uint16_t* input, size_t lanes,
                                   std::vector<uint16_t>& output) {
     if (!ready() || !input || lanes == 0 || lanes > width_) return false;
+    if (bf16_ready_ && lanes <= 32) {
+        // gemm_bf16 reads A as fp16 [M=lanes, K] row-major while callers pass
+        // channel-major [K, lanes]; they coincide at lanes == 1.
+        uint16_t* staged = static_cast<uint16_t*>(metal_buffer_get_contents(metal_input_));
+        if (lanes == 1) {
+            std::memcpy(staged, input, input_dim_ * sizeof(uint16_t));
+        } else {
+            for (size_t c = 0; c < input_dim_; ++c)
+                for (size_t l = 0; l < lanes; ++l)
+                    staged[l * input_dim_ + c] = input[c * lanes + l];
+        }
+        MetalCommandBufferHandle cmd = metal_command_buffer_create(metal_ctx_);
+        if (!cmd) return false;
+        metal_dispatch_gemm_bf16(metal_ctx_, cmd, metal_input_, metal_weights_,
+                                 metal_output_, static_cast<int>(lanes),
+                                 static_cast<int>(output_dim_),
+                                 static_cast<int>(input_dim_));
+        metal_command_buffer_commit(cmd);
+        metal_command_buffer_wait(cmd);
+        output.resize(output_dim_ * lanes);
+        std::memcpy(output.data(), metal_buffer_get_contents(metal_output_),
+                    output.size() * sizeof(uint16_t));
+        return true;
+    }
     if (metal_ready_ && lanes <= 32) {
         std::memcpy(metal_buffer_get_contents(metal_input_), input,
                     input_dim_ * lanes * sizeof(uint16_t));
         MetalCommandBufferHandle cmd = metal_command_buffer_create(metal_ctx_);
         if (cmd) {
-            metal_dispatch_gemm_int4_groupwise(
-                metal_ctx_, cmd, metal_input_, metal_weights_, metal_scales_,
-                metal_biases_, metal_output_, static_cast<int>(output_dim_),
-                static_cast<int>(input_dim_), static_cast<int>(metal_packed_cols_),
-                static_cast<int>(metal_groups_), static_cast<int>(lanes));
+            if (lanes == 1 && !metal_rowwise_) {
+                // K-parallel GEMV: orders of magnitude faster than the
+                // per-(row,lane) kernel at one lane.
+                metal_dispatch_gemv_int4_groupwise(
+                    metal_ctx_, cmd, metal_weights_, metal_scales_,
+                    metal_biases_, metal_input_, metal_output_,
+                    static_cast<uint32_t>(output_dim_),
+                    static_cast<uint32_t>(metal_packed_cols_),
+                    static_cast<uint32_t>(input_dim_),
+                    static_cast<uint32_t>(metal_groups_));
+            } else {
+                metal_dispatch_gemm_int4_groupwise(
+                    metal_ctx_, cmd, metal_input_, metal_weights_, metal_scales_,
+                    metal_biases_, metal_output_, static_cast<int>(output_dim_),
+                    static_cast<int>(input_dim_), static_cast<int>(metal_packed_cols_),
+                    static_cast<int>(metal_groups_), static_cast<int>(lanes));
+            }
             metal_command_buffer_commit(cmd);
             metal_command_buffer_wait(cmd);
             output.resize(output_dim_ * lanes);

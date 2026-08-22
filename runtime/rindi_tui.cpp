@@ -654,14 +654,13 @@ void RindiTUI::run_interactive_loop(CommandHandler cmd_handler, ChatDispatchFn c
                     in_chat_stream_.store(true);
                     auto t0 = std::chrono::high_resolution_clock::now();
                     record_request_start();
-                    size_t prompt_tokens = std::max((size_t)1, prompt.size() / 4 + 2);
                     std::string full_response = "";
                     size_t gen_tokens = 0;
                     auto t_first = std::chrono::high_resolution_clock::now();
                     bool first_token = true;
                     double ttft_ms = 0.0;
 
-                    chat_fn(prompt, [this, &full_response, &gen_tokens, &first_token, &t0, &ttft_ms](const std::string& token) {
+                    const ChatTurnStats stats = chat_fn(prompt, [this, &full_response, &gen_tokens, &first_token, &t0, &ttft_ms](const std::string& token) {
                         if (first_token) {
                             auto t_now = std::chrono::high_resolution_clock::now();
                             ttft_ms = std::chrono::duration<double, std::milli>(t_now - t0).count();
@@ -672,11 +671,20 @@ void RindiTUI::run_interactive_loop(CommandHandler cmd_handler, ChatDispatchFn c
                         record_request_chunk(1);
                     });
 
+                    // Prefer the engine's measured counters; the callback-side
+                    // TTFT is the fallback when the engine did not sample.
+                    const size_t prompt_tokens = stats.prompt_tokens;
+                    const size_t reported_gen = stats.generated_tokens > gen_tokens ? stats.generated_tokens : gen_tokens;
                     auto t1 = std::chrono::high_resolution_clock::now();
-                    double total_decode_sec = std::chrono::duration<double>(t1 - t_first).count();
-                    double decode_tps = total_decode_sec > 0.0 ? (gen_tokens / total_decode_sec) : 0.0;
-                    size_t tokens_saved = prompt_tokens > 4 ? prompt_tokens / 2 : 0;
-                    record_request_end(prompt_tokens, gen_tokens, ttft_ms, decode_tps, 2850.0, tokens_saved > 0, tokens_saved);
+                    double decode_window_ms = std::chrono::duration<double, std::milli>(t1 - t_first).count();
+                    double decode_tps = stats.decode_tps;
+                    if (decode_tps <= 0.0 && gen_tokens > 1 && decode_window_ms > 0.0)
+                        decode_tps = static_cast<double>(gen_tokens - 1) * 1000.0 / decode_window_ms;
+                    record_request_end(prompt_tokens, reported_gen,
+                                       ttft_ms > 0.0 ? ttft_ms : stats.ttft_ms,
+                                       decode_tps,
+                                       stats.prefill_tps,
+                                       false, 0);
                     in_chat_stream_.store(false);
 
                     log("Assistant: " + full_response, "ANE");
@@ -781,20 +789,13 @@ void RindiTUI::run_interactive_loop(CommandHandler cmd_handler, ChatDispatchFn c
                         auto t0 = std::chrono::high_resolution_clock::now();
                         record_request_start();
 
-                        size_t prompt_tokens = std::max((size_t)1, prompt.size() / 4 + 2);
-                        auto t_pref_start = std::chrono::high_resolution_clock::now();
-                        std::this_thread::sleep_for(std::chrono::microseconds(std::max((int)(prompt_tokens * 1000 / 950), 2)));
-                        auto t_pref_end = std::chrono::high_resolution_clock::now();
-                        double prefill_sec = std::chrono::duration<double>(t_pref_end - t_pref_start).count();
-                        double prefill_tps = prefill_sec > 0.0 ? (prompt_tokens / prefill_sec) : 0.0;
-
                         std::string full_response = "";
                         size_t gen_tokens = 0;
                         auto t_first = std::chrono::high_resolution_clock::now();
                         bool first_token = true;
                         double ttft_ms = 0.0;
 
-                        chat_fn(prompt, [this, &full_response, &gen_tokens, &first_token, &t0, &ttft_ms](const std::string& token) {
+                        const ChatTurnStats stats = chat_fn(prompt, [this, &full_response, &gen_tokens, &first_token, &t0, &ttft_ms](const std::string& token) {
                             if (first_token) {
                                 auto t_now = std::chrono::high_resolution_clock::now();
                                 ttft_ms = std::chrono::duration<double, std::milli>(t_now - t0).count();
@@ -805,14 +806,19 @@ void RindiTUI::run_interactive_loop(CommandHandler cmd_handler, ChatDispatchFn c
                             record_request_chunk(1);
                         });
 
+                        // All counters come from the engine's measured timers.
+                        const size_t prompt_tokens = stats.prompt_tokens;
+                        const size_t reported_gen = stats.generated_tokens > gen_tokens ? stats.generated_tokens : gen_tokens;
                         auto t1 = std::chrono::high_resolution_clock::now();
-                        double total_decode_sec = std::chrono::duration<double>(t1 - t_first).count();
-                        double decode_tps = total_decode_sec > 0.0 ? (gen_tokens / total_decode_sec) : 0.0;
+                        double decode_window_ms = std::chrono::duration<double, std::milli>(t1 - t_first).count();
+                        double decode_tps = stats.decode_tps;
+                        if (decode_tps <= 0.0 && gen_tokens > 1 && decode_window_ms > 0.0)
+                            decode_tps = static_cast<double>(gen_tokens - 1) * 1000.0 / decode_window_ms;
+                        const double total_decode_sec = decode_window_ms / 1000.0;
 
-                        size_t tokens_saved = prompt_tokens > 4 ? prompt_tokens / 2 : 0;
-                        bool apc_hit = tokens_saved > 0;
-
-                        record_request_end(prompt_tokens, gen_tokens, ttft_ms, decode_tps, prefill_tps, apc_hit, tokens_saved);
+                        record_request_end(prompt_tokens, reported_gen,
+                                           ttft_ms > 0.0 ? ttft_ms : stats.ttft_ms,
+                                           decode_tps, stats.prefill_tps, false, 0);
                         in_chat_stream_.store(false);
 
                         log("Assistant: " + full_response, "ANE");

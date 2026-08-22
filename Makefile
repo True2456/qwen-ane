@@ -23,6 +23,7 @@ OBJS = \
 	$(RUNTIME_DIR)/bpe_tokenizer.o \
 	$(RUNTIME_DIR)/rindi_engine.o \
 	$(RUNTIME_DIR)/rindi_tui.o \
+	$(RUNTIME_DIR)/rindi_mtp.o \
 	$(RUNTIME_DIR)/rindi_c_api.o
 
 TARGETS = \
@@ -30,7 +31,7 @@ TARGETS = \
 	$(RUNTIME_DIR)/librindi_native.dylib \
 	$(RUNTIME_DIR)/rindi-server
 
-.PHONY: all clean test-cpp-safetensors test-ane-bridge test-ane-projection test-ane-int4-projection test-gdn-state test-gdn-conv test-gdn-recurrence test-gdn-layer test-attention test-engine-sampling test-native-generate test-ane-multi-output test-ane-artifact-load
+.PHONY: all clean test-cpp-safetensors test-ane-bridge test-ane-projection test-ane-int4-projection test-gdn-state test-gdn-conv test-gdn-recurrence test-gdn-layer test-attention test-metal-attention test-mtp test-engine-sampling test-native-generate test-ane-multi-output test-ane-artifact-load
 
 all: $(TARGETS)
 
@@ -70,6 +71,14 @@ test-attention: probes/test_attention.cpp runtime/rindi_attention.o runtime/rind
 	$(CXX) $(CXXFLAGS) -I. $< runtime/rindi_attention.o runtime/rindi_ane_projection.o runtime/ane_c_bridge.o runtime/metal_engine.o $(FRAMEWORKS) -o /tmp/rindi-test-attention
 	/tmp/rindi-test-attention
 
+test-mtp: probes/test_mtp.cpp $(OBJS)
+	$(CXX) $(CXXFLAGS) -I. $< $(OBJS) $(FRAMEWORKS) -o /tmp/rindi-test-mtp
+	/tmp/rindi-test-mtp
+
+test-metal-attention: probes/test_metal_attention.cpp runtime/rindi_attention.o runtime/rindi_ane_projection.o runtime/ane_c_bridge.o runtime/metal_engine.o
+	$(CXX) $(CXXFLAGS) -I. $< runtime/rindi_attention.o runtime/rindi_ane_projection.o runtime/ane_c_bridge.o runtime/metal_engine.o $(FRAMEWORKS) -o /tmp/rindi-test-metal-attention
+	/tmp/rindi-test-metal-attention
+
 test-engine-sampling: probes/test_engine_sampling.cpp $(OBJS)
 	$(CXX) $(CXXFLAGS) -I. $< $(OBJS) $(FRAMEWORKS) -o /tmp/rindi-test-engine-sampling
 	/tmp/rindi-test-engine-sampling
@@ -82,8 +91,8 @@ test-ane-multi-output: probes/test_ane_multi_output.cpp runtime/ane_c_bridge.o r
 	$(CXX) $(CXXFLAGS) -I. $< runtime/ane_c_bridge.o runtime/metal_engine.o $(FRAMEWORKS) -o /tmp/rindi-test-ane-multi-output
 	/tmp/rindi-test-ane-multi-output
 
-test-ane-artifact-load: probes/test_ane_artifact_load.cpp $(RUNTIME_DIR)/rindi_native_chain.o $(RUNTIME_DIR)/ane_c_bridge.o $(RUNTIME_DIR)/metal_engine.o
-	$(CXX) $(CXXFLAGS) -I. $< $(RUNTIME_DIR)/rindi_native_chain.o $(RUNTIME_DIR)/ane_c_bridge.o $(RUNTIME_DIR)/metal_engine.o $(FRAMEWORKS) -o /tmp/rindi-test-ane-artifact-load
+test-ane-artifact-load: probes/test_ane_artifact_load.cpp $(RUNTIME_DIR)/rindi_native_chain.o $(RUNTIME_DIR)/rindi_mtp.o $(RUNTIME_DIR)/ane_c_bridge.o $(RUNTIME_DIR)/metal_engine.o
+	$(CXX) $(CXXFLAGS) -I. $< $(RUNTIME_DIR)/rindi_native_chain.o $(RUNTIME_DIR)/rindi_mtp.o $(RUNTIME_DIR)/ane_c_bridge.o $(RUNTIME_DIR)/metal_engine.o $(FRAMEWORKS) -o /tmp/rindi-test-ane-artifact-load
 	/tmp/rindi-test-ane-artifact-load
 
 $(RUNTIME_DIR)/ane_c_bridge.o: $(RUNTIME_DIR)/ane_c_bridge.m $(RUNTIME_DIR)/ane_c_bridge.h
@@ -122,6 +131,9 @@ $(RUNTIME_DIR)/rindi_engine.o: $(RUNTIME_DIR)/rindi_engine.cpp $(RUNTIME_DIR)/ri
 $(RUNTIME_DIR)/rindi_tui.o: $(RUNTIME_DIR)/rindi_tui.cpp $(RUNTIME_DIR)/rindi_tui.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(RUNTIME_DIR)/rindi_mtp.o: $(RUNTIME_DIR)/rindi_mtp.cpp $(RUNTIME_DIR)/rindi_mtp.h $(RUNTIME_DIR)/rindi_attention.h
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 $(RUNTIME_DIR)/rindi_c_api.o: $(RUNTIME_DIR)/rindi_c_api.cpp $(RUNTIME_DIR)/rindi_c_api.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
@@ -131,7 +143,7 @@ $(RUNTIME_DIR)/rindi_server.o: $(RUNTIME_DIR)/rindi_server.cpp $(RUNTIME_DIR)/ri
 $(RUNTIME_DIR)/libmetal_engine.dylib: $(RUNTIME_DIR)/metal_engine.o
 	$(CC) -dynamiclib -O3 $^ $(FRAMEWORKS) -o $@
 
-$(RUNTIME_DIR)/librindi_native.dylib: $(RUNTIME_DIR)/ane_c_bridge.o $(RUNTIME_DIR)/metal_engine.o $(RUNTIME_DIR)/rindi_native_chain.o $(RUNTIME_DIR)/rindi_ane_projection.o $(RUNTIME_DIR)/rindi_gdn_state.o $(RUNTIME_DIR)/rindi_gdn_layer.o $(RUNTIME_DIR)/rindi_gdn_conv.o $(RUNTIME_DIR)/rindi_gdn_recurrence.o $(RUNTIME_DIR)/rindi_attention.o $(RUNTIME_DIR)/bpe_tokenizer.o $(RUNTIME_DIR)/rindi_engine.o $(RUNTIME_DIR)/rindi_c_api.o
+$(RUNTIME_DIR)/librindi_native.dylib: $(RUNTIME_DIR)/ane_c_bridge.o $(RUNTIME_DIR)/metal_engine.o $(RUNTIME_DIR)/rindi_native_chain.o $(RUNTIME_DIR)/rindi_ane_projection.o $(RUNTIME_DIR)/rindi_gdn_state.o $(RUNTIME_DIR)/rindi_gdn_layer.o $(RUNTIME_DIR)/rindi_gdn_conv.o $(RUNTIME_DIR)/rindi_gdn_recurrence.o $(RUNTIME_DIR)/rindi_attention.o $(RUNTIME_DIR)/rindi_mtp.o $(RUNTIME_DIR)/bpe_tokenizer.o $(RUNTIME_DIR)/rindi_engine.o $(RUNTIME_DIR)/rindi_c_api.o
 	$(CXX) -dynamiclib -O3 $^ $(FRAMEWORKS) -o $@
 
 $(RUNTIME_DIR)/rindi-server: $(OBJS) $(RUNTIME_DIR)/rindi_server.o

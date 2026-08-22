@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 class RindiAneProjection {
@@ -32,6 +33,24 @@ public:
     bool compile_chain_int4(MetalContext* ctx, const std::string& weights_path,
                             const std::string& scales_path, size_t input_dim,
                             size_t output_dim);
+    // Direct BF16 projection on Metal (gemm_bf16) for unquantized tensors
+    // such as the MTP draft block. evaluate() runs one command buffer.
+    bool compile_bf16_metal(MetalContext* ctx, const SafeTensorsLoader& loader,
+                            const std::string& tensor_name);
+    bool bf16_ready() const { return bf16_ready_; }
+    // Quantize an unquantized BF16 checkpoint tensor to the groupwise int4
+    // format at load time and run it on the fast groupwise Metal kernel.
+    // Per 64-column group: scale=(max-min)/15, bias=min, q in [0,15].
+    bool compile_int4_from_bf16(MetalContext* ctx,
+                                const SafeTensorsLoader& loader,
+                                const std::string& tensor_name);
+    bool compile_int4_from_bf16_rows(MetalContext* ctx, const void* data,
+                                     size_t rows, size_t cols);
+    // Row-concatenated variant: quantizes each named tensor independently and
+    // packs the rows into one projection (e.g. fused q/k/v or gate/up).
+    bool compile_int4_from_bf16_fused(
+        MetalContext* ctx, const SafeTensorsLoader& loader,
+        const std::vector<std::pair<std::string, size_t>>& tensors);
     bool evaluate(const uint16_t* input, size_t lanes,
                   std::vector<uint16_t>& output);
     bool metal_dispatch(MetalContext* ctx, MetalCommandBufferHandle cmd,
@@ -42,7 +61,7 @@ public:
     size_t input_dim() const { return input_dim_; }
     size_t output_dim() const { return output_dim_; }
     size_t width() const { return width_; }
-    bool ready() const { return host_ready_ || (model_ && request_); }
+    bool ready() const { return host_ready_ || bf16_ready_ || metal_ready_ || (model_ && request_); }
 
 private:
     bool init_metal_int4(const SafeTensorsLoader& loader,
@@ -64,6 +83,7 @@ private:
     bool host_groupwise_{false};
     bool metal_ready_{false};
     bool metal_rowwise_{false};
+    bool bf16_ready_{false};
     MetalContext* metal_ctx_{nullptr};
     MetalBufferHandle metal_weights_{nullptr};
     MetalBufferHandle metal_scales_{nullptr};

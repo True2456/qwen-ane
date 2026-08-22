@@ -530,6 +530,150 @@ static const char* kDefaultShadersSource =
 "        }\n"
 "    }\n"
 "    out_tokens[seq_idx] = best_tok;\n"
+"}\n"
+"\n"
+"// ============================================================================\n"
+"// Decode/prefill attention core: scores -> softmax -> P*V over a resident\n"
+"// KV cache. Q rows are pre-normalized/RoPE'd by the host; K/V caches are\n"
+"// [capacity, HK*D] fp16, shared by decode (lanes=1) and prefill batches.\n"
+"// ============================================================================\n"
+"// Lane-1 (GEMV) groupwise int4 matvec: one threadgroup per output row,\n"
+"// threads stride the packed K dimension 8 nibbles at a time, then a tree\n"
+"// reduction. Coalesced uint loads, weights read exactly once.\n"
+"kernel void gemv_int4_groupwise(\n"
+"    device const uint*   W     [[buffer(0)]],   // [rows, packed_cols]\n"
+"    device const ushort* S     [[buffer(1)]],   // bf16 scales [rows*groups]\n"
+"    device const ushort* B     [[buffer(2)]],   // bf16 biases\n"
+"    device const half*   x     [[buffer(3)]],   // [K]\n"
+"    device half*         y     [[buffer(4)]],   // [rows]\n"
+"    constant uint& packed_cols [[buffer(5)]],\n"
+"    constant uint& K           [[buffer(6)]],\n"
+"    constant uint& groups      [[buffer(7)]],\n"
+"    uint row [[threadgroup_position_in_grid]],\n"
+"    uint tid [[thread_index_in_threadgroup]],\n"
+"    uint tg  [[threads_per_threadgroup]],\n"
+"    threadgroup float* shared [[threadgroup(0)]]) {\n"
+"    device const uint* wrow = W + (size_t)row * packed_cols;\n"
+"    float acc = 0.0f;\n"
+"    for (uint c8 = tid; c8 < packed_cols; c8 += tg) {\n"
+"        const uint word = wrow[c8];\n"
+"        const uint base = c8 * 8u;\n"
+"        const float s = float(as_type<float>(uint(S[row * groups + base / 64u]) << 16));\n"
+"        const float b = float(as_type<float>(uint(B[row * groups + base / 64u]) << 16));\n"
+"        #pragma unroll\n"
+"        for (uint j = 0; j < 8u; ++j) {\n"
+"            const uint q = (word >> (j * 4u)) & 0xfu;\n"
+"            acc += float(x[base + j]) * (float(q) * s + b);\n"
+"        }\n"
+"    }\n"
+"    shared[tid] = acc;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    for (uint off = tg / 2u; off > 0u; off >>= 1u) {\n"
+"        if (tid < off) shared[tid] += shared[tid + off];\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    }\n"
+"    if (tid == 0u) y[row] = half(shared[0]);\n"
+"}\n"
+"\n"
+"kernel void attn_scores_fp16(\n"
+
+"    device const half*  q         [[buffer(0)]],  // [lanes*HQ*D]\n"
+"    device const half*  k_cache   [[buffer(1)]],  // [cap*HK*D]\n"
+"    device float*       scores    [[buffer(2)]],  // [lanes*HQ*cap]\n"
+"    constant uint&      base_pos  [[buffer(3)]],\n"
+"    constant uint&      kv_len    [[buffer(4)]],  // base_pos + lanes\n"
+"    constant uint&      cap       [[buffer(5)]],  // cache capacity == score stride\n"
+"    constant uint&      heads_q   [[buffer(6)]],\n"
+"    constant uint&      heads_kv  [[buffer(7)]],\n"
+"    constant uint&      dim       [[buffer(8)]],\n"
+"    uint3               pos       [[thread_position_in_grid]] // x: t, y: head, z: lane\n"
+") {\n"
+"    uint t = pos.x;\n"
+"    uint h = pos.y;\n"
+"    uint lane = pos.z;\n"
+"    if (t >= kv_len || t > base_pos + lane) return; // causal mask\n"
+"    uint kh = h / (heads_q / heads_kv);\n"
+"    device const half* qp = q + ((size_t)lane * heads_q + h) * dim;\n"
+"    device const half* kp = k_cache + ((size_t)t * heads_kv + kh) * dim;\n"
+"    float acc = 0.0f;\n"
+"    for (uint d = 0; d < dim; ++d) acc += float(qp[d]) * float(kp[d]);\n"
+"    scores[((size_t)lane * heads_q + h) * cap + t] = acc * rsqrt(float(dim));\n"
+"}\n"
+"\n"
+"kernel void attn_softmax_fp16(\n"
+"    device const float* scores   [[buffer(0)]],  // [rows*cap], rows = lanes*HQ\n"
+"    device float*       probs    [[buffer(1)]],\n"
+"    constant uint&      base_pos [[buffer(2)]],\n"
+"    constant uint&      cap      [[buffer(3)]],\n"
+"    constant uint&      heads_q  [[buffer(4)]],\n"
+"    uint2               pos      [[thread_position_in_grid]],  // x: tid, y: row\n"
+"    uint                tid      [[thread_index_in_threadgroup]],\n"
+"    uint2               tg       [[threads_per_threadgroup]],\n"
+"    threadgroup float*  shared   [[threadgroup(0)]]\n"
+") {\n"
+"    const uint row = pos.y;\n"
+"    const uint lane = row / heads_q;\n"
+"    const uint limit = base_pos + lane + 1;\n"
+"    device const float* s = scores + (size_t)row * cap;\n"
+"    device float* p = probs + (size_t)row * cap;\n"
+"    float local_max = -1e30f;\n"
+"    for (uint t = tid; t < limit; t += tg.x) {\n"
+"        local_max = max(local_max, s[t]);\n"
+"    }\n"
+"    shared[tid] = local_max;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    for (uint off = tg.x / 2; off > 0; off >>= 1) {\n"
+"        if (tid < off) shared[tid] = max(shared[tid], shared[tid + off]);\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    }\n"
+"    const float m = shared[0];\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    float local_sum = 0.0f;\n"
+"    for (uint t = tid; t < limit; t += tg.x) {\n"
+"        float e = exp(s[t] - m);\n"
+"        p[t] = e;\n"
+"        local_sum += e;\n"
+"    }\n"
+"    shared[tid] = local_sum;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    for (uint off = tg.x / 2; off > 0; off >>= 1) {\n"
+"        if (tid < off) shared[tid] += shared[tid + off];\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    }\n"
+"    const float inv_total = 1.0f / shared[0];\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    for (uint t = tid; t < limit; t += tg.x) {\n"
+"        p[t] *= inv_total;\n"
+"    }\n"
+"}\n"
+"\n"
+"kernel void attn_pv_fp16(\n"
+"    device const float* probs   [[buffer(0)]],  // [lanes*HQ*cap]\n"
+"    device const half*  v_cache [[buffer(1)]],  // [cap*HK*D]\n"
+"    device half*        out     [[buffer(2)]],  // [lanes*HQ*D]\n"
+"    constant uint&      base_pos [[buffer(3)]],\n"
+"    constant uint&      cap     [[buffer(4)]],\n"
+"    constant uint&      heads_q [[buffer(5)]],\n"
+"    constant uint&      heads_kv [[buffer(6)]],\n"
+"    constant uint&      dim     [[buffer(7)]],\n"
+"    uint3               pos     [[thread_position_in_grid]] // x: dtile(64), y: head, z: lane\n"
+") {\n"
+"    const uint d0 = pos.x * 64;\n"
+"    const uint h = pos.y;\n"
+"    const uint lane = pos.z;\n"
+"    if (d0 >= dim) return;\n"
+"    const uint limit = base_pos + lane + 1;\n"
+"    const uint kh = h / (heads_q / heads_kv);\n"
+"    float acc[64];\n"
+"    for (uint i = 0; i < 64; ++i) acc[i] = 0.0f;\n"
+"    device const float* p = probs + ((size_t)lane * heads_q + h) * cap;\n"
+"    for (uint t = 0; t < limit; ++t) {\n"
+"        const float w = p[t];\n"
+"        device const half* vp = v_cache + ((size_t)t * heads_kv + kh) * dim + d0;\n"
+"        for (uint i = 0; i < 64; ++i) acc[i] += w * float(vp[i]);\n"
+"    }\n"
+"    device half* op = out + ((size_t)lane * heads_q + h) * dim + d0;\n"
+"    for (uint i = 0; i < 64; ++i) op[i] = half(acc[i]);\n"
 "}\n";
 
 MetalContext* metal_context_create(void) {
@@ -1346,6 +1490,122 @@ void metal_dispatch_argmax_fp16(
     MTLSize threadsPerGrid = MTLSizeMake((B + 31) / 32 * 32, 1, 1);
     MTLSize threadsPerGroup = MTLSizeMake(32, 1, 1);
     [encoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerGroup];
+    [encoder endEncoding];
+    [pool release];
+}
+
+
+/* ========================================================================= */
+/* Attention core dispatches (scores -> softmax -> P*V)                       */
+/* ========================================================================= */
+
+void metal_dispatch_attn_scores_fp16(
+    MetalContext* ctx, MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle q_buf, MetalBufferHandle k_cache,
+    MetalBufferHandle scores_buf,
+    uint32_t base_pos, uint32_t kv_len, uint32_t lanes, uint32_t cap,
+    uint32_t heads_q, uint32_t heads_kv, uint32_t dim) {
+    if (!ctx || !cmd_buf || !q_buf || !k_cache || !scores_buf) return;
+    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+    id<MTLComputePipelineState> pipeline =
+        (id<MTLComputePipelineState>)metal_get_pipeline(ctx, "attn_scores_fp16");
+    if (!pipeline) { [pool release]; return; }
+    id<MTLComputeCommandEncoder> encoder =
+        [(id<MTLCommandBuffer>)cmd_buf computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:(id<MTLBuffer>)q_buf offset:0 atIndex:0];
+    [encoder setBuffer:(id<MTLBuffer>)k_cache offset:0 atIndex:1];
+    [encoder setBuffer:(id<MTLBuffer>)scores_buf offset:0 atIndex:2];
+    const uint32_t vals[] = {base_pos, kv_len, cap, heads_q, heads_kv, dim};
+    for (NSUInteger i = 0; i < 6; ++i)
+        [encoder setBytes:&vals[i] length:sizeof(uint32_t) atIndex:3 + i];
+    MTLSize grid = MTLSizeMake(kv_len, heads_q, lanes);
+    MTLSize group = MTLSizeMake(MIN(kv_len, 256u), 1, 1);
+    [encoder dispatchThreads:grid threadsPerThreadgroup:group];
+    [encoder endEncoding];
+    [pool release];
+}
+
+void metal_dispatch_attn_softmax_fp16(
+    MetalContext* ctx, MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle scores_buf, MetalBufferHandle probs_buf,
+    uint32_t rows, uint32_t base_pos, uint32_t cap, uint32_t heads_q) {
+    if (!ctx || !cmd_buf || !scores_buf || !probs_buf) return;
+    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+    id<MTLComputePipelineState> pipeline =
+        (id<MTLComputePipelineState>)metal_get_pipeline(ctx, "attn_softmax_fp16");
+    if (!pipeline) { [pool release]; return; }
+    id<MTLComputeCommandEncoder> encoder =
+        [(id<MTLCommandBuffer>)cmd_buf computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:(id<MTLBuffer>)scores_buf offset:0 atIndex:0];
+    [encoder setBuffer:(id<MTLBuffer>)probs_buf offset:0 atIndex:1];
+    const uint32_t vals[] = {base_pos, cap, heads_q};
+    for (NSUInteger i = 0; i < 3; ++i)
+        [encoder setBytes:&vals[i] length:sizeof(uint32_t) atIndex:2 + i];
+    [encoder setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
+    MTLSize grid = MTLSizeMake(256, rows, 1);
+    MTLSize group = MTLSizeMake(256, 1, 1);
+    [encoder dispatchThreads:grid threadsPerThreadgroup:group];
+    [encoder endEncoding];
+    [pool release];
+}
+
+void metal_dispatch_attn_pv_fp16(
+    MetalContext* ctx, MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle probs_buf, MetalBufferHandle v_cache,
+    MetalBufferHandle out_buf,
+    uint32_t base_pos, uint32_t lanes, uint32_t cap,
+    uint32_t heads_q, uint32_t heads_kv, uint32_t dim) {
+    if (!ctx || !cmd_buf || !probs_buf || !v_cache || !out_buf) return;
+    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+    id<MTLComputePipelineState> pipeline =
+        (id<MTLComputePipelineState>)metal_get_pipeline(ctx, "attn_pv_fp16");
+    if (!pipeline) { [pool release]; return; }
+    id<MTLComputeCommandEncoder> encoder =
+        [(id<MTLCommandBuffer>)cmd_buf computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:(id<MTLBuffer>)probs_buf offset:0 atIndex:0];
+    [encoder setBuffer:(id<MTLBuffer>)v_cache offset:0 atIndex:1];
+    [encoder setBuffer:(id<MTLBuffer>)out_buf offset:0 atIndex:2];
+    const uint32_t vals[] = {base_pos, cap, heads_q, heads_kv, dim};
+    for (NSUInteger i = 0; i < 5; ++i)
+        [encoder setBytes:&vals[i] length:sizeof(uint32_t) atIndex:3 + i];
+    const uint32_t dtiles = dim / 64;
+    MTLSize grid = MTLSizeMake(dtiles, heads_q, lanes);
+    MTLSize group = MTLSizeMake(MIN(dtiles, 4u), 1, 1);
+    [encoder dispatchThreads:grid threadsPerThreadgroup:group];
+    [encoder endEncoding];
+    [pool release];
+}
+
+void metal_dispatch_gemv_int4_groupwise(
+    MetalContext* ctx, MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle w_buf, MetalBufferHandle scales_buf,
+    MetalBufferHandle biases_buf, MetalBufferHandle x_buf,
+    MetalBufferHandle y_buf,
+    uint32_t rows, uint32_t packed_cols, uint32_t K, uint32_t groups) {
+    if (!ctx || !cmd_buf || !w_buf || !scales_buf || !biases_buf ||
+        !x_buf || !y_buf) return;
+    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+    id<MTLComputePipelineState> pipeline =
+        (id<MTLComputePipelineState>)metal_get_pipeline(ctx, "gemv_int4_groupwise");
+    if (!pipeline) { [pool release]; return; }
+    id<MTLComputeCommandEncoder> encoder =
+        [(id<MTLCommandBuffer>)cmd_buf computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:(id<MTLBuffer>)w_buf offset:0 atIndex:0];
+    [encoder setBuffer:(id<MTLBuffer>)scales_buf offset:0 atIndex:1];
+    [encoder setBuffer:(id<MTLBuffer>)biases_buf offset:0 atIndex:2];
+    [encoder setBuffer:(id<MTLBuffer>)x_buf offset:0 atIndex:3];
+    [encoder setBuffer:(id<MTLBuffer>)y_buf offset:0 atIndex:4];
+    const uint32_t vals[] = {packed_cols, K, groups};
+    for (NSUInteger i = 0; i < 3; ++i)
+        [encoder setBytes:&vals[i] length:sizeof(uint32_t) atIndex:5 + i];
+    [encoder setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
+    MTLSize grid = MTLSizeMake(rows, 1, 1);
+    MTLSize group = MTLSizeMake(256, 1, 1);
+    [encoder dispatchThreadgroups:grid threadsPerThreadgroup:group];
     [encoder endEncoding];
     [pool release];
 }

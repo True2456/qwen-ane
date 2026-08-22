@@ -234,18 +234,35 @@ bool RindiGdnLayer::core_from_projected(const RindiGdnProjectionOutput& p,
                                         size_t lanes,
                                         std::vector<uint16_t>& core,
                                         std::vector<uint16_t>& z) {
+    RindiGdnProjectionView view{p.qkv.data(), p.z.data(), p.beta.data(), p.a.data()};
+    return core_from_projected_view(view, lanes, core, z);
+}
+
+bool RindiGdnLayer::core_from_projected_view(const RindiGdnProjectionView& p,
+                                             size_t lanes,
+                                             std::vector<uint16_t>& core,
+                                             std::vector<uint16_t>& z) {
     if (!ready_ || lanes == 0 || lanes > width_) return false;
-    std::vector<uint16_t> activated;
-    if (!conv_.evaluate(p.qkv.data(), lanes, activated)) return false;
     constexpr size_t H = 48, D = 128, V = 128, HK = H * D, W = 160;
     constexpr size_t C = HK + 2 * H;
-    z = p.z;
-    std::vector<uint16_t> packed(C * W, 0);
-    std::vector<uint16_t> decay_batch(H * lanes);
-    std::vector<uint16_t> key_batch(HK * lanes);
-    std::vector<uint16_t> query_batch(HK * lanes);
-    std::vector<uint16_t> value_batch(H * V * lanes);
-    std::vector<uint16_t> beta_batch(H * lanes);
+    if (!conv_.evaluate(p.qkv, lanes, activated_scratch_)) return false;
+    const std::vector<uint16_t>& activated = activated_scratch_;
+    // z carries in_proj_z's HK channels per lane; the packed-surface count
+    // C includes the value/beta channel groups and must not size it.
+    z.assign(p.z, p.z + HK * lanes);
+
+    // The packed [C, W] surface is only consumed by the legacy per-lane ANE
+    // fallback below; building it for the batch path was pure waste.
+    decay_batch_.resize(H * lanes);
+    key_batch_.resize(HK * lanes);
+    query_batch_.resize(HK * lanes);
+    value_batch_.resize(H * V * lanes);
+    beta_batch_.resize(H * lanes);
+    uint16_t* decay_batch = decay_batch_.data();
+    uint16_t* key_batch = key_batch_.data();
+    uint16_t* query_batch = query_batch_.data();
+    uint16_t* value_batch = value_batch_.data();
+    uint16_t* beta_batch = beta_batch_.data();
     for (size_t lane = 0; lane < lanes; ++lane) {
         for (size_t h = 0; h < H; ++h) {
             const size_t source_h = h / 3;
@@ -266,6 +283,8 @@ bool RindiGdnLayer::core_from_projected(const RindiGdnProjectionOutput& p,
             const float decay = std::exp(-std::exp(half_to_float(a_log_[h])) *
                                          stable_softplus(raw_a + half_to_float(dt_bias_[h])));
             const float beta = 1.0f / (1.0f + std::exp(-raw_b));
+            decay_batch[h * lanes + lane] = float_to_half(decay);
+            beta_batch[h * lanes + lane] = float_to_half(beta);
             for (size_t d = 0; d < D; ++d) {
                 const size_t c = h * D + d;
                 // Match mlx_lm's Qwen3.5 gated-delta normalization exactly:
@@ -277,30 +296,26 @@ bool RindiGdnLayer::core_from_projected(const RindiGdnProjectionOutput& p,
                                 qden / static_cast<float>(D);
                 const float k = half_to_float(activated[(2048 + source_h * D + d) * lanes + lane]) /
                                 kden / std::sqrt(static_cast<float>(D));
-                packed[c * W + V] = float_to_half(decay);
-                packed[c * W + V + 1] = float_to_half(k);
-                packed[c * W + V + 2] = float_to_half(q);
-                decay_batch[h * lanes + lane] = float_to_half(decay);
                 key_batch[c * lanes + lane] = float_to_half(k);
                 query_batch[c * lanes + lane] = float_to_half(q);
             }
             for (size_t d = 0; d < V; ++d) {
-                packed[(HK + h) * W + d] = activated[(4096 + h * V + d) * lanes + lane];
                 value_batch[(h * V + d) * lanes + lane] =
                     activated[(4096 + h * V + d) * lanes + lane];
             }
-            packed[(HK + H + h) * W] = float_to_half(beta);
-            beta_batch[h * lanes + lane] = float_to_half(beta);
         }
     }
 
-    if (lanes > 1 && !std::getenv("RINDI_DISABLE_METAL_RECURRENCE")) {
-        std::vector<uint16_t> batch_core;
-        if (recurrence_.step_batch(decay_batch.data(), key_batch.data(),
-                                   query_batch.data(), value_batch.data(),
-                                   beta_batch.data(), lanes, batch_core) &&
-            batch_core.size() == H * V * lanes) {
-            core = std::move(batch_core);
+    // Always take the Metal batched recurrence, lanes == 1 included: base
+    // decoding and speculative verification must execute the IDENTICAL
+    // recurrence implementation, otherwise fp16 rounding differences change
+    // logits and speculative output stops being exact. The legacy ANE
+    // single-step path remains reachable only via RINDI_DISABLE_METAL_RECURRENCE.
+    if (!std::getenv("RINDI_DISABLE_METAL_RECURRENCE")) {
+        if (recurrence_.step_batch(decay_batch, key_batch,
+                                   query_batch, value_batch,
+                                   beta_batch, lanes, core) &&
+            core.size() == H * V * lanes) {
             return true;
         }
     }
@@ -308,9 +323,11 @@ bool RindiGdnLayer::core_from_projected(const RindiGdnProjectionOutput& p,
     // CPU/ANE fallback for single-token decode or if the Metal recurrence is
     // unavailable. Rebuild the compact packed input for each lane because the
     // legacy recurrence request owns one sequential state transition.
+    packed_scratch_.assign(C * W, 0);
+    uint16_t* packed = packed_scratch_.data();
     core.resize(H * V * lanes);
     for (size_t lane = 0; lane < lanes; ++lane) {
-        std::fill(packed.begin(), packed.end(), 0);
+        std::fill(packed, packed + C * W, 0);
         for (size_t h = 0; h < H; ++h) {
             for (size_t d = 0; d < D; ++d) {
                 const size_t c = h * D + d;
@@ -323,7 +340,7 @@ bool RindiGdnLayer::core_from_projected(const RindiGdnProjectionOutput& p,
             packed[(HK + H + h) * W] = beta_batch[h * lanes + lane];
         }
         std::vector<uint16_t> lane_core;
-        if (!recurrence_.step(packed.data(), lane_core) || lane_core.size() != H * V)
+        if (!recurrence_.step(packed, lane_core) || lane_core.size() != H * V)
             return false;
         for (size_t c = 0; c < H * V; ++c) core[c * lanes + lane] = lane_core[c];
     }

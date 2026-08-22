@@ -362,6 +362,39 @@ void metal_dispatch_argmax_fp16(
     int V
 );
 
+/* ========================================================================= */
+/* Attention core (scores -> softmax -> P*V) over a resident KV cache.        */
+/* Layouts: q [lanes*HQ*D] fp16, k/v caches [cap*HK*D] fp16,                  */
+/*          scores/probs [lanes*HQ*cap] fp32, out [lanes*HQ*D] fp16.          */
+/* ========================================================================= */
+
+void metal_dispatch_gemv_int4_groupwise(
+    MetalContext* ctx, MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle w_buf, MetalBufferHandle scales_buf,
+    MetalBufferHandle biases_buf, MetalBufferHandle x_buf,
+    MetalBufferHandle y_buf,
+    uint32_t rows, uint32_t packed_cols, uint32_t K, uint32_t groups);
+
+void metal_dispatch_attn_scores_fp16(
+    MetalContext* ctx, MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle q_buf, MetalBufferHandle k_cache,
+    MetalBufferHandle scores_buf,
+    uint32_t base_pos, uint32_t kv_len, uint32_t lanes, uint32_t cap,
+    uint32_t heads_q, uint32_t heads_kv, uint32_t dim);
+
+void metal_dispatch_attn_softmax_fp16(
+    MetalContext* ctx, MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle scores_buf, MetalBufferHandle probs_buf,
+    uint32_t rows /* lanes*HQ */, uint32_t base_pos, uint32_t cap,
+    uint32_t heads_q);
+
+void metal_dispatch_attn_pv_fp16(
+    MetalContext* ctx, MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle probs_buf, MetalBufferHandle v_cache,
+    MetalBufferHandle out_buf,
+    uint32_t base_pos, uint32_t lanes, uint32_t cap,
+    uint32_t heads_q, uint32_t heads_kv, uint32_t dim);
+
 #ifdef __cplusplus
 }
 #endif

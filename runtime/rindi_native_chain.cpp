@@ -376,6 +376,7 @@ bool RindiNativeChain::compile_layer(int layer_idx, const std::string& package_p
     old.core_dim = core_dim;
     old.intermediate = intermediate;
     old.attention = is_attention;
+    old.written_lanes = 0;
     old.metal_tail.reset();
     return true;
 }
@@ -505,25 +506,27 @@ bool RindiNativeChain::evaluate_tail(int layer_idx, const uint16_t* core,
                   << " expected=" << (core_dim + hidden_dim_) << std::endl;
         return false;
     }
-    metal_iosurface_lock(e.input_surface, 0);
+    // The input surface is zeroed once and only rewritten when the live lane
+    // count changes: decode writes lane 0 of every channel forever, so a
+    // per-call memset of the full [C, 32] surface (~1.4 MB x 64 layers) was
+    // pure overhead. CPU writes complete before the synchronous evaluate, and
+    // these surfaces are process-private, so no IOSurface lock is required.
     auto* in = static_cast<uint16_t*>(metal_iosurface_get_base_address(e.input_surface));
-    std::memset(in, 0, e.input_channels * seq_len_ * sizeof(uint16_t));
+    if (e.written_lanes != 1) {
+        std::memset(in, 0, e.input_channels * seq_len_ * sizeof(uint16_t));
+        e.written_lanes = 1;
+    }
     for (size_t c = 0; c < core_dim; ++c) in[c * seq_len_] = core[c];
     for (size_t c = 0; c < hidden_dim_; ++c) in[(core_dim + c) * seq_len_] = residual[c];
-    metal_iosurface_unlock(e.input_surface, 0);
     if (!ane_request_evaluate(ane_ctx_, e.model, e.req_a_to_b, nullptr, 0, nullptr, 0)) return false;
     output.resize(hidden_dim_);
-    metal_iosurface_lock(e.output_surface, kIOSurfaceLockReadOnly);
-    auto* out = static_cast<const uint16_t*>(metal_iosurface_get_base_address(e.output_surface));
+    const uint16_t* out = static_cast<const uint16_t*>(metal_iosurface_get_base_address(e.output_surface));
     for (size_t c = 0; c < hidden_dim_; ++c) output[c] = out[c * seq_len_];
-    metal_iosurface_unlock(e.output_surface, kIOSurfaceLockReadOnly);
     if (next_projection) {
         if (!e.projection_surface || !e.projection_channels) return false;
         next_projection->resize(e.projection_channels);
-        metal_iosurface_lock(e.projection_surface, kIOSurfaceLockReadOnly);
-        auto* p = static_cast<const uint16_t*>(metal_iosurface_get_base_address(e.projection_surface));
+        const uint16_t* p = static_cast<const uint16_t*>(metal_iosurface_get_base_address(e.projection_surface));
         for (size_t c = 0; c < e.projection_channels; ++c) (*next_projection)[c] = p[c * seq_len_];
-        metal_iosurface_unlock(e.projection_surface, kIOSurfaceLockReadOnly);
     }
     return true;
 }
@@ -556,35 +559,34 @@ bool RindiNativeChain::evaluate_tail_batch(int layer_idx, const uint16_t* core,
         }
     }
 
-    metal_iosurface_lock(e.input_surface, 0);
+    // Lane-width change is the only event that requires re-zeroing: columns
+    // [lanes, written_lanes) may hold stale values from a wider chunk.
     auto* in = static_cast<uint16_t*>(metal_iosurface_get_base_address(e.input_surface));
-    std::memset(in, 0, e.input_channels * seq_len_ * sizeof(uint16_t));
+    if (e.written_lanes != lanes) {
+        std::memset(in, 0, e.input_channels * seq_len_ * sizeof(uint16_t));
+        e.written_lanes = lanes;
+    }
     for (size_t c = 0; c < core_dim; ++c)
         std::memcpy(in + c * seq_len_, core + c * lanes, lanes * sizeof(uint16_t));
     for (size_t c = 0; c < hidden_dim_; ++c)
         std::memcpy(in + (core_dim + c) * seq_len_, residual + c * lanes,
                     lanes * sizeof(uint16_t));
-    metal_iosurface_unlock(e.input_surface, 0);
 
     if (!ane_request_evaluate(ane_ctx_, e.model, e.req_a_to_b, nullptr, 0, nullptr, 0))
         return false;
     output.resize(hidden_dim_ * lanes);
-    metal_iosurface_lock(e.output_surface, kIOSurfaceLockReadOnly);
-    auto* out = static_cast<const uint16_t*>(metal_iosurface_get_base_address(e.output_surface));
+    const uint16_t* out = static_cast<const uint16_t*>(metal_iosurface_get_base_address(e.output_surface));
     for (size_t c = 0; c < hidden_dim_; ++c)
         std::memcpy(output.data() + c * lanes, out + c * seq_len_,
                     lanes * sizeof(uint16_t));
-    metal_iosurface_unlock(e.output_surface, kIOSurfaceLockReadOnly);
 
     if (next_projection) {
         if (!e.projection_surface || !e.projection_channels) return false;
         next_projection->resize(e.projection_channels * lanes);
-        metal_iosurface_lock(e.projection_surface, kIOSurfaceLockReadOnly);
-        auto* p = static_cast<const uint16_t*>(metal_iosurface_get_base_address(e.projection_surface));
+        const uint16_t* p = static_cast<const uint16_t*>(metal_iosurface_get_base_address(e.projection_surface));
         for (size_t c = 0; c < e.projection_channels; ++c)
             std::memcpy(next_projection->data() + c * lanes, p + c * seq_len_,
                         lanes * sizeof(uint16_t));
-        metal_iosurface_unlock(e.projection_surface, kIOSurfaceLockReadOnly);
     }
     if (compare_metal_tail && !metal_output.empty()) {
         auto compare_tensor = [](const std::vector<uint16_t>& ref,

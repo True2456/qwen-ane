@@ -269,6 +269,164 @@ static std::vector<ToolDef> parse_tools(const std::string& json_body) {
     return tools;
 }
 
+static std::string build_tools_json(const std::vector<ToolDef>& tools) {
+    if (tools.empty()) return "";
+    std::string out = "[";
+    for (size_t i = 0; i < tools.size(); ++i) {
+        if (i) out += ",";
+        out += "{\"type\":\"function\",\"function\":{\"name\":\"" +
+               json_escape(tools[i].name) + "\",\"description\":\"" +
+               json_escape(tools[i].description) + "\",\"parameters\":" +
+               (tools[i].parameters_schema.empty() ? "{}" : tools[i].parameters_schema) +
+               "}}";
+    }
+    out += "]";
+    return out;
+}
+
+struct ParsedToolCall {
+    std::string id;
+    std::string name;
+    std::string arguments_json;  // compact JSON string of arguments
+};
+
+// Qwen emits zero or more <tool_call>{"name":..., "arguments":{...}}</tool_call>
+// blocks in its content. Extract them into OpenAI-compatible entries and
+// return the remaining content. Unparsable blocks stay in the content.
+static void parse_qwen_tool_calls(const std::string& text,
+                                  std::string& content_out,
+                                  std::vector<ParsedToolCall>& calls_out) {
+    static std::atomic<uint64_t> call_counter{0};
+    content_out.clear();
+    calls_out.clear();
+    size_t pos = 0;
+    while (true) {
+        const size_t start = text.find("<tool_call>", pos);
+        if (start == std::string::npos) break;
+        const size_t end = text.find("</tool_call>", start);
+        const size_t block_end = (end == std::string::npos) ? text.size() : end;
+        std::string body = text.substr(start + 11, block_end - (start + 11));
+        // Trim whitespace/newlines around the JSON payload.
+        const size_t b0 = body.find_first_not_of(" \t\r\n");
+        const size_t b1 = body.find_last_not_of(" \t\r\n");
+        bool parsed = false;
+        if (b0 != std::string::npos && b1 != std::string::npos && b1 > b0) {
+            body = body.substr(b0, b1 - b0 + 1);
+            if (!body.empty() && body.front() == '{') {
+                const std::string name = extract_json_field(body, "name");
+                std::string args = extract_json_field(body, "arguments");
+                if (!name.empty()) {
+                    ParsedToolCall tc;
+                    tc.id = "call_" + std::to_string(++call_counter);
+                    tc.name = name;
+                    tc.arguments_json = args.empty() ? "{}" : args;
+                    calls_out.push_back(std::move(tc));
+                    parsed = true;
+                }
+            }
+        }
+        if (!parsed) {
+            // Keep the raw block in the content rather than dropping model output.
+            content_out.append(text, pos, block_end - pos);
+        } else {
+            content_out.append(text, pos, start - pos);
+        }
+        pos = (end == std::string::npos) ? text.size() : end + 12;
+        if (end == std::string::npos) break;
+    }
+    content_out.append(text, pos, text.size() - pos);
+}
+
+// Routes live model deltas into reasoning (<think>...</think>) and content
+// streams based on what the model actually emitted. No synthetic reasoning
+// text is ever injected.
+class ThinkSplitter {
+public:
+    using EmitFn = std::function<void(const std::string&)>;
+    ThinkSplitter(EmitFn reasoning_cb, EmitFn content_cb)
+        : reasoning_cb_(std::move(reasoning_cb)), content_cb_(std::move(content_cb)) {}
+
+    void feed(const std::string& delta) {
+        pending_ += delta;
+        if (mode_ == Mode::kDetect) {
+            // Wait until pending can no longer be a '<think>' prefix.
+            static const std::string kOpen = "<think>";
+            if (pending_.compare(0, pending_.size(), kOpen, 0, pending_.size()) == 0 &&
+                pending_.size() < kOpen.size()) {
+                return;  // still ambiguous
+            }
+            if (pending_.compare(0, kOpen.size(), kOpen) == 0) {
+                mode_ = Mode::kReasoning;
+                pending_ = pending_.substr(kOpen.size());
+            } else {
+                mode_ = Mode::kContent;
+            }
+        }
+        if (mode_ == Mode::kContent) {
+            emit_clean(pending_, true);
+            pending_.clear();
+            return;
+        }
+        // Reasoning mode: hold back a possible partial '</think>' suffix.
+        static const std::string kClose = "</think>";
+        const size_t close = pending_.find(kClose);
+        if (close != std::string::npos) {
+            emit_reasoning(pending_.substr(0, close));
+            pending_ = pending_.substr(close + kClose.size());
+            mode_ = Mode::kContent;
+            emit_clean(pending_, true);
+            pending_.clear();
+            return;
+        }
+        const size_t safe = pending_.size() > kClose.size() - 1
+            ? pending_.size() - (kClose.size() - 1) : 0;
+        if (safe > 0) {
+            emit_reasoning(pending_.substr(0, safe));
+            pending_ = pending_.substr(safe);
+        }
+    }
+
+    void finish() {
+        if (pending_.empty()) return;
+        if (mode_ == Mode::kReasoning) emit_reasoning(pending_);
+        else emit_clean(pending_, true);  // kContent or an unconsumed '<' prefix
+        pending_.clear();
+    }
+
+    const std::string& content_accum() const { return content_accum_; }
+    const std::string& reasoning_accum() const { return reasoning_accum_; }
+
+private:
+    enum class Mode { kDetect, kReasoning, kContent };
+
+    void emit_reasoning(const std::string& s) {
+        if (s.empty()) return;
+        reasoning_accum_ += s;
+        if (reasoning_cb_) reasoning_cb_(s);
+    }
+    void emit_clean(const std::string& s, bool to_stream) {
+        if (s.empty()) return;
+        // Strip any stray think markers from content.
+        std::string clean;
+        clean.reserve(s.size());
+        for (size_t i = 0; i < s.size();) {
+            if (s.compare(i, 7, "<think>") == 0) { i += 7; continue; }
+            if (s.compare(i, 8, "</think>") == 0) { i += 8; continue; }
+            clean += s[i++];
+        }
+        if (clean.empty()) return;
+        content_accum_ += clean;
+        if (to_stream && content_cb_) content_cb_(clean);
+    }
+
+    EmitFn reasoning_cb_;
+    EmitFn content_cb_;
+    Mode mode_{Mode::kDetect};
+    std::string pending_;
+    std::string content_accum_;
+    std::string reasoning_accum_;
+};
+
 // ---------------------------------------------------------------------------
 // HTTP Response Helpers
 // ---------------------------------------------------------------------------
@@ -429,15 +587,12 @@ void handle_client(int client_fd, RindiEngine* engine) {
         std::vector<ToolDef> tools = parse_tools(body);
 
         std::string last_user_prompt;
-        bool has_tool_response = false;
         std::vector<std::pair<std::string, std::string>> formatted_msgs;
 
         for (const auto& m : messages) {
             formatted_msgs.push_back({m.role, m.content});
             if (m.role == "user") {
                 last_user_prompt = m.content;
-            } else if (m.role == "tool") {
-                has_tool_response = true;
             }
         }
 
@@ -448,69 +603,8 @@ void handle_client(int client_fd, RindiEngine* engine) {
             g_tui->record_request_start();
         }
 
-        auto t0 = std::chrono::high_resolution_clock::now();
-        size_t prompt_tokens = std::max((size_t)1, body.size() / 4);
-
-        auto t_pref_start = std::chrono::high_resolution_clock::now();
-        std::this_thread::sleep_for(std::chrono::microseconds(std::max((int)(prompt_tokens * 1000 / 950), 2)));
-        auto t_pref_end = std::chrono::high_resolution_clock::now();
-        double prefill_sec = std::chrono::duration<double>(t_pref_end - t_pref_start).count();
-        double prefill_tps = prefill_sec > 0.0 ? (prompt_tokens / prefill_sec) : 0.0;
-
-        bool should_call_tool = false;
-        std::string tool_to_call;
-        std::string tool_args_json;
-
-        if (!tools.empty() && !has_tool_response) {
-            std::string p_lower = last_user_prompt;
-            std::transform(p_lower.begin(), p_lower.end(), p_lower.begin(), ::tolower);
-
-            for (const auto& t : tools) {
-                std::string t_lower = t.name;
-                std::transform(t_lower.begin(), t_lower.end(), t_lower.begin(), ::tolower);
-
-                if (t_lower.find("write") != std::string::npos || t_lower.find("create") != std::string::npos) {
-                    if (p_lower.find("write") != std::string::npos || p_lower.find("create") != std::string::npos || p_lower.find("save") != std::string::npos) {
-                        should_call_tool = true;
-                        tool_to_call = t.name;
-                        std::string target_path = "/tmp/rindi_output.txt";
-                        size_t path_pos = p_lower.find("/tmp/");
-                        if (path_pos != std::string::npos) {
-                            size_t path_end = p_lower.find_first_of(" \t\r\n\"'", path_pos);
-                            target_path = last_user_prompt.substr(path_pos, path_end - path_pos);
-                        }
-                        tool_args_json = "{\"path\": \"" + json_escape(target_path) + "\", \"content\": \"Rindi ANE + Metal GPU Native Execution Verified.\\n\"}";
-                        break;
-                    }
-                } else if (t_lower.find("read") != std::string::npos || t_lower.find("view") != std::string::npos) {
-                    if (p_lower.find("read") != std::string::npos || p_lower.find("check") != std::string::npos || p_lower.find("view") != std::string::npos) {
-                        should_call_tool = true;
-                        tool_to_call = t.name;
-                        std::string target_path = "/tmp/rindi_output.txt";
-                        size_t path_pos = p_lower.find("/tmp/");
-                        if (path_pos != std::string::npos) {
-                            size_t path_end = p_lower.find_first_of(" \t\r\n\"'", path_pos);
-                            target_path = last_user_prompt.substr(path_pos, path_end - path_pos);
-                        }
-                        tool_args_json = "{\"path\": \"" + json_escape(target_path) + "\"}";
-                        break;
-                    }
-                } else if (t_lower.find("bash") != std::string::npos || t_lower.find("exec") != std::string::npos) {
-                    if (p_lower.find("run") != std::string::npos || p_lower.find("exec") != std::string::npos || p_lower.find("bash") != std::string::npos || p_lower.find("command") != std::string::npos) {
-                        should_call_tool = true;
-                        tool_to_call = t.name;
-                        tool_args_json = "{\"command\": \"uname -a\"}";
-                        break;
-                    }
-                }
-            }
-
-            if (!should_call_tool && !tools.empty() && (p_lower.find("tool") != std::string::npos || p_lower.find("call") != std::string::npos)) {
-                should_call_tool = true;
-                tool_to_call = tools[0].name;
-                tool_args_json = "{}";
-            }
-        }
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        const std::string tools_json = build_tools_json(tools);
 
         std::string cmpl_id = "chatcmpl-" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
 
@@ -526,65 +620,71 @@ void handle_client(int client_fd, RindiEngine* engine) {
             std::string chunk0 = "data: {\"id\":\"" + cmpl_id + "\",\"object\":\"chat.completion.chunk\",\"created\":1787300000,\"model\":\"" + model_requested + "\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n";
             write(client_fd, chunk0.c_str(), chunk0.size());
 
-            // 2. Reasoning content chunk for Pi compatibility (requiresReasoningContentOnAssistantMessages)
-            if (enable_thinking) {
-                std::string thinking_text = should_call_tool
-                    ? "Analyzing requirements and preparing tool execution through direct Apple Silicon ANE + Metal GPU hardware pipeline."
-                    : (has_tool_response
-                        ? "Tool execution result received. Verifying completion across 64 ANE layers."
-                        : "Formulating response through Apple Silicon ANE + Metal GPU hardware pipeline.");
-                std::string reason_chunk = "data: {\"id\":\"" + cmpl_id + "\",\"object\":\"chat.completion.chunk\",\"created\":1787300000,\"model\":\"" + model_requested + "\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"" + json_escape(thinking_text) + "\"},\"finish_reason\":null}]}\n\n";
-                write(client_fd, reason_chunk.c_str(), reason_chunk.size());
-            }
-
+            // 2. Real generation. Reasoning and content deltas come from the
+            // model itself via ThinkSplitter; tool calls are parsed from the
+            // model's <tool_call> output after the turn completes.
             size_t token_count = 0;
-            auto t_first_token = std::chrono::high_resolution_clock::now();
-            double ttft_ms = std::chrono::duration<double, std::milli>(t_first_token - t0).count();
+            bool got_first_token = false;
+            double ttft_ms = 0.0;
+            std::string full_content;
+            auto t_first_token = t0;
 
-            if (should_call_tool) {
-                std::string tc_id = "call_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count() % 1000000);
+            auto emit_sse = [&](const std::string& json_delta) {
+                std::string c = "data: {\"id\":\"" + cmpl_id + "\",\"object\":\"chat.completion.chunk\",\"created\":1787300000,\"model\":\"" + model_requested + "\",\"choices\":[{\"index\":0,\"delta\":{" + json_delta + "},\"finish_reason\":null}]}\n\n";
+                write(client_fd, c.c_str(), c.size());
+            };
 
-                if (engine) {
-                    engine->generate("tool " + tool_to_call, 1, requested_temperature, nullptr);
-                    if (g_tui) g_tui->record_ane_step(engine->get_last_eval_ms());
-                }
+            ThinkSplitter splitter(
+                [&](const std::string& thought) {
+                    if (enable_thinking && !thought.empty())
+                        emit_sse("\"reasoning_content\":\"" + json_escape(thought) + "\"");
+                },
+                [&](const std::string& text) {
+                    // Once the model opens a <tool_call> block, suppress raw
+                    // content deltas; the structured tool_calls delta at the end
+                    // carries it instead.
+                    full_content += text;
+                    if (full_content.find("<tool_call>") == std::string::npos)
+                        emit_sse("\"content\":\"" + json_escape(text) + "\"");
+                });
 
-                // Chunk with tool_call definition & name
-                std::string tc_chunk1 = "data: {\"id\":\"" + cmpl_id + "\",\"object\":\"chat.completion.chunk\",\"created\":1787300000,\"model\":\"" + model_requested + "\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"" + tc_id + "\",\"type\":\"function\",\"function\":{\"name\":\"" + tool_to_call + "\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n";
-                write(client_fd, tc_chunk1.c_str(), tc_chunk1.size());
-
-                // Chunk with tool arguments
-                std::string tc_chunk2 = "data: {\"id\":\"" + cmpl_id + "\",\"object\":\"chat.completion.chunk\",\"created\":1787300000,\"model\":\"" + model_requested + "\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"" + json_escape(tool_args_json) + "\"}}]},\"finish_reason\":null}]}\n\n";
-                write(client_fd, tc_chunk2.c_str(), tc_chunk2.size());
-
-                token_count += 16;
-                if (g_tui) g_tui->record_request_chunk(16);
-
-                std::string final_chunk = "data: {\"id\":\"" + cmpl_id + "\",\"object\":\"chat.completion.chunk\",\"created\":1787300000,\"model\":\"" + model_requested + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(prompt_tokens) + ",\"completion_tokens\":" + std::to_string(token_count) + ",\"total_tokens\":" + std::to_string(prompt_tokens + token_count) + "}}\n\n";
-                write(client_fd, final_chunk.c_str(), final_chunk.size());
-            } else {
-                // 3. Real Generation over 27B Model Engine
+            if (engine) {
                 auto stream_token_cb = [&](const std::string& token_chunk) {
                     if (token_chunk.empty()) return;
-                    std::string c = "data: {\"id\":\"" + cmpl_id + "\",\"object\":\"chat.completion.chunk\",\"created\":1787300000,\"model\":\"" + model_requested + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + json_escape(token_chunk) + "\"},\"finish_reason\":null}]}\n\n";
-                    write(client_fd, c.c_str(), c.size());
-                    token_count++;
-                    if (g_tui) {
-                        g_tui->record_request_chunk(1);
-                        if (engine) g_tui->record_ane_step(engine->get_last_eval_ms());
+                    ++token_count;
+                    if (!got_first_token) {
+                        got_first_token = true;
+                        t_first_token = std::chrono::high_resolution_clock::now();
+                        ttft_ms = std::chrono::duration<double, std::milli>(t_first_token - t0).count();
                     }
+                    splitter.feed(token_chunk);
+                    if (g_tui) g_tui->record_request_chunk(1);
                 };
-
-                if (engine) {
-                    engine->chat_completion(formatted_msgs, "", requested_max_tokens,
-                                            requested_temperature, stream_token_cb,
-                                            enable_thinking, reasoning_effort);
-                }
-
-                // 4. Final chunk with finish_reason: stop
-                std::string final_chunk = "data: {\"id\":\"" + cmpl_id + "\",\"object\":\"chat.completion.chunk\",\"created\":1787300000,\"model\":\"" + model_requested + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(prompt_tokens) + ",\"completion_tokens\":" + std::to_string(token_count) + ",\"total_tokens\":" + std::to_string(prompt_tokens + token_count) + "}}\n\n";
-                write(client_fd, final_chunk.c_str(), final_chunk.size());
+                engine->chat_completion(formatted_msgs, tools_json,
+                                        requested_max_tokens, requested_temperature,
+                                        stream_token_cb, enable_thinking,
+                                        reasoning_effort);
             }
+            splitter.finish();
+
+            std::string clean_content;
+            std::vector<ParsedToolCall> tool_calls;
+            parse_qwen_tool_calls(full_content, clean_content, tool_calls);
+            const bool has_tool_calls = !tool_calls.empty();
+            for (const auto& tc : tool_calls) {
+                emit_sse("\"tool_calls\":[{\"index\":0,\"id\":\"" + tc.id +
+                         "\",\"type\":\"function\",\"function\":{\"name\":\"" +
+                         json_escape(tc.name) + "\",\"arguments\":\"\"}}]");
+                emit_sse("\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"" +
+                         json_escape(tc.arguments_json) + "\"}}]");
+            }
+
+            // Final chunk with finish_reason and REAL usage counters.
+            const GenerationStats empty_stats;
+            const GenerationStats& stats = (engine && engine->is_ready())
+                ? engine->get_last_stats() : empty_stats;
+            std::string final_chunk = "data: {\"id\":\"" + cmpl_id + "\",\"object\":\"chat.completion.chunk\",\"created\":1787300000,\"model\":\"" + model_requested + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"" + (has_tool_calls ? "tool_calls" : "stop") + "\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(stats.prompt_tokens) + ",\"completion_tokens\":" + std::to_string(stats.generated_tokens) + ",\"total_tokens\":" + std::to_string(stats.prompt_tokens + stats.generated_tokens) + "}}\n\n";
+            write(client_fd, final_chunk.c_str(), final_chunk.size());
 
             // 5. DONE marker
             std::string done_marker = "data: [DONE]\n\n";
@@ -593,24 +693,32 @@ void handle_client(int client_fd, RindiEngine* engine) {
             std::this_thread::sleep_for(std::chrono::milliseconds(15));
             close(client_fd);
 
+            const GenerationStats& sstats = (engine && engine->is_ready())
+                ? engine->get_last_stats() : empty_stats;
             auto t_end = std::chrono::high_resolution_clock::now();
-            double total_decode_sec = std::chrono::duration<double>(t_end - t_first_token).count();
-            double decode_tps = total_decode_sec > 0 ? (token_count / total_decode_sec) : 0.0;
-            size_t tokens_saved = prompt_tokens > 4 ? prompt_tokens / 2 : 0;
-            bool apc_hit = tokens_saved > 0;
+            double total_decode_sec = got_first_token
+                ? std::chrono::duration<double>(t_end - t_first_token).count() : 0.0;
+            double decode_tps = (token_count > 1 && total_decode_sec > 0.0)
+                ? static_cast<double>(token_count - 1) / total_decode_sec : 0.0;
+            const size_t real_prompt_tokens = sstats.prompt_tokens;
 
             if (g_tui) {
-                g_tui->record_request_end(prompt_tokens, token_count, ttft_ms, decode_tps, prefill_tps, apc_hit, tokens_saved);
-                char lbuf[128];
-                snprintf(lbuf, sizeof(lbuf), "Stream complete: %zu tokens in %.2fs (%.1f tok/s) [TTFT: %.1fms]", token_count, total_decode_sec, decode_tps, ttft_ms);
-                g_tui->log(std::string(lbuf), "ANE");
+                g_tui->record_request_end(real_prompt_tokens, token_count, ttft_ms,
+                                          decode_tps, sstats.prefill_tps(), false, 0);
+                char lbuf[160];
+                snprintf(lbuf, sizeof(lbuf),
+                         "Stream complete: %zu tokens in %.2fs (%.1f tok/s) [TTFT: %.1fms, prefill %zu tok @ %.1f tok/s]",
+                         token_count, total_decode_sec, decode_tps, ttft_ms,
+                         real_prompt_tokens, sstats.prefill_tps());
+                g_tui->log(std::string(lbuf), "ENGINE");
             }
             return;
         } else {
-            // Non-streaming completion response
+            // Non-streaming completion response over the real model.
             std::string gen_output;
             if (engine) {
-                gen_output = engine->chat_completion(formatted_msgs, "", requested_max_tokens,
+                gen_output = engine->chat_completion(formatted_msgs, tools_json,
+                                                     requested_max_tokens,
                                                      requested_temperature, nullptr,
                                                      enable_thinking, reasoning_effort);
             }
@@ -621,25 +729,59 @@ void handle_client(int client_fd, RindiEngine* engine) {
                 return;
             }
 
-            size_t token_count = std::max((size_t)1, gen_output.size() / 4);
-            auto t_first_token = std::chrono::high_resolution_clock::now();
-            double ttft_ms = std::chrono::duration<double, std::milli>(t_first_token - t0).count();
+            // Split the real reasoning/content and extract tool calls.
+            ThinkSplitter offline(
+                [](const std::string&) {},
+                [](const std::string&) {});
+            offline.feed(gen_output);
+            offline.finish();
+            std::string clean_content;
+            std::vector<ParsedToolCall> tool_calls;
+            parse_qwen_tool_calls(offline.content_accum(), clean_content, tool_calls);
+            const bool has_tool_calls = !tool_calls.empty();
+            const std::string& reasoning_content = offline.reasoning_accum();
+            const std::string& content = clean_content;
 
-            std::string res_body = "{\"id\":\"" + cmpl_id + "\",\"object\":\"chat.completion\",\"created\":1787300000,\"model\":\"" + model_requested + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + json_escape(gen_output) + "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(prompt_tokens) + ",\"completion_tokens\":" + std::to_string(token_count) + ",\"total_tokens\":" + std::to_string(prompt_tokens + token_count) + "}}";
+            const GenerationStats empty_stats_ns;
+            const GenerationStats& stats = (engine && engine->is_ready())
+                ? engine->get_last_stats() : empty_stats_ns;
+            auto t_first_token = t0;  // non-streaming: first byte arrives with everything else
+
+            std::string message_fields;
+            if (!has_tool_calls) {
+                message_fields = "\"content\":" + (content.empty() ? std::string("null") : "\"" + json_escape(content) + "\"");
+                if (!reasoning_content.empty())
+                    message_fields += ",\"reasoning_content\":\"" + json_escape(reasoning_content) + "\"";
+            } else {
+                message_fields = "\"content\":" + (content.empty() ? std::string("null") : "\"" + json_escape(content) + "\"");
+                if (!reasoning_content.empty())
+                    message_fields += ",\"reasoning_content\":\"" + json_escape(reasoning_content) + "\"";
+                message_fields += ",\"tool_calls\":[";
+                for (size_t i = 0; i < tool_calls.size(); ++i) {
+                    if (i) message_fields += ",";
+                    message_fields += "{\"id\":\"" + json_escape(tool_calls[i].id) + "\",\"type\":\"function\",\"function\":{\"name\":\"" + json_escape(tool_calls[i].name) + "\",\"arguments\":\"" + json_escape(tool_calls[i].arguments_json) + "\"}}";
+                }
+                message_fields += "]";
+            }
+            const std::string finish_reason = has_tool_calls ? "tool_calls" : "stop";
+
+            std::string res_body = "{\"id\":\"" + cmpl_id + "\",\"object\":\"chat.completion\",\"created\":1787300000,\"model\":\"" + model_requested + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\"," + message_fields + "},\"finish_reason\":\"" + finish_reason + "\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(stats.prompt_tokens) + ",\"completion_tokens\":" + std::to_string(stats.generated_tokens) + ",\"total_tokens\":" + std::to_string(stats.prompt_tokens + stats.generated_tokens) + "}}";
             send_json_response(client_fd, 200, "OK", res_body);
             close(client_fd);
 
             auto t_end = std::chrono::high_resolution_clock::now();
-            double total_decode_sec = std::chrono::duration<double>(t_end - t_first_token).count();
-            double decode_tps = total_decode_sec > 0 ? (token_count / total_decode_sec) : 0.0;
-            size_t tokens_saved = prompt_tokens > 4 ? prompt_tokens / 2 : 0;
-            bool apc_hit = tokens_saved > 0;
+            double ttft_ms = std::chrono::duration<double, std::milli>(t_end - t_first_token).count();
+            const double decode_tps = stats.decode_tps();
 
             if (g_tui) {
-                g_tui->record_request_end(prompt_tokens, token_count, ttft_ms, decode_tps, prefill_tps, apc_hit, tokens_saved);
-                char lbuf[128];
-                snprintf(lbuf, sizeof(lbuf), "Non-stream complete: %zu tokens in %.2fs (%.1f tok/s) [TTFT: %.1fms]", token_count, total_decode_sec, decode_tps, ttft_ms);
-                g_tui->log(std::string(lbuf), "ANE");
+                g_tui->record_request_end(stats.prompt_tokens, stats.generated_tokens,
+                                          ttft_ms, decode_tps, stats.prefill_tps(), false, 0);
+                char lbuf[160];
+                snprintf(lbuf, sizeof(lbuf),
+                         "Non-stream complete: %zu tokens in %.2fs (%.1f tok/s) [TTFT: %.1fms, prefill %zu tok @ %.1f tok/s]",
+                         stats.generated_tokens, stats.total_ms / 1000.0, decode_tps, ttft_ms,
+                         stats.prompt_tokens, stats.prefill_tps());
+                g_tui->log(std::string(lbuf), "ENGINE");
             }
             return;
         }
@@ -755,11 +897,18 @@ int main(int argc, char** argv) {
 
     // 6. Interactive Command & Chat Loop on Main Thread, or a simple service
     // loop when launched headlessly.
-    auto chat_dispatch = [](const std::string& prompt, std::function<void(const std::string& token)> stream_cb) {
+    auto chat_dispatch = [](const std::string& prompt, std::function<void(const std::string& token)> stream_cb) -> RindiTUI::ChatTurnStats {
+        RindiTUI::ChatTurnStats stats;
         if (g_engine) {
             g_engine->generate(prompt, 128, 0.7f, stream_cb);
-            if (g_tui) g_tui->record_ane_step(g_engine->get_last_eval_ms());
+            const GenerationStats& s = g_engine->get_last_stats();
+            stats.prompt_tokens = s.prompt_tokens;
+            stats.generated_tokens = s.generated_tokens;
+            stats.ttft_ms = s.ttft_ms;
+            stats.prefill_tps = s.prefill_tps();
+            stats.decode_tps = s.decode_tps();
         }
+        return stats;
     };
 
     if (headless) {

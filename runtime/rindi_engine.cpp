@@ -121,6 +121,7 @@ bool RindiEngine::init_model() {
         return false;
     }
 
+    init_mtp();
     std::cout << "[RindiEngine] Model Engine Online (native C++ scheduler, 27B Parameters, 64 Layers, 5120 Hidden Dim)." << std::endl;
     return true;
 }
@@ -205,6 +206,159 @@ bool RindiEngine::init_scheduler() {
     return true;
 }
 
+bool RindiEngine::init_mtp() {
+    const char* depth_env = std::getenv("RINDI_MTP_DEPTH");
+    if (depth_env) mtp_depth_ = std::max(0, std::atoi(depth_env));
+    if (std::getenv("RINDI_DISABLE_MTP")) mtp_depth_ = 0;
+    if (mtp_depth_ <= 0) {
+        std::cout << "  [MTP] disabled" << std::endl;
+        return false;
+    }
+    if (!lm_head_loader_.has_tensor("mtp.fc.weight")) {
+        std::cout << "  [MTP] no mtp tensors in shard; disabled" << std::endl;
+        return false;
+    }
+    if (!mtp_.compile(chain_->ane_context(), lm_head_loader_, hidden_dim_, 4096)) {
+        std::cout << "  [MTP] compile failed; speculative decode unavailable" << std::endl;
+        return false;
+    }
+    // Draft-time head: quantized once at load; argmax scans the fp16 logits.
+    lm_head_draft_ready_ =
+        lm_head_draft_.compile_int4_from_bf16(metal_ctx_, lm_head_loader_,
+                                              "lm_head.weight");
+    if (!lm_head_draft_ready_)
+        std::cout << "  [MTP] draft lm_head unavailable; using BF16 head"
+                  << std::endl;
+    mtp_.set_embed_loader(&safetensors_);
+    mtp_.set_argmax_fn([this](const std::vector<uint16_t>& norm) {
+        if (lm_head_draft_ready_) {
+            std::vector<uint16_t> logits;
+            if (lm_head_draft_.evaluate(norm.data(), 1, logits) &&
+                !logits.empty()) {
+                const size_t vocab = std::min(tokenizer_.vocab_size(), logits.size());
+                int best = 0;
+                float best_val = engine_half_to_float(logits[0]);
+                for (size_t v = 1; v < vocab; ++v) {
+                    const float val = engine_half_to_float(logits[v]);
+                    if (val > best_val) { best_val = val; best = static_cast<int>(v); }
+                }
+                return best;
+            }
+        }
+        return this->argmax_token(norm);
+    });
+    mtp_ready_ = true;
+    std::cout << "  [MTP] draft block resident (depth " << mtp_depth_
+              << ", greedy only)" << std::endl;
+    return true;
+}
+
+int RindiEngine::argmax_token(const std::vector<uint16_t>& logits_input) {
+    if (logits_input.size() != hidden_dim_) return -1;
+    const size_t vocab = std::min(tokenizer_.vocab_size(), size_t(248320));
+    if (!lm_head_gpu_ready_ || vocab == 0) return -1;
+    std::memcpy(metal_buffer_get_contents(lm_head_input_gpu_),
+                logits_input.data(), hidden_dim_ * sizeof(uint16_t));
+    MetalCommandBufferHandle cmd = metal_command_buffer_create(metal_ctx_);
+    if (!cmd) return -1;
+    metal_dispatch_gemm_bf16(metal_ctx_, cmd, lm_head_input_gpu_,
+                             lm_head_gpu_, lm_head_logits_gpu_,
+                             1, static_cast<int>(vocab),
+                             static_cast<int>(hidden_dim_));
+    if (lm_head_token_gpu_) {
+        metal_dispatch_argmax_fp16(metal_ctx_, cmd, lm_head_logits_gpu_,
+                                   lm_head_token_gpu_, 1,
+                                   static_cast<int>(vocab));
+    }
+    metal_command_buffer_commit(cmd);
+    metal_command_buffer_wait(cmd);
+    if (lm_head_token_gpu_) {
+        const int32_t token = *static_cast<const int32_t*>(
+            metal_buffer_get_contents(lm_head_token_gpu_));
+        if (token >= 0 && static_cast<size_t>(token) < vocab) return token;
+        return -1;
+    }
+    // No argmax buffer: scan the logits row on CPU.
+    const uint16_t* logits = static_cast<const uint16_t*>(
+        metal_buffer_get_contents(lm_head_logits_gpu_));
+    if (!logits) return -1;
+    int best = 0;
+    float best_val = engine_half_to_float(logits[0]);
+    for (size_t v = 1; v < vocab; ++v) {
+        const float val = engine_half_to_float(logits[v]);
+        if (val > best_val) { best_val = val; best = static_cast<int>(v); }
+    }
+    return best;
+}
+
+bool RindiEngine::argmax_over_hidden(const std::vector<uint16_t>& hidden,
+                                     size_t lanes, std::vector<int>& tokens) {
+    tokens.assign(lanes, -1);
+    const size_t vocab = std::min(tokenizer_.vocab_size(), size_t(248320));
+    if (!lm_head_gpu_ready_ || vocab == 0 || lanes == 0 || lanes > 32 ||
+        hidden.size() != hidden_dim_ * lanes) return false;
+    // Normalize each lane with the final norm into a row-major staging block.
+    if (!lm_head_batch_input_) {
+        lm_head_batch_input_ = metal_buffer_create(metal_ctx_, 32 * hidden_dim_ * sizeof(uint16_t));
+        lm_head_batch_logits_ = metal_buffer_create(metal_ctx_, 32 * vocab * sizeof(uint16_t));
+        lm_head_batch_tokens_ = metal_buffer_create(metal_ctx_, 32 * sizeof(int32_t));
+        if (!lm_head_batch_input_ || !lm_head_batch_logits_ || !lm_head_batch_tokens_)
+            return false;
+    }
+    auto* staged = static_cast<uint16_t*>(metal_buffer_get_contents(lm_head_batch_input_));
+    std::vector<uint16_t> lane_in(hidden_dim_), lane_norm;
+    for (size_t lane = 0; lane < lanes; ++lane) {
+        for (size_t c = 0; c < hidden_dim_; ++c)
+            lane_in[c] = hidden[c * lanes + lane];
+        if (!apply_rms_norm(lane_in, final_norm_, lane_norm)) return false;
+        std::memcpy(staged + lane * hidden_dim_, lane_norm.data(),
+                    hidden_dim_ * sizeof(uint16_t));
+    }
+    MetalCommandBufferHandle cmd = metal_command_buffer_create(metal_ctx_);
+    if (!cmd) return false;
+    metal_dispatch_gemm_bf16(metal_ctx_, cmd, lm_head_batch_input_,
+                             lm_head_gpu_, lm_head_batch_logits_,
+                             static_cast<int>(lanes), static_cast<int>(vocab),
+                             static_cast<int>(hidden_dim_));
+    metal_dispatch_argmax_fp16(metal_ctx_, cmd, lm_head_batch_logits_,
+                               lm_head_batch_tokens_, static_cast<int>(lanes),
+                               static_cast<int>(vocab));
+    metal_command_buffer_commit(cmd);
+    metal_command_buffer_wait(cmd);
+    const int32_t* toks = static_cast<const int32_t*>(
+        metal_buffer_get_contents(lm_head_batch_tokens_));
+    for (size_t lane = 0; lane < lanes; ++lane) {
+        if (toks[lane] >= 0 && static_cast<size_t>(toks[lane]) < vocab)
+            tokens[lane] = toks[lane];
+    }
+    return true;
+}
+
+void RindiEngine::capture_snapshot(DecodeSnapshot& snap) const {
+    snap.attn_pos.clear();
+    for (const auto& a : attention_layers_) {
+        snap.attn_pos.push_back(a ? a->position() : 0);
+    }
+    snap.gdn_conv.resize(gdn_layers_.size());
+    snap.gdn_state.resize(gdn_layers_.size());
+    for (size_t i = 0; i < gdn_layers_.size(); ++i) {
+        if (gdn_layers_[i]) gdn_layers_[i]->snapshot_state(snap.gdn_conv[i],
+                                                           snap.gdn_state[i]);
+    }
+    snap.mtp_pos = mtp_.position();
+}
+
+void RindiEngine::restore_snapshot(const DecodeSnapshot& snap) {
+    for (size_t i = 0; i < attention_layers_.size() && i < snap.attn_pos.size(); ++i) {
+        if (attention_layers_[i]) attention_layers_[i]->set_position(snap.attn_pos[i]);
+    }
+    for (size_t i = 0; i < gdn_layers_.size() && i < snap.gdn_conv.size(); ++i) {
+        if (gdn_layers_[i]) gdn_layers_[i]->restore_state(snap.gdn_conv[i],
+                                                          snap.gdn_state[i]);
+    }
+    mtp_.restore_kv(snap.mtp_pos, {}, {});
+}
+
 bool RindiEngine::apply_rms_norm(const std::vector<uint16_t>& input,
                                  const std::vector<uint16_t>& weight,
                                  std::vector<uint16_t>& output) const {
@@ -254,13 +408,17 @@ bool RindiEngine::forward_token(const std::vector<uint16_t>& input,
         return false;
     }
 
-    std::vector<uint16_t> next_projection;
-    std::vector<uint16_t> residual;
-    std::vector<uint16_t> core;
-    std::vector<uint16_t> z;
+    // These bind to the member scratch buffers: tail N folds layer N+1's
+    // projection into next_projection_, and each layer's core output lands in
+    // core_scratch_ without a fresh allocation.
+    std::vector<uint16_t>& next_projection = next_projection_;
+    std::vector<uint16_t>& core = core_scratch_;
+    std::vector<uint16_t>& z = z_scratch_;
+    std::vector<uint16_t>& gated = gated_scratch_;
     for (size_t layer = 0; layer < num_layers_; ++layer) {
         const auto layer_core_start = std::chrono::high_resolution_clock::now();
-        residual = hidden;
+        residual_scratch_ = hidden;
+        const std::vector<uint16_t>& residual = residual_scratch_;
         const bool attention = attention_layers_[layer] != nullptr;
 
         if (layer == 0) {
@@ -274,7 +432,7 @@ bool RindiEngine::forward_token(const std::vector<uint16_t>& input,
                 }
                 // q_proj is [q, gate]. Match mlx_lm: apply sigmoid(gate)
                 // before the fused tail, whose input is core + residual.
-                core = std::move(attended);
+                core.swap(attended);
                 for (size_t h = 0; h < 24; ++h) {
                     for (size_t d = 0; d < 256; ++d) {
                         const size_t c = h * 256 + d;
@@ -288,9 +446,8 @@ bool RindiEngine::forward_token(const std::vector<uint16_t>& input,
                 std::cerr << "[RindiEngine] GDN core failed at layer " << layer << std::endl;
                 return false;
             } else {
-                std::vector<uint16_t> gated;
                 if (!gdn_layers_[layer]->gate_core(core, z, gated)) return false;
-                core = std::move(gated);
+                core.swap(gated);
             }
         } else {
             if (next_projection.empty()) {
@@ -306,22 +463,18 @@ bool RindiEngine::forward_token(const std::vector<uint16_t>& input,
                               << ": " << next_projection.size() << std::endl;
                     return false;
                 }
-                // q_proj is laid out per head as [q(256), gate(256)]. Keep
-                // the full projection for core_step(), which extracts q,
-                // then apply the gate before the fused tail.
-                std::vector<uint16_t> q(next_projection.begin(), next_projection.begin() + QG);
-                std::vector<uint16_t> k(next_projection.begin() + QG,
-                                        next_projection.begin() + QG + K);
-                std::vector<uint16_t> v(next_projection.begin() + QG + K,
-                                        next_projection.end());
-                if (!attention_layers_[layer]->core_step(q, k, v, core)) {
+                // q_proj is laid out per head as [q(256), gate(256)]. Read the
+                // q/k/v slices straight out of the folded projection buffer.
+                const uint16_t* np = next_projection.data();
+                if (!attention_layers_[layer]->core_step(np, QG, np + QG, K,
+                                                         np + QG + K, K, core)) {
                     std::cerr << "[RindiEngine] attention folded core failed at layer " << layer << std::endl;
                     return false;
                 }
                 for (size_t h = 0; h < 24; ++h) {
                     for (size_t d = 0; d < 256; ++d) {
                         const size_t c = h * 256 + d;
-                        const float gate = engine_half_to_float(q[h * 512 + 256 + d]);
+                        const float gate = engine_half_to_float(np[h * 512 + 256 + d]);
                         const float sigmoid = 1.0f / (1.0f + std::exp(-gate));
                         core[c] = engine_float_to_half(
                             engine_half_to_float(core[c]) * sigmoid);
@@ -336,21 +489,15 @@ bool RindiEngine::forward_token(const std::vector<uint16_t>& input,
                               << ": " << next_projection.size() << std::endl;
                     return false;
                 }
-                RindiGdnProjectionOutput projected;
-                projected.qkv.assign(next_projection.begin(), next_projection.begin() + QKV);
-                projected.z.assign(next_projection.begin() + QKV,
-                                   next_projection.begin() + QKV + Z);
-                projected.beta.assign(next_projection.begin() + QKV + Z,
-                                      next_projection.begin() + QKV + Z + G);
-                projected.a.assign(next_projection.begin() + QKV + Z + G,
-                                   next_projection.end());
-                if (!gdn_layers_[layer]->core_from_projected(projected, 1, core, z)) {
+                const uint16_t* np = next_projection.data();
+                RindiGdnProjectionView projected{np, np + QKV, np + QKV + Z,
+                                                 np + QKV + Z + G};
+                if (!gdn_layers_[layer]->core_from_projected_view(projected, 1, core, z)) {
                     std::cerr << "[RindiEngine] GDN folded core failed at layer " << layer << std::endl;
                     return false;
                 }
-                std::vector<uint16_t> gated;
                 if (!gdn_layers_[layer]->gate_core(core, z, gated)) return false;
-                core = std::move(gated);
+                core.swap(gated);
             }
         }
 
@@ -435,14 +582,15 @@ bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
 
     std::vector<uint16_t> hidden = input;
     std::vector<uint16_t> normalized;
-    std::vector<uint16_t> next_projection;
-    std::vector<uint16_t> residual;
-    std::vector<uint16_t> core;
-    std::vector<uint16_t> z;
+    std::vector<uint16_t>& next_projection = next_projection_;
+    std::vector<uint16_t>& core = batch_core_scratch_;
+    std::vector<uint16_t>& z = batch_z_scratch_;
+    std::vector<uint16_t>& gated = batch_gated_scratch_;
 
     for (size_t layer = 0; layer < num_layers_; ++layer) {
         const auto layer_start = std::chrono::high_resolution_clock::now();
-        residual = hidden;
+        residual_scratch_ = hidden;
+        const std::vector<uint16_t>& residual = residual_scratch_;
         const bool attention = attention_layers_[layer] != nullptr;
 
         if (layer == 0) {
@@ -488,20 +636,17 @@ bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
             if (next_projection.empty()) return false;
             if (attention) {
                 if (next_projection.size() != (QG + 2 * K) * lanes) return false;
-                std::vector<uint16_t> q(next_projection.begin(),
-                                        next_projection.begin() + QG * lanes);
-                std::vector<uint16_t> k(next_projection.begin() + QG * lanes,
-                                        next_projection.begin() + (QG + K) * lanes);
-                std::vector<uint16_t> v(next_projection.begin() + (QG + K) * lanes,
-                                        next_projection.end());
-                if (!attention_layers_[layer]->core_step_batch(q, k, v, lanes, core))
+                const uint16_t* np = next_projection.data();
+                if (!attention_layers_[layer]->core_step_batch(np, np + QG * lanes,
+                                                               np + (QG + K) * lanes,
+                                                               lanes, core))
                     return false;
                 for (size_t h = 0; h < 24; ++h) {
                     for (size_t d = 0; d < 256; ++d) {
                         const size_t c = h * 256 + d;
                         const size_t qc = h * 512 + 256 + d;
                         for (size_t lane = 0; lane < lanes; ++lane) {
-                            const float gate = engine_half_to_float(q[qc * lanes + lane]);
+                            const float gate = engine_half_to_float(np[qc * lanes + lane]);
                             core[c * lanes + lane] = engine_float_to_half(
                                 engine_half_to_float(core[c * lanes + lane]) /
                                 (1.0f + std::exp(-gate)));
@@ -510,20 +655,14 @@ bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
                 }
             } else {
                 if (next_projection.size() != (QKV + Z + 2 * G) * lanes) return false;
-                RindiGdnProjectionOutput projected;
-                projected.qkv.assign(next_projection.begin(),
-                                     next_projection.begin() + QKV * lanes);
-                projected.z.assign(next_projection.begin() + QKV * lanes,
-                                   next_projection.begin() + (QKV + Z) * lanes);
-                projected.beta.assign(next_projection.begin() + (QKV + Z) * lanes,
-                                      next_projection.begin() + (QKV + Z + G) * lanes);
-                projected.a.assign(next_projection.begin() + (QKV + Z + G) * lanes,
-                                   next_projection.end());
-                std::vector<uint16_t> gated;
-                if (!gdn_layers_[layer]->core_from_projected(projected, lanes, core, z) ||
+                const uint16_t* np = next_projection.data();
+                RindiGdnProjectionView projected{np, np + QKV * lanes,
+                                                 np + (QKV + Z) * lanes,
+                                                 np + (QKV + Z + G) * lanes};
+                if (!gdn_layers_[layer]->core_from_projected_view(projected, lanes, core, z) ||
                     !gdn_layers_[layer]->gate_core_batch(core, z, lanes, gated))
                     return false;
-                core = std::move(gated);
+                core.swap(gated);
             }
         }
 
@@ -557,37 +696,41 @@ int RindiEngine::sample_next_token(const std::vector<uint16_t>& hidden,
     if (lm_head_gpu_ready_ && vocab > 0) {
         std::memcpy(metal_buffer_get_contents(lm_head_input_gpu_),
                     hidden.data(), hidden_dim_ * sizeof(uint16_t));
+        const bool greedy = temperature <= 0.0f;
         MetalCommandBufferHandle cmd = metal_command_buffer_create(metal_ctx_);
         if (cmd) {
             metal_dispatch_gemm_bf16(metal_ctx_, cmd, lm_head_input_gpu_,
                                      lm_head_gpu_, lm_head_logits_gpu_,
                                      1, static_cast<int>(vocab),
                                      static_cast<int>(hidden_dim_));
+            // Greedy sampling fuses the argmax into the same command buffer;
+            // dispatches inside one compute encoder execute in order, so this
+            // removes a second commit/wait round trip per token.
+            bool fused_argmax = false;
+            if (greedy && lm_head_token_gpu_) {
+                metal_dispatch_argmax_fp16(metal_ctx_, cmd, lm_head_logits_gpu_,
+                                           lm_head_token_gpu_, 1,
+                                           static_cast<int>(vocab));
+                fused_argmax = true;
+            }
             metal_command_buffer_commit(cmd);
             metal_command_buffer_wait(cmd);
+            if (fused_argmax) {
+                const int32_t token = *static_cast<const int32_t*>(
+                    metal_buffer_get_contents(lm_head_token_gpu_));
+                if (token >= 0 && static_cast<size_t>(token) < vocab) {
+                    if (std::getenv("RINDI_DEBUG_LOGITS")) {
+                        std::cerr << "[RindiDebug] Metal LM-head argmax token="
+                                  << token << "=\"" << tokenizer_.decode(token)
+                                  << "\"" << std::endl;
+                    }
+                    return token;
+                }
+                fused_argmax = false;  // fall through to the top-k path
+            }
             const uint16_t* logits = static_cast<const uint16_t*>(
                 metal_buffer_get_contents(lm_head_logits_gpu_));
             if (logits) {
-                if (temperature <= 0.0f) {
-                    MetalCommandBufferHandle argmax_cmd = metal_command_buffer_create(metal_ctx_);
-                    if (argmax_cmd) {
-                        metal_dispatch_argmax_fp16(
-                            metal_ctx_, argmax_cmd, lm_head_logits_gpu_,
-                            lm_head_token_gpu_, 1, static_cast<int>(vocab));
-                        metal_command_buffer_commit(argmax_cmd);
-                        metal_command_buffer_wait(argmax_cmd);
-                        const int32_t token = *static_cast<const int32_t*>(
-                            metal_buffer_get_contents(lm_head_token_gpu_));
-                        if (token >= 0 && static_cast<size_t>(token) < vocab) {
-                            if (std::getenv("RINDI_DEBUG_LOGITS")) {
-                                std::cerr << "[RindiDebug] Metal LM-head argmax token="
-                                          << token << "=\"" << tokenizer_.decode(token)
-                                          << "\"" << std::endl;
-                            }
-                            return token;
-                        }
-                    }
-                }
                 for (size_t token = 0; token < vocab; ++token) {
                     const float score = engine_half_to_float(logits[token]);
                     if (top.size() < 64) top.emplace_back(score, static_cast<int>(token));
@@ -788,7 +931,11 @@ std::string RindiEngine::generate(
         }
         std::vector<uint16_t> batch_hidden;
         if (!forward_prompt_batch(batch_input, lanes, batch_hidden) ||
-            batch_hidden.size() != hidden_dim_ * lanes) return "";
+            batch_hidden.size() != hidden_dim_ * lanes) {
+            std::cerr << "[RindiEngine] prompt batch failed at offset " << offset
+                      << " lanes=" << lanes << std::endl;
+            return "";
+        }
         if (std::getenv("RINDI_COMPARE_METAL_TAIL")) {
             const auto& metal_batch = chain_->last_metal_batch_output();
             if (metal_batch.size() == hidden_dim_ * lanes) {
@@ -818,10 +965,258 @@ std::string RindiEngine::generate(
     std::string generated_text;
     std::mt19937 rng(0x523138u);
     const auto decode_start = std::chrono::high_resolution_clock::now();
+    auto first_token_time = decode_start;
+    size_t generated_tokens = 0;
+    bool got_first_token = false;
+
+    const bool spec = mtp_ready_ && mtp_depth_ > 0 && temperature <= 0.0f &&
+                      prompt_tokens.size() > 0;
+    const bool dbg_mtp = std::getenv("RINDI_DEBUG_MTP") != nullptr;
+    size_t spec_steps = 0;
+    const auto emit = [&](int token_id) {
+        std::string token_str = tokenizer_.decode(token_id);
+        if (token_str.empty()) token_str = " ";
+        generated_text += token_str;
+        ++generated_tokens;
+        if (dbg_mtp) std::fprintf(stderr, "[MTPTRACE] emit %d\n", token_id);
+        if (stream_cb) stream_cb(token_str);
+    };
+
+    auto finalize_stats = [&](const std::chrono::high_resolution_clock::time_point& end) {
+        last_stats_.prompt_tokens = prompt_tokens.size();
+        last_stats_.generated_tokens = generated_tokens;
+        last_stats_.prefill_ms = std::chrono::duration<double, std::milli>(
+            prefill_end - prefill_start).count();
+        last_stats_.ttft_ms = got_first_token
+            ? std::chrono::duration<double, std::milli>(first_token_time - t0).count() : 0.0;
+        last_stats_.decode_ms = got_first_token
+            ? std::chrono::duration<double, std::milli>(end - first_token_time).count() : 0.0;
+        last_stats_.total_ms = std::chrono::duration<double, std::milli>(end - t0).count();
+    };
+
+    if (spec) {
+        // ---- Speculative (MTP) greedy decode -------------------------------
+        // Invariant: hidden_state is the state at the position BEFORE cur;
+        // cur is the last emitted but not yet consumed token (-1 = none).
+        int cur = -1;
+        auto round_start = std::chrono::high_resolution_clock::now();
+        std::vector<uint16_t> logits_input;
+        std::vector<int> drafts;
+        std::vector<std::vector<uint16_t>> draft_hs;
+        std::vector<uint16_t> batch_in, batch_hidden, replay_hidden;
+        DecodeSnapshot snap;
+
+        auto sample_cur = [&]() -> bool {
+            if (!apply_rms_norm(hidden_state, final_norm_, logits_input)) return false;
+            cur = argmax_token(logits_input);
+            return cur >= 0;
+        };
+        // Emit at most `allowed` tokens from a confirmed batch; returns the
+        // number actually emitted so the round can stop at the token cap.
+        auto emit_batch = [&](const std::vector<int>& toks, size_t allowed) {
+            const size_t n = std::min(toks.size(), allowed);
+            for (size_t i = 0; i < n; ++i) emit(toks[i]);
+            return n;
+        };
+
+        while (generated_tokens < max_tokens) {
+            if (cur < 0) {
+                if (!sample_cur()) break;
+                if (cur == tokenizer_.eos_token_id()) break;
+                emit(cur);
+                if (got_first_token == false) { first_token_time = std::chrono::high_resolution_clock::now(); got_first_token = true; }
+            }
+
+            {
+                const auto ts = std::chrono::high_resolution_clock::now();
+                capture_snapshot(snap);
+                if (dbg_mtp) std::fprintf(stderr, "[MTPPHASE] snap_ms=%.3f\n",
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::high_resolution_clock::now() - ts).count());
+            }
+            snap.last_hidden = hidden_state;
+
+            drafts.clear();
+            draft_hs.clear();
+            int dtok = cur;
+            std::vector<uint16_t> dh = hidden_state;
+            std::vector<uint16_t> ho;
+            for (int i = 0; i < mtp_depth_; ++i) {
+                int t = -1;
+                if (!mtp_.draft(dtok, dh, ho, t)) break;
+                if (t == tokenizer_.eos_token_id()) break;
+                drafts.push_back(t);
+                draft_hs.push_back(ho);
+                dtok = t;
+            }
+            ++spec_steps;
+            if (dbg_mtp) {
+                const auto now = std::chrono::high_resolution_clock::now();
+                std::fprintf(stderr, "[MTPPHASE] draft_ms=%.3f\n",
+                    std::chrono::duration<double, std::milli>(now - round_start).count());
+                round_start = now;
+            }
+
+            if (drafts.empty()) {
+                // Nothing to verify: consume cur through the target stack,
+                // keeping the draft cache aligned with every confirmed token.
+                mtp_.advance(cur, snap.last_hidden);
+                if (!safetensors_.get_embedding_row_fp16(cur, hidden_dim_, embedding) ||
+                    !forward_token(embedding, hidden_state)) break;
+                cur = -1;   // next round samples fresh
+                continue;
+            }
+
+            const size_t lanes = drafts.size() + 1;
+            batch_in.resize(hidden_dim_ * lanes);
+            {
+                std::vector<int> seq;
+                seq.reserve(lanes);
+                seq.push_back(cur);
+                for (int d : drafts) seq.push_back(d);
+                std::vector<uint16_t> row;
+                for (size_t lane = 0; lane < lanes; ++lane) {
+                    if (!safetensors_.get_embedding_row_fp16(seq[lane], hidden_dim_, row) ||
+                        row.size() != hidden_dim_) {
+                        finalize_stats(std::chrono::high_resolution_clock::now());
+                        return generated_text;
+                    }
+                    for (size_t c = 0; c < hidden_dim_; ++c)
+                        batch_in[c * lanes + lane] = row[c];
+                }
+            }
+            if (!forward_prompt_batch(batch_in, lanes, batch_hidden) ||
+                batch_hidden.size() != hidden_dim_ * lanes) {
+                finalize_stats(std::chrono::high_resolution_clock::now());
+                return generated_text;
+            }
+            if (dbg_mtp) {
+                const auto now2 = std::chrono::high_resolution_clock::now();
+                std::fprintf(stderr, "[MTPPHASE] verify_ms=%.3f\n",
+                    std::chrono::duration<double, std::milli>(now2 - round_start).count());
+                round_start = now2;
+            }
+            std::vector<int> preds;
+            if (!argmax_over_hidden(batch_hidden, lanes, preds)) {
+                finalize_stats(std::chrono::high_resolution_clock::now());
+                return generated_text;
+            }
+
+            size_t n_ok = 0;
+            while (n_ok < drafts.size() && preds[n_ok] == drafts[n_ok]) ++n_ok;
+            if (dbg_mtp) {
+                std::fprintf(stderr, "[MTPTRACE] round cur=%d drafts=", cur);
+                for (int d : drafts) std::fprintf(stderr, "%d,", d);
+                std::fprintf(stderr, " preds=");
+                for (int q : preds) std::fprintf(stderr, "%d,", q);
+                std::fprintf(stderr, " n_ok=%zu\n", n_ok);
+            }
+
+            if (n_ok == drafts.size()) {
+                // Full acceptance: keep every draft plus the bonus token.
+                // Slot the final accepted draft into the draft cache (the
+                // drafting loop only consumed cur..d_{k-1}), paired with the
+                // state at the position BEFORE it: lane L-2 of this verify
+                // batch, which is d_{k-1}'s position for k >= 1, or cur's own
+                // prior state when k == 1.
+                {
+                    const uint16_t* prev_base = lanes >= 2
+                        ? batch_hidden.data() + (lanes - 2) * hidden_dim_
+                        : snap.last_hidden.data();
+                    std::vector<uint16_t> prev_lane(prev_base,
+                                                    prev_base + hidden_dim_);
+                    mtp_.advance(drafts.back(), prev_lane);
+                }
+                const int bonus = preds[lanes - 1];
+                hidden_state.assign(batch_hidden.end() - hidden_dim_,
+                                    batch_hidden.end());
+                std::vector<int> confirmed(drafts);
+                if (bonus != tokenizer_.eos_token_id()) confirmed.push_back(bonus);
+                const size_t allowed = max_tokens - generated_tokens;
+                const size_t took = emit_batch(confirmed, allowed);
+                cur = confirmed[took - 1];
+                if (took < confirmed.size() || bonus == tokenizer_.eos_token_id()) {
+                    if (bonus == tokenizer_.eos_token_id() && took == confirmed.size())
+                        cur = -1;
+                    break;
+                }
+            } else {
+                // Partial: rewind, replay the proven prefix, take the fix.
+                {
+                    const auto tr = std::chrono::high_resolution_clock::now();
+                    restore_snapshot(snap);
+                    if (dbg_mtp) std::fprintf(stderr, "[MTPPHASE] restore_ms=%.3f\n",
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::high_resolution_clock::now() - tr).count());
+                }
+                const size_t keep_len = n_ok + 1;   // [cur] + accepted drafts
+                replay_hidden.clear();
+                batch_in.resize(hidden_dim_ * keep_len);
+                {
+                    std::vector<int> seq;
+                    seq.push_back(cur);
+                    for (size_t i = 0; i < n_ok; ++i) seq.push_back(drafts[i]);
+                    std::vector<uint16_t> row;
+                    for (size_t lane = 0; lane < keep_len; ++lane) {
+                        if (!safetensors_.get_embedding_row_fp16(seq[lane], hidden_dim_, row)) {
+                            finalize_stats(std::chrono::high_resolution_clock::now());
+                            return generated_text;
+                        }
+                        for (size_t c = 0; c < hidden_dim_; ++c)
+                            batch_in[c * keep_len + lane] = row[c];
+                    }
+                }
+                if (!forward_prompt_batch(batch_in, keep_len, replay_hidden) ||
+                    replay_hidden.size() != hidden_dim_ * keep_len) {
+                    finalize_stats(std::chrono::high_resolution_clock::now());
+                    return generated_text;
+                }
+                hidden_state.assign(
+                    replay_hidden.end() - hidden_dim_, replay_hidden.end());
+                const int fix = preds[n_ok];
+                std::vector<int> confirmed(drafts.begin(),
+                                           drafts.begin() + n_ok);
+                if (fix != tokenizer_.eos_token_id()) confirmed.push_back(fix);
+                const size_t allowed = max_tokens - generated_tokens;
+                const size_t took = emit_batch(confirmed, allowed);
+                if (fix == tokenizer_.eos_token_id()) {
+                    mtp_.restore_kv(snap.mtp_pos, {}, {});
+                    break;
+                }
+                if (took < confirmed.size()) break;   // token cap reached
+                cur = fix;
+                // Re-align the draft cache over the confirmed suffix so the
+                // next round's drafts continue at the right positions. Entry
+                // i pairs draft i with the state BEFORE it: d_0 follows cur
+                // (snap.last_hidden), d_i follows d_{i-1} (draft_hs[i-1]).
+                mtp_.restore_kv(snap.mtp_pos, {}, {});
+                {
+                    std::vector<uint16_t> prev = snap.last_hidden;
+                    for (size_t i = 0; i < n_ok; ++i) {
+                        mtp_.advance(drafts[i], prev);
+                        prev = draft_hs[i];
+                    }
+                    mtp_.advance(fix, hidden_state);
+                }
+            }
+        }
+        last_eval_ms_ = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t0).count();
+        finalize_stats(std::chrono::high_resolution_clock::now());
+        last_stats_.spec_used = true;
+        last_stats_.spec_steps = spec_steps;
+        last_stats_.accepted_per_step = spec_steps > 0
+            ? static_cast<double>(generated_tokens) / static_cast<double>(spec_steps)
+            : 0.0;
+        return generated_text;
+    }
 
     for (int step = 0; step < max_tokens; ++step) {
         std::vector<uint16_t> logits_input;
-        if (!apply_rms_norm(hidden_state, final_norm_, logits_input)) return generated_text;
+        if (!apply_rms_norm(hidden_state, final_norm_, logits_input)) {
+            finalize_stats(std::chrono::high_resolution_clock::now());
+            return generated_text;
+        }
         if (std::getenv("RINDI_DEBUG_HIDDEN")) {
             float raw_sq = 0.0f, norm_sq = 0.0f;
             for (size_t i = 0; i < hidden_dim_; ++i) {
@@ -842,6 +1237,14 @@ std::string RindiEngine::generate(
         }
         int next_token_id = sample_next_token(logits_input, temperature, rng);
         if (next_token_id == tokenizer_.eos_token_id()) break;
+        if (std::getenv("RINDI_DEBUG_MTP"))
+            std::fprintf(stderr, "[PLAINTRACE] emit %d\n", next_token_id);
+        if (!got_first_token) {
+            first_token_time = std::chrono::high_resolution_clock::now();
+            got_first_token = true;
+        }
+        ++generated_tokens;
+        (void)spec;
 
         std::string token_str = tokenizer_.decode(next_token_id);
         if (token_str.empty()) {
@@ -857,12 +1260,16 @@ std::string RindiEngine::generate(
         // avoid an extra 64-layer ANE pass after the final requested token.
         if (step + 1 < max_tokens) {
             if (!safetensors_.get_embedding_row_fp16(next_token_id, hidden_dim_, embedding) ||
-                !forward_token(embedding, hidden_state)) return generated_text;
+                !forward_token(embedding, hidden_state)) {
+                finalize_stats(std::chrono::high_resolution_clock::now());
+                return generated_text;
+            }
         }
     }
 
     auto t1 = std::chrono::high_resolution_clock::now();
     last_eval_ms_ = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    finalize_stats(t1);
     if (std::getenv("RINDI_DEBUG_TIMING")) {
         const double decode_ms = std::chrono::duration<double, std::milli>(
             t1 - decode_start).count();

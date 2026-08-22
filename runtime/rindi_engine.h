@@ -16,8 +16,32 @@
 #include "rindi_native_chain.h"
 #include "rindi_attention.h"
 #include "rindi_gdn_layer.h"
+#include "rindi_mtp.h"
 #include "metal_engine.h"
 #include "ane_c_bridge.h"
+
+// Measured generation counters. Every field is filled from a timer inside
+// RindiEngine::generate(); nothing here is estimated.
+struct GenerationStats {
+    size_t prompt_tokens{0};
+    size_t generated_tokens{0};   // includes the prefill-derived first token
+    double prefill_ms{0.0};
+    double ttft_ms{0.0};          // request -> first sampled token
+    double decode_ms{0.0};        // first sampled token -> last
+    double total_ms{0.0};
+    size_t spec_steps{0};          // speculative verify rounds
+    double accepted_per_step{0.0}; // confirmed tokens per verify round
+    bool spec_used{false};
+    double prefill_tps() const {
+        return prefill_ms > 0.0 ? static_cast<double>(prompt_tokens) * 1000.0 / prefill_ms : 0.0;
+    }
+    // The first token costs prefill, not decode, so the decode window holds
+    // generated_tokens - 1 tokens.
+    double decode_tps() const {
+        return decode_ms > 0.0 && generated_tokens > 1
+            ? static_cast<double>(generated_tokens - 1) * 1000.0 / decode_ms : 0.0;
+    }
+};
 
 class RindiEngine {
 public:
@@ -47,6 +71,7 @@ public:
     );
 
     double get_last_eval_ms() const { return last_eval_ms_; }
+    const GenerationStats& get_last_stats() const { return last_stats_; }
 
 private:
     std::string model_path_;
@@ -66,6 +91,9 @@ private:
     MetalBufferHandle lm_head_logits_gpu_{nullptr};
     MetalBufferHandle lm_head_input_gpu_{nullptr};
     MetalBufferHandle lm_head_token_gpu_{nullptr};
+    MetalBufferHandle lm_head_batch_input_{nullptr};
+    MetalBufferHandle lm_head_batch_logits_{nullptr};
+    MetalBufferHandle lm_head_batch_tokens_{nullptr};
     bool lm_head_gpu_ready_{false};
 
     std::vector<std::unique_ptr<RindiAttention>> attention_layers_;
@@ -75,10 +103,52 @@ private:
     bool scheduler_ready_{false};
 
     double last_eval_ms_{0.0};
+    GenerationStats last_stats_;
+    MtpBlock mtp_;
+    bool mtp_ready_{false};
+    int mtp_depth_{2};
+    // int4 copy of lm_head used ONLY for draft-token argmax (4x less weight
+    // traffic per drafted token than the BF16 head).
+    RindiAneProjection lm_head_draft_;
+    bool lm_head_draft_ready_{false};
+
+    // Per-token scratch reused across layers and steps to keep the decode
+    // loop free of large allocations. next_projection_ deliberately lives
+    // across loop iterations: tail N folds layer N+1's projection into it.
+    std::vector<uint16_t> hidden_scratch_;
+    std::vector<uint16_t> normalized_scratch_;
+    std::vector<uint16_t> next_projection_;
+    std::vector<uint16_t> core_scratch_;
+    std::vector<uint16_t> z_scratch_;
+    std::vector<uint16_t> residual_scratch_;
+    std::vector<uint16_t> gated_scratch_;
+    std::vector<uint16_t> batch_core_scratch_;
+    std::vector<uint16_t> batch_gated_scratch_;
+    std::vector<uint16_t> batch_z_scratch_;
 
     bool init_model();
     bool init_gpu_lm_head();
     bool init_scheduler();
+    bool init_mtp();
+
+    // Greedy lm-head argmax over an already-normalized hidden vector.
+    int argmax_token(const std::vector<uint16_t>& logits_input);
+    // Batched greedy predictions over channel-major hidden [C, lanes].
+    bool argmax_over_hidden(const std::vector<uint16_t>& hidden,
+                            size_t lanes, std::vector<int>& tokens);
+
+    // Speculative-decode rollback. Attention caches rewind by position only:
+    // rows beyond position_ are unreachable through causal masking. The GDN
+    // conv windows and recurrent states mutate in place, so they need real
+    // copies (~75 MB per snapshot, reused across steps).
+    struct DecodeSnapshot {
+        std::vector<size_t> attn_pos;
+        std::vector<std::vector<uint16_t>> gdn_conv, gdn_state;
+        size_t mtp_pos{0};
+        std::vector<uint16_t> last_hidden;
+    };
+    void capture_snapshot(DecodeSnapshot& snap) const;
+    void restore_snapshot(const DecodeSnapshot& snap);
     bool forward_token(const std::vector<uint16_t>& input,
                        std::vector<uint16_t>& output);
     bool forward_prompt_batch(const std::vector<uint16_t>& input,
