@@ -999,6 +999,7 @@ std::string RindiEngine::generate(
         // Invariant: hidden_state is the state at the position BEFORE cur;
         // cur is the last emitted but not yet consumed token (-1 = none).
         int cur = -1;
+        size_t hot_streak = 0;   // consecutive full accepts -> deeper drafts
         auto round_start = std::chrono::high_resolution_clock::now();
         std::vector<uint16_t> logits_input;
         std::vector<int> drafts;
@@ -1038,10 +1039,18 @@ std::string RindiEngine::generate(
 
             drafts.clear();
             draft_hs.clear();
+            // Adaptive depth: tails are lane-invariant in COST (a K-lane
+            // verify costs ~= a 1-lane step on this ANE backend), so when the
+            // drafter is hot, deeper drafts propose more near-free tokens.
+            // Retreat on any miss. Acceptance still goes through the proven
+            // re-forward replay, so drafting depth does not affect exactness.
+            int depth = mtp_depth_;
+            if (hot_streak >= 2) depth = std::min<int>(depth + 2, 8);
+            else if (hot_streak >= 1) depth = std::min<int>(depth + 1, 8);
             int dtok = cur;
             std::vector<uint16_t> dh = hidden_state;
             std::vector<uint16_t> ho;
-            for (int i = 0; i < mtp_depth_; ++i) {
+            for (int i = 0; i < depth; ++i) {
                 int t = -1;
                 if (!mtp_.draft(dtok, dh, ho, t)) break;
                 if (t == tokenizer_.eos_token_id()) break;
@@ -1113,6 +1122,7 @@ std::string RindiEngine::generate(
             }
 
             if (n_ok == drafts.size()) {
+                ++hot_streak;
                 // Full acceptance: keep every draft plus the bonus token.
                 // Slot the final accepted draft into the draft cache (the
                 // drafting loop only consumed cur..d_{k-1}), paired with the
@@ -1141,6 +1151,7 @@ std::string RindiEngine::generate(
                     break;
                 }
             } else {
+                hot_streak = 0;   // a miss retreats the next round's draft depth
                 // Partial: rewind, replay the proven prefix, take the fix.
                 {
                     const auto tr = std::chrono::high_resolution_clock::now();
