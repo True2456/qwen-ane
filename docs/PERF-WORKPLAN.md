@@ -152,17 +152,23 @@ MLX's real int4 GEMM lives locally at
   register-blocked accumulation). It is a large careful port, NOT a oneshot
   glyph dump - the failed drafts underscore this.
 
-## P4b - Port plan (next work item, runnable gate: bit-exact + BETTER)
-1. Write gemm_int4_groupwise_tile: one threadgroup per ROWS_TILE x 32 lane
-   block; stream K in 64-col steps loading A-block + W-block into
-   threadgroup  once per step (amortized DRAM).
-2. Register-block: each thread accumulates kR rows x kC lanes in local
-   registers, unrolled inner loop over shared block.
-3. A/B litmus via probes/test_metal_gemm_micro.cpp (already exists): assert
-   mismatches=0 AND strict ms/call < 5.4 before wiring. NEVER wire an
-   unverified kernel.
-4. If the tile kernel passes, branch/renv toggle) switches the prefill
-   path. Then re-measure full Metal prefill.
+## P4b - Attempted row-tile - REJECTED by harness (measured facts)
+- ATTEMPTED gemm_int4_groupwise_tile: one threadgroup per 16-row x 32-lane
+  block, A-block + W-block streamed into threadgroup once per K-step (the
+  A-amortization idea). 
+- WAS REJECTED by probes/test_metal_gemm_micro.cpp:
+  TILE-vs-BATCH mism=1114112/1114112 maxdiff=22.7 (WRONG) AND 21.9ms vs
+  BATCH 5.4ms (SLOWER). Reverted to the committed BATCH kernel. The harness
+  gate did its job - a silent-bug kernel was caught before wiring.
+- WHY: row-tile with serial-K per thread LOSES the K-parallelism that makes
+  BATCH fast. A-sharing helps DRAM but serial-K per thread dominates.
+- VERIFIED: `simdgroup_matrix<float,N,M>` COMPILES in this engine's runtime
+  WGSL dialect (via newLibraryWithSource test). So MLX's register-blocked
+  MMA IS reachable here - the true MLX-speed path is NOT just row-tiling but
+  output-tiles + register-blocked simdgroup MMA.
+- REAL NEXT: port a minimal register-blocked MMAFrag accumulation into a
+  GEMM, bit-exact gate it in the harness BEFORE wiring. Prefer MLX's
+  gemm_splitk/steel_gemm structure as the reference (in mlx-swift).
 
 ## Targets
 - decode: ~4.5 tok/s measured now (was 4.0->4.3). Single forward near the
