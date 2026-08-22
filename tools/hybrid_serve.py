@@ -136,8 +136,13 @@ class HybridEngine:
             print("  [ANE Engine] Registering 64 packaged ANE resident programs...")
             ane_pkg_dir = str(Path(model_path) / manifest.get("ane_layers_dir", "ane_layers"))
             self.ane_layers = ane_serve.attach_ane_chain(self.model, "mil", 32, dense_bits, ane_pkg_dir)
-            ane_serve.attach_ane_lm_head(self.model, "mil", 32, dense_bits, 4)
+            if os.environ.get("RINDI_SKIP_ANE_LM_HEAD") != "1":
+                ane_serve.attach_ane_lm_head(self.model, "mil", 32, dense_bits, 4)
+            else:
+                print("  [ANE lm_head] skipped by RINDI_SKIP_ANE_LM_HEAD; using MLX head")
             print(f"  ANE resident programs: {self.ane_layers} layers (41.0 GB host RAM freed)")
+            if self.mode == "silent":
+                self._release_gpu_prefill()
         else:
             print(f"  [Loading Base Model (Lazy mmap)] {model_path}...")
             self.model, self.tok = load(model_path, lazy=True)
@@ -159,12 +164,38 @@ class HybridEngine:
             print("  [ANE Engine] Registering 64 ANE resident layers (41.0 GB freed)...")
             cr = ane_serve._bake_cache_dir(model_path, dense_bits) if bake_cache else None
             self.ane_layers = ane_serve.attach_ane_chain(self.model, "mil", 32, dense_bits, cr)
-            ane_serve.attach_ane_lm_head(self.model, "mil", 32, dense_bits, 4)
+            if os.environ.get("RINDI_SKIP_ANE_LM_HEAD") != "1":
+                ane_serve.attach_ane_lm_head(self.model, "mil", 32, dense_bits, 4)
+            else:
+                print("  [ANE lm_head] skipped by RINDI_SKIP_ANE_LM_HEAD; using MLX head")
 
             # 7. Release unquantized host RAM and clear MLX cache
-            import gc
-            mx.clear_cache()
-            gc.collect()
+            if self.mode == "silent":
+                self._release_gpu_prefill()
+            else:
+                import gc
+                mx.clear_cache()
+                gc.collect()
+
+    def _release_gpu_prefill(self):
+        """Release the duplicate full MLX/GPU prefill model in silent mode.
+
+        Silent mode decodes through the resident ANE chain and only needs the
+        slimmed model object for embeddings, attention/GDN state, and the MLX
+        lm_head fallback. Keeping the separate GPU prefill model alive maps
+        the full checkpoint into Metal and defeats the ANE memory reduction.
+        """
+        import gc
+        released = []
+        for name in ("gpu_inner", "gpu_model"):
+            if hasattr(self, name):
+                delattr(self, name)
+                released.append(name)
+        mx.clear_cache()
+        gc.collect()
+        if released:
+            print("  [Memory] released GPU prefill model for silent mode "
+                  f"({', '.join(released)})", flush=True)
 
     def _init_mtp_head(self):
         w = {}
@@ -287,7 +318,7 @@ class HybridEngine:
             # Full cold prefill
             ids_arr = mx.array(remaining_tokens)
             t_prefill = time.perf_counter()
-            if len(remaining_tokens) > 32 and hasattr(self, "gpu_inner"):
+            if exec_mode != "silent" and len(remaining_tokens) > 32 and hasattr(self, "gpu_inner"):
                 h = self.gpu_inner(ids_arr[None], cache=c)
                 tag = "Metal GPU Tensor Cores"
             else:
@@ -311,7 +342,7 @@ class HybridEngine:
                 # Incremental delta prefill for only new user/tool tokens
                 ids_rem = mx.array(remaining_tokens)
                 t_delta = time.perf_counter()
-                if len(remaining_tokens) > 32 and hasattr(self, "gpu_inner"):
+                if exec_mode != "silent" and len(remaining_tokens) > 32 and hasattr(self, "gpu_inner"):
                     h = self.gpu_inner(ids_rem[None], cache=c)
                     delta_tag = "Metal GPU Tensor Cores"
                 else:

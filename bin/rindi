@@ -10,8 +10,11 @@ while [ -h "$SOURCE" ]; do
 done
 ROOT_DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 
-# Prevent OpenMP duplicate runtime initialization conflict on macOS
-export KMP_DUPLICATE_LIB_OK=TRUE
+# Ensure native server binary is compiled
+if [ ! -f "$ROOT_DIR/runtime/rindi-server" ]; then
+  echo "[Rindi] Compiling native Apple Silicon ANE + Metal GPU server..."
+  make -C "$ROOT_DIR" || exit 1
+fi
 
-# Launch Unified Rindi ANE + Metal GPU Hybrid Inference Server
-exec python3 "$ROOT_DIR/tools/hybrid_serve.py" "$@"
+# Launch Native C++ Inference Server
+exec "$ROOT_DIR/runtime/rindi-server" "$@"

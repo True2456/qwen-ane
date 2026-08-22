@@ -217,6 +217,140 @@ void metal_dispatch_gemm_fp16(
 );
 
 /**
+ * Dispatches GEMM with a BF16 weight matrix:
+ * out_buf [M, N] = in_buf [M, K] @ weight_buf.T [N, K].
+ * The BF16 weights are converted on the GPU during the dot product.
+ */
+void metal_dispatch_gemm_bf16(
+    MetalContext* ctx,
+    MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle in_buf,
+    MetalBufferHandle weight_buf,
+    MetalBufferHandle out_buf,
+    int M,
+    int N,
+    int K
+);
+
+/**
+ * Groupwise-int4 matrix projection. Weights are row-major packed as eight
+ * signed 4-bit values per uint32; scales/biases are BF16 per 64 columns.
+ * Input/output use channel-major [feature, lane] layout.
+ */
+void metal_dispatch_gemm_int4_groupwise(
+    MetalContext* ctx,
+    MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle input_buf,
+    MetalBufferHandle weight_buf,
+    MetalBufferHandle scale_buf,
+    MetalBufferHandle bias_buf,
+    MetalBufferHandle output_buf,
+    int rows,
+    int logical_cols,
+    int packed_cols,
+    int groups,
+    int lanes
+);
+
+/* Same projection with byte offsets into the input/output channel-major
+ * buffers. This lets a fused tail write several folded projections into one
+ * contiguous next-layer buffer without a CPU concat. */
+void metal_dispatch_gemm_int4_groupwise_offset(
+    MetalContext* ctx,
+    MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle input_buf,
+    size_t input_offset,
+    MetalBufferHandle weight_buf,
+    MetalBufferHandle scale_buf,
+    MetalBufferHandle bias_buf,
+    MetalBufferHandle output_buf,
+    size_t output_offset,
+    int rows,
+    int logical_cols,
+    int packed_cols,
+    int groups,
+    int lanes
+);
+
+void metal_dispatch_gemm_int4_rowwise_offset(
+    MetalContext* ctx,
+    MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle input_buf,
+    size_t input_offset,
+    MetalBufferHandle weight_buf,
+    MetalBufferHandle scale_buf,
+    MetalBufferHandle output_buf,
+    size_t output_offset,
+    int rows,
+    int logical_cols,
+    int packed_cols,
+    int lanes
+);
+
+/* Tiled variant for exact ANE chain blobs (one FP16 scale per output row). */
+void metal_dispatch_gemm_int4_rowwise_tiled_offset(
+    MetalContext* ctx,
+    MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle input_buf,
+    size_t input_offset,
+    MetalBufferHandle weight_buf,
+    MetalBufferHandle scale_buf,
+    MetalBufferHandle output_buf,
+    size_t output_offset,
+    int rows,
+    int logical_cols,
+    int packed_cols,
+    int lanes
+);
+
+void metal_dispatch_add_channel_fp16(
+    MetalContext* ctx,
+    MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle a_buf,
+    MetalBufferHandle b_buf,
+    MetalBufferHandle out_buf,
+    int channels,
+    int lanes
+);
+
+void metal_dispatch_rmsnorm_channel_fp16(
+    MetalContext* ctx,
+    MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle input_buf,
+    MetalBufferHandle weight_buf,
+    MetalBufferHandle output_buf,
+    int channels,
+    int lanes,
+    float eps
+);
+
+void metal_dispatch_swiglu_channel_fp16(
+    MetalContext* ctx,
+    MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle gate_up_buf,
+    MetalBufferHandle output_buf,
+    int intermediate,
+    int lanes
+);
+
+/** Advance a GDN state for a batch of causal lanes on Metal. */
+void metal_dispatch_gdn_recurrence(
+    MetalContext* ctx,
+    MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle state_buf,
+    MetalBufferHandle decay_buf,
+    MetalBufferHandle key_buf,
+    MetalBufferHandle query_buf,
+    MetalBufferHandle value_buf,
+    MetalBufferHandle beta_buf,
+    MetalBufferHandle output_buf,
+    int heads,
+    int key_dim,
+    int value_dim,
+    int lanes
+);
+
+/**
  * Dispatches GPU Argmax FP16: out_tokens [B] = argmax(logits [B, V], axis=-1).
  */
 void metal_dispatch_argmax_fp16(

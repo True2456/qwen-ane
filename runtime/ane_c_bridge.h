@@ -35,6 +35,34 @@ void ane_context_destroy(ANEContext* ctx);
 ANEModel* ane_model_load_compiled(ANEContext* ctx, const char* package_path, const char* key, int qos);
 
 /**
+ * Build/load an ANE model from MIL text and raw weight payloads. Payloads are
+ * wrapped in the milinternal 128-byte blob format used by q38_ane_engine.py.
+ * `weight_names` must match the @model_path/weights/<name> paths in MIL.
+ */
+ANEModel* ane_model_compile_mil(
+    ANEContext* ctx,
+    const char* mil_text,
+    const char* const* weight_names,
+    const void* const* weight_data,
+    const size_t* weight_sizes,
+    size_t weight_count,
+    int instance_hint,
+    int qos
+);
+
+/**
+ * Return the channel dimension of each compiled output, in the ANE symbol
+ * order.  MIL may reorder tuple outputs during compilation, so callers that
+ * bind multiple IOSurfaces must use this order rather than the source tuple
+ * order.
+ */
+size_t ane_model_output_channels(
+    ANEModel* model,
+    size_t* channels,
+    size_t capacity
+);
+
+/**
  * Free an ANEModel.
  */
 void ane_model_release(ANEModel* model);
@@ -47,6 +75,15 @@ ANERequest* ane_request_create(
     ANEModel* model,
     IOSurfaceRef input_surface,
     IOSurfaceRef output_surface,
+    int procedure_index
+);
+
+ANERequest* ane_request_create_multi(
+    ANEContext* ctx,
+    ANEModel* model,
+    IOSurfaceRef input_surface,
+    IOSurfaceRef* output_surfaces,
+    size_t output_count,
     int procedure_index
 );
 

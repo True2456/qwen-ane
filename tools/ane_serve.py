@@ -1446,6 +1446,17 @@ def attach_ane_chain(model, engine_path, seq, bits, cache=None):
                     return call
 
                 m.__class__ = type("AneChainProj", (type(m),), {"__call__": rd()})
+            # The folded projection and input norm are now read from the
+            # previous tail's output surface.  Drop their MLX buffers too;
+            # retaining them defeats the point of the chained ANE path and
+            # can keep several gigabytes of unified memory resident.
+            FREED[0] += _free_mlx(
+                (nb.input_layernorm, "weight"),
+                *[(getattr(nb.linear_attn if getattr(nb, "is_linear", False)
+                           else nb.self_attn, name), "weight")
+                  for name, _, _ in spans],
+            )
+            _reclaim()
         done += 1
         if done % 16 == 0 or done == N:
             print(f"    chained {done}/{N} ({total/1e9:.1f} GB, "
