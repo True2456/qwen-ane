@@ -126,9 +126,43 @@ the server or TUI reports must come from a measured timer.
   tail_ms/layer 30 -> 18 ms, Metal prefill 12.6 -> 19.6 tok/s.
 - HONEST REMAINDER: Metal-tail prefill is now 19.6 tok/s vs ANE's ~71. The
   K-parallel kernel still leaves 5.4 ms/call (MLX ~0.5 ms). Next lever is
-  2D row-tiling (one threadgroup cycles several output rows to amortize the
-  A load and cut the per-kernel grid to ~2ms), then a shared-K-load across
-  the group. Until that lands, ANE fused tails stay the prefill backend.
+  2D row/col output-tiling + shared block loaders (below). Until that lands,
+  ANE fused tails stay the prefill backend.
+
+### Why MLX is still ~10x faster (source-verified, not guessed)
+MLX's real int4 GEMM lives locally at
+  /Users/true/AppleLLM/.build/checkouts/mlx-swift/Source/Cmlx/mlx-generated/
+  metal/steel/gemm/{gemm.h, mma.h, loader.h} + kernels/steel_gemm_splitk.h.
+- gemm.h GEMMKernel: blocks the output into BMxBN tiles (NOT one row like
+  ours); each threadgroup owns an output tile and streams A/B K-blocks
+  through threadgroup shared memory (BlockLoader, loaders).
+- loader.h: block loaders read A-tile + B-tile chunks once per K-step into
+  shared threadgroup memory; DRAM A/B traffic amortized across the tile,
+  so A+B are*not* re-read per output row (our kernel re-reads the whole
+  A matrix for every threadgroup row).
+- mma.h: register-blocked MMAFrag - 8x8 metal::simdgroup_matrix fragments,
+  each thread holds WM*WN accumulators in fp32 registers and does the full
+  inner product with fragment loads + unrolled outer product. This is the
+  SIMD/HMA unit that gets the NU-factor; our per-thread scalar inner loop
+  cannot reach it.
+- kernels: gemm_splitk split-K across tid.z partitions with atomic
+  accumulation. Also gemm_fused (loads A operand tiles) etc.
+- CONCLUSION: the 12 TFLOP/s ceiling is reachable in our engine by porting
+  this structure into WGSL (output tiles + threadgroup block loaders +
+  register-blocked accumulation). It is a large careful port, NOT a oneshot
+  glyph dump - the failed drafts underscore this.
+
+## P4b - Port plan (next work item, runnable gate: bit-exact + BETTER)
+1. Write gemm_int4_groupwise_tile: one threadgroup per ROWS_TILE x 32 lane
+   block; stream K in 64-col steps loading A-block + W-block into
+   threadgroup  once per step (amortized DRAM).
+2. Register-block: each thread accumulates kR rows x kC lanes in local
+   registers, unrolled inner loop over shared block.
+3. A/B litmus via probes/test_metal_gemm_micro.cpp (already exists): assert
+   mismatches=0 AND strict ms/call < 5.4 before wiring. NEVER wire an
+   unverified kernel.
+4. If the tile kernel passes, branch/renv toggle) switches the prefill
+   path. Then re-measure full Metal prefill.
 
 ## Targets
 - decode: ~4.5 tok/s measured now (was 4.0->4.3). Single forward near the
