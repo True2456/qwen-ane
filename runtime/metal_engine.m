@@ -279,6 +279,49 @@ static const char* kDefaultShadersSource =
 "    C[row * lanes + lane] = half(sum);\n"
 "}\n"
 "\n"
+"kernel void gemm_int4_rowwise_batch(\n"
+"    device const half*   A     [[buffer(0)]],   // [K, lanes] channel-major\n"
+"    device const uchar*  W     [[buffer(1)]],   // [rows, packed_cols] 2 nibbles/byte\n"
+"    device const half*   S     [[buffer(2)]],   // [rows] per-row scale\n"
+"    device half*         C     [[buffer(3)]],   // [rows, lanes]\n"
+"    constant uint& rows         [[buffer(4)]],\n"
+"    constant uint& cols         [[buffer(5)]],\n"
+"    constant uint& packed_cols  [[buffer(6)]],\n"
+"    constant uint& lanes        [[buffer(7)]],\n"
+"    uint row [[threadgroup_position_in_grid]],\n"
+"    uint tid [[thread_index_in_threadgroup]],\n"
+"    uint tg  [[threads_per_threadgroup]],\n"
+"    threadgroup float* shared [[threadgroup(0)]]) {\n"
+"    if (row >= rows) return;\n"
+"    uint lane = tid % lanes;\n"
+"    uint kpar = tid / lanes;\n"
+"    uint lane_count = min(lanes, 32u);\n"
+"    if (lane >= lane_count) { shared[tid] = 0.0f; return; }\n"
+"    device const uchar* wrow = W + (size_t)row * packed_cols;\n"
+"    uint nlane_tg = tg / lane_count;    // kpar slices per row\n"
+"    float acc = 0.0f;\n"
+"    float scale = float(S[row]);\n"
+"    for (uint kp = kpar; kp < nlane_tg; kp += nlane_tg) {\n"
+"        uint c2_lo = (packed_cols * kp) / nlane_tg;\n"
+"        uint c2_hi = (packed_cols * (kp + 1u)) / nlane_tg;\n"
+"        for (uint c = c2_lo; c < c2_hi; ++c) {\n"
+"            uchar packed = wrow[c];\n"
+"            int q0 = int(packed & 0x0fu); if (q0 >= 8) q0 -= 16;\n"
+"            int q1 = int((packed >> 4u) & 0xfu); if (q1 >= 8) q1 -= 16;\n"
+"            acc += float(A[(2*c) * lanes + lane]) * float(q0) * scale;\n"
+"            acc += float(A[(2*c+1) * lanes + lane]) * float(q1) * scale;\n"
+"        }\n"
+"    }\n"
+"    shared[tid] = acc;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    for (uint off = nlane_tg / 2u; off > 0u; off >>= 1u) {\n"
+"        if (kpar < off)\n"
+"            shared[tid] += shared[(kpar + off) * lane_count + lane];\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    }\n"
+"    if (kpar == 0u) C[row * lanes + lane] = half(shared[lane]);\n"
+"}\n"
+"\n"
 "kernel void gemm_int4_rowwise_tiled(\n"
 "    device const half* A       [[buffer(0)]],\n"
 "    device const uchar* W      [[buffer(1)]],\n"
@@ -575,8 +618,62 @@ static const char* kDefaultShadersSource =
 "    if (tid == 0u) y[row] = half(shared[0]);\n"
 "}\n"
 "\n"
-"kernel void attn_scores_fp16(\n"
+"// Batched (lanes>1) groupwise int4 GEMM, K-parallel + lane-shared weight\n"
+"// loads. One threadgroup per output row; threads tile (lane,kpar); each\n"
+"// thread reduces a K-strided slice; tree-sum over kpar per lane. Each W row\n"
+"// is read once and shared across all lanes, and K is split across threads.\n"
+"kernel void gemm_int4_groupwise_batch(\n"
+"    device const uint*   W     [[buffer(0)]],   // [rows, packed_cols]\n"
+"    device const ushort* S     [[buffer(1)]],   // bf16 scales [rows*groups]\n"
+"    device const ushort* B     [[buffer(2)]],   // bf16 biases\n"
+"    device const half*   A     [[buffer(3)]],   // [K, lanes] channel-major\n"
+"    device half*         C     [[buffer(4)]],   // [rows, lanes]\n"
+"    constant uint& rows         [[buffer(5)]],\n"
+"    constant uint& packed_cols  [[buffer(6)]],\n"
+"    constant uint& groups       [[buffer(7)]],\n"
+"    constant uint& lanes        [[buffer(8)]],\n"
+"    uint row [[threadgroup_position_in_grid]],\n"
+"    uint tid [[thread_index_in_threadgroup]],\n"
+"    uint tg  [[threads_per_threadgroup]],\n"
+"    threadgroup float* shared [[threadgroup(0)]]) {\n"
+"    if (row >= rows) return;\n"
+"    // Threads laid out as [kpar, lane] to coalesce the shared W word\n"
+"    // across lanes: tid = kpar*lanes + lane, so lane is contiguous-quick.\n"
+"    uint lane = tid % lanes;\n"
+"    uint kpar = tid / lanes;\n"
+"    uint lane_count = min(lanes, 32u);\n"
+"    if (lane >= lane_count) { shared[tid] = 0.0f; return; }\n"
+"    device const uint* wrow = W + (size_t)row * packed_cols;\n"
+"    uint nlane_tg = tg / lane_count;    // kpar slices per threadgroup\n"
+"    float acc = 0.0f;\n"
+"    // Grid over K in nlane_tg equal-sized slices.\n"
+"    for (uint kp = kpar; kp < nlane_tg; kp += nlane_tg) {\n"
+"        uint c8_lo = (packed_cols * kp) / nlane_tg;\n"
+"        uint c8_hi = (packed_cols * (kp + 1u)) / nlane_tg;\n"
+"        for (uint c8 = c8_lo; c8 < c8_hi; ++c8) {\n"
+"            uint word = wrow[c8];\n"
+"            uint base = c8 * 8u;\n"
+"            float s = float(as_type<float>(uint(S[row * groups + base / 64u]) << 16));\n"
+"            float b = float(as_type<float>(uint(B[row * groups + base / 64u]) << 16));\n"
+"            #pragma unroll\n"
+"            for (uint j = 0; j < 8u; ++j) {\n"
+"                uint q = (word >> (j * 4u)) & 0xfu;\n"
+"                acc += float(A[(base + j) * lanes + lane]) * (float(q) * s + b);\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"    shared[tid] = acc;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    // Tree-reduce the kpar dimension while leaving lanes distinct.\n"
+"    for (uint off = nlane_tg / 2u; off > 0u; off >>= 1u) {\n"
+"        if (kpar < off)\n"
+"            shared[tid] += shared[(kpar + off) * lane_count + lane];\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    }\n"
+"    if (kpar == 0u) C[row * lanes + lane] = half(shared[lane]);\n"
+"}\n"
 
+"kernel void attn_scores_fp16(\n"
 "    device const half*  q         [[buffer(0)]],  // [lanes*HQ*D]\n"
 "    device const half*  k_cache   [[buffer(1)]],  // [cap*HK*D]\n"
 "    device float*       scores    [[buffer(2)]],  // [lanes*HQ*cap]\n"
@@ -1205,6 +1302,48 @@ void metal_dispatch_gemm_int4_groupwise(
         output_buf, 0, rows, logical_cols, packed_cols, groups, lanes);
 }
 
+/* NEW: K-parallel batched groupwise GEMM. One threadgroup per output row;
+ * threads tile [kpar, lane] so the shared W word is loaded once and kept in
+ * threadgroup memory, and K is split across kpar threads (power-of-two, so
+ * the per-lane tree reduction is exact). Input A is [K, lanes] channel-major,
+ * output C is [rows, lanes]. This is the fast path for prefill lanes>1. */
+void metal_dispatch_gemm_int4_groupwise_batch(
+    MetalContext* ctx, MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle input_buf, MetalBufferHandle weight_buf,
+    MetalBufferHandle scale_buf, MetalBufferHandle bias_buf,
+    MetalBufferHandle output_buf,
+    int rows, int logical_cols, int packed_cols, int groups, int lanes) {
+    if (!ctx || !cmd_buf || !input_buf || !weight_buf || !scale_buf ||
+        !bias_buf || !output_buf || rows <= 0 || logical_cols <= 0 || lanes <= 0) return;
+    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+    id<MTLComputePipelineState> pipeline =
+        (id<MTLComputePipelineState>)metal_get_pipeline(ctx, "gemm_int4_groupwise_batch");
+    if (!pipeline) { [pool release]; return; }
+    int lc = MIN(lanes, 32);                        // lanes handled per group
+    int knar = 1;
+    while (knar * 2 <= (int)(logical_cols / 64) && knar < 32) knar *= 2;  // power-of-two slices
+    if (knar < 1) knar = 1;
+    int tg = lc * knar;                            // threads per group
+    id<MTLCommandBuffer> cmd = (id<MTLCommandBuffer>)cmd_buf;
+    id<MTLComputeCommandEncoder> encoder = [cmd computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:(id<MTLBuffer>)weight_buf offset:0 atIndex:0];
+    [encoder setBuffer:(id<MTLBuffer>)scale_buf offset:0 atIndex:1];
+    [encoder setBuffer:(id<MTLBuffer>)bias_buf offset:0 atIndex:2];
+    [encoder setBuffer:(id<MTLBuffer>)input_buf offset:0 atIndex:3];
+    [encoder setBuffer:(id<MTLBuffer>)output_buf offset:0 atIndex:4];
+    uint32_t values[] = {(uint32_t)rows, (uint32_t)packed_cols,
+                        (uint32_t)groups, (uint32_t)lanes};
+    for (NSUInteger i = 0; i < 4; ++i)
+        [encoder setBytes:&values[i] length:sizeof(uint32_t) atIndex:5 + i];
+    [encoder setThreadgroupMemoryLength:tg * sizeof(float) atIndex:0];
+    MTLSize grid = MTLSizeMake(rows, 1, 1);
+    MTLSize group = MTLSizeMake(tg, 1, 1);
+    [encoder dispatchThreadgroups:grid threadsPerThreadgroup:group];
+    [encoder endEncoding];
+    [pool release];
+}
+
 void metal_dispatch_gemm_int4_groupwise_offset(
     MetalContext* ctx,
     MetalCommandBufferHandle cmd_buf,
@@ -1320,6 +1459,42 @@ void metal_dispatch_gemm_int4_rowwise_tiled_offset(
         [encoder setBytes:&values[i] length:sizeof(uint32_t) atIndex:4 + i];
     MTLSize grid = MTLSizeMake((lanes + 31) / 32, (rows + 15) / 16, 1);
     MTLSize group = MTLSizeMake(32, 16, 1);
+    [encoder dispatchThreadgroups:grid threadsPerThreadgroup:group];
+    [encoder endEncoding];
+    [pool release];
+}
+
+/* NEW: K-parallel batched rowwise GEMM, one threadgroup per output row. */
+void metal_dispatch_gemm_int4_rowwise_batched(
+    MetalContext* ctx,   MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle input_buf,  MetalBufferHandle weight_buf,
+    MetalBufferHandle scale_buf,  MetalBufferHandle output_buf,
+    int rows, int logical_cols, int packed_cols, int lanes) {
+    if (!ctx || !cmd_buf || !input_buf || !weight_buf || !scale_buf || !output_buf ||
+        rows <= 0 || logical_cols <= 0 || lanes <= 0) return;
+    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+    id<MTLComputePipelineState> pipeline =
+        (id<MTLComputePipelineState>)metal_get_pipeline(ctx, "gemm_int4_rowwise_batch");
+    if (!pipeline) { [pool release]; return; }
+    int lc = MIN(lanes, 32);
+    int knar = 1;
+    while (knar * 2 <= (int)(logical_cols / 2) && knar < 32) knar *= 2;
+    if (knar < 1) knar = 1;
+    int tg = lc * knar;
+    id<MTLCommandBuffer> cmd = (id<MTLCommandBuffer>)cmd_buf;
+    id<MTLComputeCommandEncoder> encoder = [cmd computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:(id<MTLBuffer>)input_buf offset:0 atIndex:0];
+    [encoder setBuffer:(id<MTLBuffer>)weight_buf offset:0 atIndex:1];
+    [encoder setBuffer:(id<MTLBuffer>)scale_buf offset:0 atIndex:2];
+    [encoder setBuffer:(id<MTLBuffer>)output_buf offset:0 atIndex:3];
+    uint32_t values[] = {(uint32_t)rows, (uint32_t)logical_cols,
+                        (uint32_t)packed_cols, (uint32_t)lanes};
+    for (NSUInteger i = 0; i < 4; ++i)
+        [encoder setBytes:&values[i] length:sizeof(uint32_t) atIndex:4 + i];
+    [encoder setThreadgroupMemoryLength:tg * sizeof(float) atIndex:0];
+    MTLSize grid = MTLSizeMake(rows, 1, 1);
+    MTLSize group = MTLSizeMake(tg, 1, 1);
     [encoder dispatchThreadgroups:grid threadsPerThreadgroup:group];
     [encoder endEncoding];
     [pool release];

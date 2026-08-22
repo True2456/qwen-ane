@@ -252,6 +252,24 @@ void metal_dispatch_gemm_int4_groupwise(
     int lanes
 );
 
+/* Batched (lanes>1) K-parallel groupwise GEMM, one threadgroup per row,
+ * threads tiled [kpar, lane] sharing the W word and splitting K. Fast path
+ * for prefill where lanes>1 (the naive per-thread-K kernel is ~16 ms/call). */
+void metal_dispatch_gemm_int4_groupwise_batch(
+    MetalContext* ctx,
+    MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle input_buf,
+    MetalBufferHandle weight_buf,
+    MetalBufferHandle scale_buf,
+    MetalBufferHandle bias_buf,
+    MetalBufferHandle output_buf,
+    int rows,
+    int logical_cols,
+    int packed_cols,
+    int groups,
+    int lanes
+);
+
 /* Same projection with byte offsets into the input/output channel-major
  * buffers. This lets a fused tail write several folded projections into one
  * contiguous next-layer buffer without a CPU concat. */
@@ -297,6 +315,20 @@ void metal_dispatch_gemm_int4_rowwise_tiled_offset(
     MetalBufferHandle scale_buf,
     MetalBufferHandle output_buf,
     size_t output_offset,
+    int rows,
+    int logical_cols,
+    int packed_cols,
+    int lanes
+);
+
+/* K-parallel batched rowwise GEMM, one threadgroup per output row. */
+void metal_dispatch_gemm_int4_rowwise_batched(
+    MetalContext* ctx,
+    MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle input_buf,
+    MetalBufferHandle weight_buf,
+    MetalBufferHandle scale_buf,
+    MetalBufferHandle output_buf,
     int rows,
     int logical_cols,
     int packed_cols,

@@ -535,6 +535,12 @@ bool RindiAneProjection::metal_dispatch(
                 output, output_offset, static_cast<int>(output_dim_),
                 static_cast<int>(input_dim_), static_cast<int>(metal_packed_cols_),
                 static_cast<int>(lanes));
+        } else if (lanes > 1 && input_offset == 0 && output_offset == 0 &&
+                   !std::getenv("RINDI_DISABLE_BATCH_GEMM")) {
+            metal_dispatch_gemm_int4_rowwise_batched(
+                ctx, cmd, input, metal_weights_, metal_scales_, output,
+                static_cast<int>(output_dim_), static_cast<int>(input_dim_),
+                static_cast<int>(metal_packed_cols_), static_cast<int>(lanes));
         } else {
             metal_dispatch_gemm_int4_rowwise_offset(
                 ctx, cmd, input, input_offset, metal_weights_, metal_scales_,
@@ -543,11 +549,20 @@ bool RindiAneProjection::metal_dispatch(
                 static_cast<int>(lanes));
         }
     } else {
-        metal_dispatch_gemm_int4_groupwise_offset(
-            ctx, cmd, input, input_offset, metal_weights_, metal_scales_,
-            metal_biases_, output, output_offset, static_cast<int>(output_dim_),
-            static_cast<int>(input_dim_), static_cast<int>(metal_packed_cols_),
-            static_cast<int>(metal_groups_), static_cast<int>(lanes));
+        if (lanes > 1 && input_offset == 0 && output_offset == 0 &&
+                   !std::getenv("RINDI_DISABLE_BATCH_GEMM")) {
+            metal_dispatch_gemm_int4_groupwise_batch(
+                ctx, cmd, input, metal_weights_, metal_scales_, metal_biases_,
+                output, static_cast<int>(output_dim_), static_cast<int>(input_dim_),
+                static_cast<int>(metal_packed_cols_), static_cast<int>(metal_groups_),
+                static_cast<int>(lanes));
+        } else {
+            metal_dispatch_gemm_int4_groupwise_offset(
+                ctx, cmd, input, input_offset, metal_weights_, metal_scales_,
+                metal_biases_, output, output_offset, static_cast<int>(output_dim_),
+                static_cast<int>(input_dim_), static_cast<int>(metal_packed_cols_),
+                static_cast<int>(metal_groups_), static_cast<int>(lanes));
+        }
     }
     return true;
 }
