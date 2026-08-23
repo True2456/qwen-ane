@@ -455,3 +455,27 @@ RISK: low-medium. Contained to engine.cpp generate() partial branch + one
   yes is per-layer rebuild viable; if no, the O(1) rollback needs the
   per-lane-conv-eval approach (call conv.evaluate K times, snapshot history_
   after each) which is exact by construction at ~lanes cost.
+
+## P7 - GDN state compositionality: PROVEN (unblocks P6 properly)
+- probes/test_conv_compose.cpp compiles one real GDN layer (layer 1) and
+  compares state after (a) one wide call (lanes=4) vs (b) chunked 3+1 vs
+  (c) chunked 2+2, hashing conv history_ + recurrence state.
+- RESULT: all three produce BYTE-IDENTICAL conv+recurrence state
+  (conv_hash/rec_hash equal across wide and both chunkings). COMPOSITIONAL=YES.
+- IMPLICATIONS:
+  * MTP's batched-verify does NOT inherently diverge GDN state from
+    sequential decode - the earlier "batch vs sequential drift" explanation
+    for MTP_EXACT=FAIL is WRONG. The drift must come from elsewhere
+    (attention numeric path, lm_head, or the tail fp16 staging).
+  * P6's state-only rebuild is FUNDAMENTALLY SOUND: re-running the GDN core
+    over the accepted prefix reproduces the exact state. My earlier P6
+    failure (MTP_EXACT=FAIL + lower acceptance) was an IMPLEMENTATION BUG,
+    not a wall.
+- NEXT: re-instate P6 but make the rebuild FAITHFUL and complete:
+  * do NOT hand-slice projections - capture per-layer np AND, for the
+    forward core, reuse the verify's stored np with an injected tail-skip
+    path OR re-run each layer's core (attention core_step_batch + GDN
+    core_step/core_from_projected_view) exactly as forward_prompt_batch does,
+    feeding stored np for layers >= 1.
+  * include attention core_step_batch (needed for KV) and gate_core_batch.
+  * verify bit-exact state + MTP_EXACT=PASS before declaring win.
