@@ -239,3 +239,35 @@ espresso -> ANE-exported cache bundle `__.bin`/`__s.bin`, loadable natively
 via `_ANEModel initWithModelAtURL:`). Text-MIL synthesis remains an fp16-only
 channel. EXL3/QTIP trellis additionally requires external dequantization
 under all routes.
+
+---
+
+## 8. 1-Bit Palettization on ANE - Execution vs Coherence (Aug 2026)
+
+Sweep on an ANE-resident 5-layer 64ch 128x128 residual conv stack
+(compute-plan verified `preferred_compute_device = MLNeuralEngineComputeDevice`;
+k-means palettization, iOS18 target). Two distinct error axes:
+
+| variant | quant_err (vs fp16-weight model) | exec_err (ANE vs CPU, same weights) |
+|---|---|---|
+| fp16 baseline   | -      | 0.0119 (cross-device noise floor) |
+| 4-bit palette   | 0.150  | **0.0111** (= noise floor) |
+| 2-bit palette   | 0.661  | **0.0130** (= noise floor) |
+| 1-bit palette   | 0.752  | **0.0114** (= noise floor) |
+
+Findings:
+- **Execution**: ANE runs 1-bit palettized weights with error identical to the
+  fp16 baseline's own cross-device variance - the dequant-in-weight-SRAM path
+  is precision-neutral down to 1 bit. Hardware answer: yes.
+- **Coherence**: post-hoc 1-bit destroys fidelity - 75% relative output error
+  after only 5 layers (15% at 4-bit). Untrained-network k-means at 1 bit does
+  NOT give coherent outputs; LLM decode would be especially fragile since
+  near-tie argmax decisions cascade (cf. P12 norm-convention fork).
+  Coherent 1-bit requires quantization-aware training (BitNet/BNN style),
+  not post-hoc palettization.
+- Practical floor for post-hoc compression: 4-bit (with 2-bit viable only for
+  insensitive stages).
+- Caveats found en route: per-channel-scale palettization (iOS18) emits
+  `constexpr_blockwise_shift_scale` which crashes Apple's MPSGraph verifier
+  on this OS; CoreML silently prefers CPU for small models - ALWAYS verify
+  ANE residency via MLComputePlan before quoting ANE numbers.
