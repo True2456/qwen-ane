@@ -511,3 +511,29 @@ RISK: low-medium. Contained to engine.cpp generate() partial branch + one
   whether O(1) rollback is possible - compositionality already answers that
   (YES). The legacy replay itself also FAILS MTP_EXACT today (pre-existing),
   so the rebuild WORTH is real once it matches the replay byte-for-byte.
+
+## P9 - state-diff infrastructure + two critical findings
+- BUILT: per-layer state-hash dump ([SPECSTATE] PRE/V/RB/LEG lines, env
+  RINDI_DEBUG_SPECSTATE) - hashes every layer's conv history + recurrence
+  state (GDN) or KV rows + position (attention), 64 hashes per tag.
+- FINDING 1 (probe bug): test_tail_sync.cpp's cross-width comparison was
+  INVALID - fill(core,7) seeds one continuous stream, so different total
+  lane counts fed DIFFERENT lane-0 data ("~96% differ" was layout+data
+  skew, not hardware lane-dependence). Fixed-width sub-test
+  (probes/test_tail_mix.cpp) proves lane-0 output is INDEPENDENT of other
+  lanes' data at fixed lanes=4. Tail lane-invariance is therefore likely
+  INTACT; the old probe must be rewritten with per-lane-consistent staging.
+- FINDING 2 (real, unexplained): engine-level state diff with IDENTICAL
+  real inputs shows rebuild-state != legacy-replay-state diverging at
+  LAYER 0 in every round (57/57), yet both paths call layer-0
+  gdn.core_step(norm, keep) with byte-identical norm inputs (verified by
+  construction: verify_input_ sliced [c*61+l] == replay batch_in [c*keep+l]).
+  Since compositionality holds and inputs match, the divergence must come
+  from hidden state NOT covered by the hash or by restore_snapshot -
+  prime suspect: the GDN conv ANE IOSurface (input_surface_/output_surface_
+  contents beyond history+lanes, or written_lanes_-gated memset semantics),
+  which snapshot/restore do not cover.
+- NEXT: extend spec_layer_hashes to also hash the conv IOSurface bytes;
+  rerun the diff. If conv-surface diverges at round 0 pre-core, add surface
+  restore to snapshot/restore. This is mechanical now - the debug tooling
+  (state hashes) is in place and committed.
