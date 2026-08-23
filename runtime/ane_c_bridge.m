@@ -77,6 +77,43 @@ static NSData* ane_make_blob(const void* data, size_t size) {
     return blob;
 }
 
+// Shared body: pre_enveloped binds weight_data verbatim (no ane_make_blob).
+static ANEModel* ane_compile_mil_common(
+    ANEContext* ctx, const char* mil_text,
+    const char* const* weight_names,
+    const void* const* weight_data, const size_t* weight_sizes,
+    size_t weight_count, int instance_hint, int qos, BOOL pre_enveloped);
+
+ANEModel* ane_model_compile_mil(
+    ANEContext* ctx,
+    const char* mil_text,
+    const char* const* weight_names,
+    const void* const* weight_data,
+    const size_t* weight_sizes,
+    size_t weight_count,
+    int instance_hint,
+    int qos
+) {
+    return ane_compile_mil_common(ctx, mil_text, weight_names, weight_data,
+                                  weight_sizes, weight_count, instance_hint,
+                                  qos, NO);
+}
+
+ANEModel* ane_model_compile_mil_env(
+    ANEContext* ctx,
+    const char* mil_text,
+    const char* const* weight_names,
+    const void* const* weight_data,
+    const size_t* weight_sizes,
+    size_t weight_count,
+    int instance_hint,
+    int qos
+) {
+    return ane_compile_mil_common(ctx, mil_text, weight_names, weight_data,
+                                  weight_sizes, weight_count, instance_hint,
+                                  qos, YES);
+}
+
 static NSDictionary* ane_compile_options(int instance_hint) {
     NSMutableDictionary* options = [NSMutableDictionary dictionary];
     [options setObject:[NSNumber numberWithInt:1]
@@ -108,16 +145,11 @@ static NSString* ane_model_path(id model) {
     return [value isKindOfClass:[NSString class]] ? (NSString*)value : nil;
 }
 
-ANEModel* ane_model_compile_mil(
-    ANEContext* ctx,
-    const char* mil_text,
+static ANEModel* ane_compile_mil_common(
+    ANEContext* ctx, const char* mil_text,
     const char* const* weight_names,
-    const void* const* weight_data,
-    const size_t* weight_sizes,
-    size_t weight_count,
-    int instance_hint,
-    int qos
-) {
+    const void* const* weight_data, const size_t* weight_sizes,
+    size_t weight_count, int instance_hint, int qos, BOOL pre_enveloped) {
     if (!ctx || !mil_text || !ctx->aneInMemoryModelClass) return NULL;
 
     @autoreleasepool {
@@ -126,7 +158,9 @@ ANEModel* ane_model_compile_mil(
             if (!weight_names[i] || (!weight_data[i] && weight_sizes[i] != 0)) return NULL;
             NSString* path = [NSString stringWithFormat:@"@model_path/weights/%s",
                               weight_names[i]];
-            NSData* blob = ane_make_blob(weight_data[i], weight_sizes[i]);
+            NSData* blob = pre_enveloped
+                ? [NSData dataWithBytes:weight_data[i] length:weight_sizes[i]]
+                : ane_make_blob(weight_data[i], weight_sizes[i]);
             NSDictionary* entry = @{ @"data": blob, @"offset": @0 };
             [weights setObject:entry forKey:path];
         }
@@ -536,13 +570,23 @@ bool ane_request_evaluate(
 
         // Directly loaded cache packages are owned by _ANEClient rather than
         // _ANEInMemoryModel.  Prefer the direct client entry points.
+        // @try: Apple's failure path can throw (observed: reportEvaluateFailure
+        // -> connectionUsedForLoadingModel -> -[_ANEInMemoryModel getUUID]
+        // unrecognized selector when a compiled-but-unloadable program is
+        // evaluated). Convert upstream exceptions into a clean NO return.
         if (ctx->aneClient && [ctx->aneClient respondsToSelector:@selector(doEvaluateDirectWithModel:options:request:qos:error:)]) {
             typedef BOOL (*EvalDirectFn)(id, SEL, id, NSDictionary*, id, unsigned int, NSError**);
             EvalDirectFn evalDirect = (EvalDirectFn)[ctx->aneClient methodForSelector:@selector(doEvaluateDirectWithModel:options:request:qos:error:)];
             NSError* err = nil;
-            BOOL ok = evalDirect(ctx->aneClient, @selector(doEvaluateDirectWithModel:options:request:qos:error:),
-                                 model->loadedModel ? model->loadedModel : model->rawModel,
-                                 @{}, req->rawRequest, 21, &err);
+            BOOL ok = NO;
+            @try {
+                ok = evalDirect(ctx->aneClient, @selector(doEvaluateDirectWithModel:options:request:qos:error:),
+                                model->loadedModel ? model->loadedModel : model->rawModel,
+                                @{}, req->rawRequest, 21, &err);
+            } @catch (NSException* ex) {
+                NSLog(@"[ANE Bridge] Direct evaluate threw: %@", ex);
+                return NO;
+            }
             if (!ok) NSLog(@"[ANE Bridge] Direct evaluate returned false: %@", err ? [err description] : @"no error");
             return ok && (err == nil);
         }

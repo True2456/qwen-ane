@@ -189,3 +189,53 @@ Implications for low-bit weights (2/3/4-bit, EXL3/QTIP trellis):
   not text MIL. Viable hybrid: compress offline with coremltools, ship the
   .mlmodelc, load at runtime via `ane_model_load_compiled` (already in the
   bridge) - keeps inference Python-free.
+
+---
+
+## 7. Weight SRAM / Packed-Weight Execution Investigation (Aug 2026)
+
+Question: can packed 2/3/4-bit weights be fetched from DRAM and dequantized
+into the ANE's weight SRAM, running MACs at fp16? (This is what ANE does for
+palettized CoreML models - internal accumulation is fp16 regardless.)
+
+**Container format DECODED** (from coremltools-compiled `.mlmodelc`, verified
+byte-level). The weight blob is a multi-region envelope:
+
+```
+[0] u32   blob_count          (p2 file: 1, p4 file: 2)
+[4] u32   version (= 2)
+per region, back-to-back:
+  u32     0xDEADBEEF
+  u32     code               (1 = dense fp16, 3 = packed indices observed)
+  u64     payload_size
+  u64     payload_offset (absolute, from file start)
+  payload...
+```
+
+MIL `BLOBFILE(offset=N)` therefore addresses each region's DEADBEEF
+sub-header - reconciling the previously mysterious constants (indices @64,
+palette @256 in the same file). Our single-blob builder (`ane_make_blob`)
+writes count=1/code=1 with payload@128, which is why offset=64 always worked.
+
+Apple's own backend emits **text MIL** with
+`constexpr_lut_to_dense()[indices=..., lut=..., shape=...]` referencing those
+regions - i.e. the op exists and hardware executes it via this container.
+k-means palettization shrinks a 512 B conv weight to 352 B (4-bit) / 192 B
+(2-bit) including palettes.
+
+**But execution through the native in-memory text-MIL pipeline is BLOCKED:**
+- All synthetic LUT/intN forms: rejected (`InvalidMILProgram`) or graceful
+  compile failure, including a byte-faithful reconstruction of Apple's own
+  two-blob container.
+- Byte-exact Apple-authored artifact (verbatim model.mil + its weight.bin):
+  ANECCompile rejects it too; the subsequent evaluation of the stale model
+  handle crashes upstream in `-[_ANEClient reportEvaluateFailure]`
+  (`-[_ANEInMemoryModel getUUID]: unrecognized selector`). Hardened the
+  bridge dispatch with @try so upstream exceptions return NO cleanly.
+
+**Conclusion**: packed-weight fetch/dequant-in-SRAM is real silicon behavior
+but is only reachable through the full offline compile path (coremltools ->
+espresso -> ANE-exported cache bundle `__.bin`/`__s.bin`, loadable natively
+via `_ANEModel initWithModelAtURL:`). Text-MIL synthesis remains an fp16-only
+channel. EXL3/QTIP trellis additionally requires external dequantization
+under all routes.

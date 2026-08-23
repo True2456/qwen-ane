@@ -68,6 +68,22 @@ size_t ane_model_output_channels(
 void ane_model_release(ANEModel* model);
 
 /**
+ * Compile MIL whose weight blobs are ALREADY enveloped (e.g. weight.bin
+ * extracted from a compiled .mlmodelc). Files are bound as-is - no
+ * ane_make_blob re-wrap. This is how sub-fp16 packed blobs reach ANE.
+ */
+ANEModel* ane_model_compile_mil_env(
+    ANEContext* ctx,
+    const char* mil_text,
+    const char* const* weight_names,
+    const void* const* weight_data,
+    const size_t* weight_sizes,
+    size_t weight_count,
+    int instance_hint,
+    int qos
+);
+
+/**
  * Create an evaluation request binding input and output IOSurfaces.
  */
 ANERequest* ane_request_create(

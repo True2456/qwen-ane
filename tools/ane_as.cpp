@@ -686,6 +686,187 @@ static int test_int4(ANEContext* ane) {
               << "\n";
     return 0;
 }
+
+// ---------------------------------------------------------------------------
+// [8] Packed sub-fp16 weights via the compiled-package (proto) path
+// ---------------------------------------------------------------------------
+
+static std::vector<uint8_t> read_file_bytes(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return {};
+    fseek(f, 0, SEEK_END);
+    const long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    std::vector<uint8_t> v((size_t)n);
+    if (fread(v.data(), 1, v.size(), f) != v.size()) v.clear();
+    fclose(f);
+    return v;
+}
+
+static int test_palettized_load(ANEContext* ane, int iters) {
+    std::cout << "\n[8] packed sub-fp16 weights executed via compiled .mlmodelc\n";
+    const std::string base = "/tmp/ane-palettized";
+    const auto xbytes = read_file_bytes(base + "/x_in.bin");
+    if (xbytes.empty()) {
+        std::cout << "  [SKIP] offline artifacts missing - run probes/make_palettized_mlmodelc.py\n";
+        return 0;
+    }
+    std::vector<uint16_t> x(xbytes.size() / 2);
+    std::memcpy(x.data(), xbytes.data(), x.size() * 2);
+
+    int any_ok = 0;
+    for (int nbits : {4, 2}) {
+        // coremlcompiler nests the bundle one level deeper
+        const std::string inner = base + "/conv_p" + std::to_string(nbits) +
+                                  ".mlmodelc/conv_p" + std::to_string(nbits) + ".mlmodelc";
+        const std::string outer = base + "/conv_p" + std::to_string(nbits) + ".mlmodelc";
+        ANEModel* model = ane_model_load_compiled(ane, inner.c_str(), nullptr, 21);
+        if (!model) model = ane_model_load_compiled(ane, outer.c_str(), nullptr, 21);
+        if (!model) {
+            std::cout << "  p" << nbits << ": LOAD FAILED (native loader refused package)\n";
+            continue;
+        }
+        IoSurface in(64), out((size_t)64 * 29 * 2);
+        if (!in || !out) { ane_model_release(model); continue; }
+        surface_fill(in.get(), x);
+        ANERequest* req = ane_request_create(ane, model, in.get(), out.get(), 0);
+        if (!req) { std::cout << "  p" << nbits << ": REQUEST FAILED\n"; ane_model_release(model); continue; }
+
+        const LatencyStats st = bench_dispatch(ane, model, req, 3, iters);
+        const auto got = surface_read(out.get(), (size_t)64 * 29);
+        const auto rbytes = read_file_bytes(base + "/y_ref_p" + std::to_string(nbits) + ".bin");
+        float rel = -1.f;
+        if (!rbytes.empty() && rbytes.size() == got.size() * 2) {
+            std::vector<uint16_t> ref(got.size());
+            std::memcpy(ref.data(), rbytes.data(), ref.size() * 2);
+            std::vector<float> reff(ref.size());
+            for (size_t i = 0; i < ref.size(); ++i) reff[i] = fp16_to_fp32(ref[i]);
+            rel = rel_error(got, reff);
+        }
+        const bool ok = rel >= 0.f && rel < 5e-3f;
+        if (ok) ++any_ok;
+        std::cout << "  p" << nbits << ": [" << (ok ? "PASS" : "FAIL")
+                  << "] RelErr=" << std::scientific << std::setprecision(2) << rel
+                  << " vs compressed-model reference | ";
+        print_stats(st, 0);
+        ane_request_release(req);
+        ane_model_release(model);
+    }
+    std::cout << "  => " << (any_ok ? "SUB-FP16 PACKED WEIGHTS EXECUTE ON ANE VIA NATIVE PIPELINE"
+                                    : "compiled packages did not execute (see above)") << "\n";
+    return 0;
+}
+
+
+// ---------------------------------------------------------------------------
+// [9] Sub-fp16 packed weights via VERBATIM compiled model.mil + its enveloped
+//     weight.bin (the container ANE itself writes). Proves packed blobs run
+//     through our native text-MIL pipeline unchanged.
+// ---------------------------------------------------------------------------
+
+static int test_packed_mil_roundtrip(ANEContext* ane, int iters) {
+    std::cout << "\n[9] verbatim compiled MIL + pre-enveloped weight.bin\n";
+    const std::string base = "/tmp/ane-palettized";
+    const auto xbytes = read_file_bytes(base + "/x_in.bin");
+    if (xbytes.empty()) { std::cout << "  [SKIP] offline artifacts missing\n"; return 0; }
+
+    int any_ok = 0;
+    for (int nbits : {4, 2}) {
+        const std::string inner = base + "/conv_p" + std::to_string(nbits) +
+                                  ".mlmodelc/conv_p" + std::to_string(nbits) + ".mlmodelc";
+        const auto mil = read_file_bytes(inner + "/model.mil");
+        const auto wbin = read_file_bytes(inner + "/weights/weight.bin");
+        if (mil.empty() || wbin.empty()) {
+            std::cout << "  p" << nbits << ": [SKIP] missing model.mil/weight.bin\n";
+            continue;
+        }
+        const char* names[] = {"weight.bin"};
+        const void* data[] = {wbin.data()};
+        const size_t sizes[] = {wbin.size()};
+        // Modes: default verbatim | RINDI_T9_REENV re-wrap | RINDI_T9_SYNTH
+        // synthetic two-blob container in the decoded .mlmodelc layout.
+        ANEModel* model = nullptr;
+        std::vector<uint8_t> synth;
+        std::string synth_mil;
+        if (getenv("RINDI_T9_SYNTH")) {
+            // blob1: 8 packed-nibble index bytes @payload 128 (all nibbles=3)
+            // blob2: 4 fp16 palette entries [1,2,3,4] @payload 256
+            const uint64_t h1 = 64, p1 = 128, n1 = 8, h2 = 192, p2o = 256, n2 = 16;
+            synth.resize(264, 0);
+            uint32_t* w32 = (uint32_t*)synth.data();
+            w32[0] = 2; w32[1] = 2;                    // count, version
+            auto put = [&](uint64_t at, uint32_t code, uint64_t sz, uint64_t off) {
+                uint32_t* b = (uint32_t*)(synth.data() + at);
+                b[0] = 0xDEADBEEFu; b[1] = code;
+                *(uint64_t*)(b + 2) = sz; *(uint64_t*)(b + 4) = off;
+            };
+            put(h1, 3, n1, p1);                        // indices, code 3
+            put(h2, 1, n2, p2o);                       // fp16 palette, code 1
+            for (int i = 0; i < 8; ++i) synth[p1 + i] = 0x33;   // all nibbles = 3
+            std::vector<uint16_t> lut = {0x3800, 0x4000, 0x4200, 0x4400};
+            memcpy(synth.data() + p2o, lut.data(), 8);
+            synth_mil =
+                "program(1.3)\n" + std::string(kBuildInfo) + "\n"
+                "{\n"
+                "  func main<ios18>(tensor<fp16, [1, 4, 1, 32]> x) {\n"
+                "    tensor<fp16, [4, 1, 1, 4]> w = constexpr_lut_to_dense()[indices = tensor<uint8, [8]>(BLOBFILE(path = tensor<string, []>(\"@model_path/weights/w.bin\"), offset = tensor<uint64, []>(64))), lut = tensor<fp16, [4]>(BLOBFILE(path = tensor<string, []>(\"@model_path/weights/w.bin\"), offset = tensor<uint64, []>(192))), name = tensor<string, []>(\"w\"), shape = tensor<uint32, [4]>([4, 1, 1, 4])];\n"
+                "    string pt = const()[name=string(\"pt\"), val=string(\"valid\")];\n"
+                "    tensor<int32, [2]> st = const()[name=string(\"st\"), val=tensor<int32, [2]>([1,1])];\n"
+                "    tensor<int32, [4]> pd = const()[name=string(\"pd\"), val=tensor<int32, [4]>([0,0,0,0])];\n"
+                "    tensor<int32, [2]> dl = const()[name=string(\"dl\"), val=tensor<int32, [2]>([1,1])];\n"
+                "    int32 gr = const()[name=string(\"gr\"), val=int32(1)];\n"
+                "    tensor<fp16, [1, 4, 1, 32]> y = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=w, x=x)[name=string(\"y\")];\n"
+                "  } -> (y);\n"
+                "}\n";
+            const char* nm[] = {"w.bin"};
+            const void* dt[] = {synth.data()};
+            const size_t sz[] = {synth.size()};
+            model = ane_model_compile_mil_env(ane, synth_mil.c_str(), nm, dt, sz, 1, 0, 21);
+            if (!model) { std::cout << "  p" << nbits << ": SYNTH COMPILE FAILED\n"; continue; }
+        } else if (getenv("RINDI_T9_REENV")) {
+            model = ane_model_compile_mil(
+                ane, std::string(mil.begin(), mil.end()).c_str(),
+                names, data, sizes, 1, 0, 21);
+        } else {
+            model = ane_model_compile_mil_env(
+                ane, std::string(mil.begin(), mil.end()).c_str(),
+                names, data, sizes, 1, 0, 21);
+        }
+        if (!model) {
+            std::cout << "  p" << nbits << ": COMPILE FAILED (packed blob refused)\n";
+            continue;
+        }
+        IoSurface in(64), out((size_t)64 * 29 * 2);
+        std::vector<uint16_t> x(xbytes.size() / 2);
+        std::memcpy(x.data(), xbytes.data(), x.size() * 2);
+        surface_fill(in.get(), x);
+        ANERequest* req = ane_request_create(ane, model, in.get(), out.get(), 0);
+        if (!req) { std::cout << "  p" << nbits << ": REQUEST FAILED\n"; ane_model_release(model); continue; }
+
+        const LatencyStats st = bench_dispatch(ane, model, req, 3, iters);
+        const auto got = surface_read(out.get(), (size_t)64 * 29);
+        const auto rbytes = read_file_bytes(base + "/y_ref_p" + std::to_string(nbits) + ".bin");
+        float rel = -1.f;
+        if (!rbytes.empty() && rbytes.size() == got.size() * 2) {
+            std::vector<uint16_t> ref(got.size());
+            std::memcpy(ref.data(), rbytes.data(), ref.size() * 2);
+            std::vector<float> reff(ref.size());
+            for (size_t i = 0; i < ref.size(); ++i) reff[i] = fp16_to_fp32(ref[i]);
+            rel = rel_error(got, reff);
+        }
+        const bool ok = rel >= 0.f && rel < 5e-3f;
+        if (ok) ++any_ok;
+        std::cout << "  p" << nbits << ": [" << (ok ? "PASS" : "FAIL")
+                  << "] RelErr=" << std::scientific << std::setprecision(2) << rel
+                  << " | dispatch p50 " << st.p50_ms << " ms\n";
+        ane_request_release(req);
+        ane_model_release(model);
+    }
+    std::cout << "  => " << (any_ok ? "PACKED SUB-FP16 WEIGHTS EXECUTE THROUGH TEXT-MIL PIPELINE"
+                                    : "verbatim packed roundtrip failed (see above)") << "\n";
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 
 int main(int argc, char** argv) {
@@ -724,6 +905,8 @@ int main(int argc, char** argv) {
         rc |= test_fused_gated_conv(ane, 64, 32, 4, req_iters);
         rc |= test_fused_gated_conv(ane, 10240, 32, 4, req_iters);
         rc |= test_int4(ane);
+        rc |= test_palettized_load(ane, req_iters);
+        rc |= test_packed_mil_roundtrip(ane, req_iters);
     }
 
     ane_context_destroy(ane);
