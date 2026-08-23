@@ -116,8 +116,12 @@ ANEModel* ane_model_compile_mil_env(
 
 static NSDictionary* ane_compile_options(int instance_hint) {
     NSMutableDictionary* options = [NSMutableDictionary dictionary];
-    [options setObject:[NSNumber numberWithInt:1]
-                forKey:@"kANEFProcedureVariantHint"];
+    // A/B hook: some MIL forms (e.g. constexpr_affine_dequantize int8) fail
+    // with the variant hint present; RINDI_NO_VARIANT_HINT=1 isolates it.
+    if (!getenv("RINDI_NO_VARIANT_HINT")) {
+        [options setObject:[NSNumber numberWithInt:1]
+                    forKey:@"kANEFProcedureVariantHint"];
+    }
     if (instance_hint > 0) {
         [options setObject:[NSNumber numberWithInt:instance_hint]
                     forKey:@"kANEFAneInstanceHint"];

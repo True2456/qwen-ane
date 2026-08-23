@@ -271,3 +271,41 @@ Findings:
   `constexpr_blockwise_shift_scale` which crashes Apple's MPSGraph verifier
   on this OS; CoreML silently prefers CPU for small models - ALWAYS verify
   ANE residency via MLComputePlan before quoting ANE numbers.
+
+---
+
+## 9. maderix/ANE Cross-Pollination (Aug 2026)
+
+Validated / attempted transfers from github.com/maderix/ANE (private-API ANE
+training research):
+
+**PORTED & WORKING on M5 Max (test [10]): dynamic weight-as-input kernels.**
+Weights packed into the tail of the INPUT surface
+(`[1, ic, 1, seq+oc]`, sliced via `slice_by_size`, reshaped/transposed into
+`matmul`). No BLOBFILE constants at all -> one compiled program serves every
+layer of matching shape; weights are IOSurface data (zero-copy updatable,
+swap-per-layer). Verified exact through our native pipeline (RelErr 5.4e-4).
+This removes per-shape recompiles and the ~119-compiles-per-process limit
+(their mitigation: exec() restart).
+
+**BLOCKED on macOS26/M5-h17: INT8 W8A8 via text MIL.** Their 1.88x recipe
+(`constexpr_affine_dequantize` int8 blobs + `quantize`/`dequantize`
+activation ops between fused ops, halving tile SRAM traffic) is rejected by
+ANECCompile here. Tried: their exact op syntax, three blob-container variants
+(ours, theirs byte-exact incl. dtype marker 0x08 @chunk+10), variant-hint
+on/off. Their results are M4/H16G-era; report notes macOS 26 regressions.
+Retry on future OS updates; until then sub-fp16 stays offline-route only.
+
+**Ideas inventory mapped to rindi:**
+- Prefill (our ~70 tok/s plateau): ANE throughput scales with SPATIAL size
+  (community data: sp64->sp2048 = 2x, M5 peak ~12.2 TFLOPS fp16). Large-S
+  prefill chunks in fused whole-layer dynamic kernels are the lever; decode
+  (S=1) can never reach compute peak - it stays bandwidth/latency bound.
+- Decode: 63 serialized dispatches ~= 6 ms/token overhead - negligible vs the
+  DRAM wall that actually binds us; ANE decode gains require smaller-weight
+  formats (blocked, see above). Keep Metal for projections.
+- RMSNorm fusion into kernels (reduce_sum + pow + mul) - drops a dispatch
+  per norm.
+- Forward taps: concat extra outputs onto the main output surface to expose
+  intermediates (MTP draft/verify states) without extra dispatches.
+- GQA per-head tiling/reduction pattern for attention with Q_DIM != KV_DIM.

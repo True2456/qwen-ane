@@ -593,6 +593,7 @@ static int test_fused_gated_conv(ANEContext* ane, int C, int S, int K, int iters
 
 static int test_int4(ANEContext* ane) {
     std::cout << "\n[7] compressed-weight probe: int4/int3/int2 dtypes + palettized LUT\n";
+    const int C = 4, K = 4;
     const char* names[] = {"w.bin", "lut.bin"};
     // Uniform-value bitstreams are packing-order invariant: filling every
     // payload byte with 0xFF makes every decoded element the max-magnitude
@@ -642,6 +643,7 @@ static int test_int4(ANEContext* ane) {
         "    tensor<int32, [4, 1, 1, 4]> idx = const()[name=string(\"idx\"), val=tensor<int32, [4, 1, 1, 4]>(BLOBFILE(path=string(\"@model_path/weights/w.bin\"), offset=uint64(64)))];\n"
         "    tensor<fp16, [4, 1, 1, 4]> w = constexpr_lut_to_dense(indices=idx, lut=lut)[name=string(\"w\")];\n";
 
+    int any_ok = 0;
     struct Var { const char* tag; const char* body; const void* data; size_t size;
                  float expect; const char* note; };
     std::vector<Var> vars = {
@@ -654,7 +656,53 @@ static int test_int4(ANEContext* ane) {
         {"lut(i32 idx)",  var_lut_i32, nullptr, 0,             16.0f, "idx=3 -> lut 4.0 => sum 16"},
     };
 
-    int any_ok = 0;
+    // --- maderix/ANE-style INT8 weights via constexpr_affine_dequantize ---
+    // w[j] = j - 8 (int8), ones-input conv lane0 sums w[0..3] = -8-7-6-5 = -26.
+    {
+        std::vector<int8_t> i8w((size_t)C * K);
+        for (int j = 0; j < C * K; ++j) i8w[j] = (int8_t)(j - 8);
+        const char* var_i8 =
+            "    tensor<fp16, [4, 1, 1, 4]> w = constexpr_affine_dequantize()"
+            "[axis = int32(0), name = string(\"w\"), "
+            "quantized_data = tensor<int8, [4, 1, 1, 4]>(BLOBFILE(path = string(\"@model_path/weights/w.bin\"), offset = uint64(64))), "
+            "scale = fp16(0x1p+0), zero_point = int8(0)];\n";
+        // maderix-exact chunk: 64B file header {01@0,02@4} + per-chunk 64B
+        // subheader {DEADBEEF, 01@+4, dtype@+10 (08=int8,10=fp16)} + payload.
+        auto mk_maderix_blob = [](const void* payload, size_t n, uint8_t dtype) {
+            std::vector<uint8_t> b(64 + 64 + n, 0);
+            b[0] = 0x01; b[4] = 0x02;
+            uint8_t* ch = b.data() + 64;
+            ch[0] = 0xEF; ch[1] = 0xBE; ch[2] = 0xAD; ch[3] = 0xDE;
+            ch[4] = 0x01; ch[10] = dtype;
+            memcpy(ch + 64, payload, n);
+            return b;
+        };
+        const std::vector<uint8_t> env = mk_maderix_blob(i8w.data(), i8w.size(), 0x08);
+        const void* d1[] = {env.data()};
+        const size_t s1[] = {env.size()};
+        ANEModel* model = ane_model_compile_mil_env(ane, mk(var_i8).c_str(), names, d1, s1, 1, 0, 21);
+        float v0 = 0.f; bool ok = false;
+        if (model) {
+            IoSurface in(4*32*2), out(4*32*2);
+            surface_fill(in.get(), std::vector<uint16_t>(128, 0x3c00));
+            ANERequest* req = ane_request_create(ane, model, in.get(), out.get(), 0);
+            if (req) {
+                ane_request_evaluate(ane, model, req, nullptr, 0, nullptr, 0);
+                const auto got = surface_read(out.get(), 128);
+                v0 = got.empty() ? 0.f : fp16_to_fp32(got[0]);
+                ok = (v0 == -26.0f);
+                ane_request_release(req);
+            }
+            ane_model_release(model);
+        }
+        std::cout << "  " << std::left << std::setw(13) << "int8 deq"
+                  << ": " << (model ? "COMPILED" : "REJECTED")
+                  << (model ? (ok ? " lane0=-26 CONFIRMED (int8 weights via text MIL!)"
+                                  : " lane0 mismatch") : "")
+                  << "\n";
+        if (ok) ++any_ok;
+    }
+
     for (const Var& v : vars) {
         const void* data[2] = {v.data, lut4.data()};
         const size_t sizes[2] = {v.size, lut4.size()*2};
@@ -867,6 +915,103 @@ static int test_packed_mil_roundtrip(ANEContext* ane, int iters) {
     return 0;
 }
 
+
+// ---------------------------------------------------------------------------
+// [10] Dynamic kernel: weights packed into the INPUT surface (no compiled
+//      weight constants at all). Port of maderix/ANE gen_dyn_matmul - one
+//      compiled program serves any layer: y[oc,seq] = W[ic,oc]^T @ x[ic,seq].
+//      Input surface layout: [1, ic, 1, seq + oc] = activations | weights.
+// ---------------------------------------------------------------------------
+static int test_dyn_matmul(ANEContext* ane, int iters) {
+    std::cout << "\n[10] dynamic matmul (weights-from-surface, recompile-free)\n";
+    const int ic = 64, oc = 64, sq = 32;
+    const std::string mil =
+        std::string("program(1.3)\n") + kBuildInfo + "\n"
+        "{\n"
+        "  func main<ios18>(tensor<fp16, [1, 64, 1, 96]> x) {\n"
+        "    tensor<int32, [4]> ba = const()[name=string(\"ba\"), val=tensor<int32, [4]>([0,0,0,0])];\n"
+        "    tensor<int32, [4]> sa = const()[name=string(\"sa\"), val=tensor<int32, [4]>([1,64,1,32])];\n"
+        "    tensor<fp16, [1,64,1,32]> act = slice_by_size(x=x,begin=ba,size=sa)[name=string(\"act\")];\n"
+        "    tensor<int32, [4]> bw = const()[name=string(\"bw\"), val=tensor<int32, [4]>([0,0,0,32])];\n"
+        "    tensor<int32, [4]> sw = const()[name=string(\"sw\"), val=tensor<int32, [4]>([1,64,1,64])];\n"
+        "    tensor<fp16, [1,64,1,64]> wt = slice_by_size(x=x,begin=bw,size=sw)[name=string(\"wt\")];\n"
+        "    tensor<int32, [4]> ra = const()[name=string(\"ra\"), val=tensor<int32, [4]>([1,1,64,32])];\n"
+        "    tensor<fp16, [1,1,64,32]> a2 = reshape(shape=ra,x=act)[name=string(\"a2\")];\n"
+        "    tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];\n"
+        "    tensor<fp16, [1,1,32,64]> a3 = transpose(perm=pm,x=a2)[name=string(\"a3\")];\n"
+        "    tensor<int32, [4]> rw = const()[name=string(\"rw\"), val=tensor<int32, [4]>([1,1,64,64])];\n"
+        "    tensor<fp16, [1,1,64,64]> W = reshape(shape=rw,x=wt)[name=string(\"W\")];\n"
+        "    bool bF = const()[name=string(\"bF\"), val=bool(false)];\n"
+        "    tensor<fp16, [1,1,32,64]> yh = matmul(transpose_x=bF,transpose_y=bF,x=a3,y=W)[name=string(\"yh\")];\n"
+        "    tensor<fp16, [1,1,64,32]> yt = transpose(perm=pm,x=yh)[name=string(\"yt\")];\n"
+        "    tensor<int32, [4]> ro = const()[name=string(\"ro\"), val=tensor<int32, [4]>([1,64,1,32])];\n"
+        "    tensor<fp16, [1,64,1,32]> y = reshape(shape=ro,x=yt)[name=string(\"y\")];\n"
+        "  } -> (y);\n"
+        "}\n";
+    // deterministic activations & weights
+    std::vector<uint16_t> surf((size_t)ic * (sq + oc));
+    auto lcg = [s = 999u](float scale) mutable {
+        s = s * 1664525u + 1013904223u;
+        return ((s >> 8) & 0xffff) / 65535.0f * 2.0f * scale - scale;
+    };
+    std::vector<float> xf((size_t)ic * sq), wf((size_t)ic * oc);
+    size_t p = 0;
+    for (int i = 0; i < ic; ++i) for (int t = 0; t < sq; ++t) xf[i*sq+t] = lcg(0.3f);
+    for (int i = 0; i < ic; ++i) for (int o = 0; o < oc; ++o) wf[i*oc+o] = lcg(0.15f);
+    for (int i = 0; i < ic; ++i) {
+        for (int t = 0; t < sq; ++t) surf[p++] = fp32_to_fp16(xf[i*sq+t]);
+        for (int o = 0; o < oc; ++o) surf[p++] = fp32_to_fp16(wf[i*oc+o]);
+    }
+    const char* no_weights[] = {nullptr};
+    ANEModel* model = ane_model_compile_mil(ane, mil.c_str(), no_weights,
+                                            nullptr, nullptr, 0, 0, 21);
+    if (!model) { std::cout << "  [FAIL] compile\n"; return 1; }
+    IoSurface in(surf.size() * 2), out((size_t)oc * sq * 2);
+    if (!in || !out) { ane_model_release(model); return 1; }
+    surface_fill(in.get(), surf);
+    ANERequest* req = ane_request_create(ane, model, in.get(), out.get(), 0);
+    if (!req) { std::cout << "  [FAIL] request\n"; ane_model_release(model); return 1; }
+
+    const LatencyStats st = bench_dispatch(ane, model, req, 5, iters);
+    const auto got = surface_read(out.get(), (size_t)oc * sq);
+    // CPU reference: y[o][t] = sum_i x[i][t] * W[i][o]
+    float max_abs = 0.f, max_ref = 0.f;
+    for (int o = 0; o < oc; ++o) for (int t = 0; t < sq; ++t) {
+        float acc = 0.f;
+        for (int i = 0; i < ic; ++i)
+            acc += xf[(size_t)i*sq+t] * wf[(size_t)i*oc+o];
+        max_abs = std::max(max_abs, std::fabs(fp16_to_fp32(got[(size_t)o*sq+t]) - acc));
+        max_ref = std::max(max_ref, std::fabs(acc));
+    }
+    const float rel = max_abs / (max_ref + 1e-9f);
+    const bool ok = rel < 5e-3f;
+    // locate worst element
+    int wo = 0, wt = 0; float worst = -1.f;
+    for (int o = 0; o < oc; ++o) for (int t = 0; t < sq; ++t) {
+        float acc = 0.f;
+        for (int i = 0; i < ic; ++i)
+            acc += xf[(size_t)i*sq+t] * wf[(size_t)i*oc+o];
+        float d = std::fabs(fp16_to_fp32(got[(size_t)o*sq+t]) - acc);
+        if (d > worst) { worst = d; wo = o; wt = t; }
+    }
+    float racc = 0.f;
+    for (int i = 0; i < ic; ++i) racc += xf[(size_t)i*sq+wt] * wf[(size_t)i*oc+wo];
+    std::cout << "      worst at o=" << wo << " t=" << wt << " got="
+              << fp16_to_fp32(got[(size_t)wo*sq+wt]) << " want=" << racc << "\n";
+    float r00 = 0.f; for (int i = 0; i < ic; ++i) r00 += xf[i*sq+0] * wf[i*oc+0];
+    std::cout << "  [" << (ok ? "PASS" : "FAIL") << "] RelErr=" << std::scientific
+              << std::setprecision(2) << rel << " (weights streamed as surface data!)\n";
+    std::cout << std::fixed << std::setprecision(4)
+              << "      got[0..3]=";
+    for (int i = 0; i < 4 && i < (int)got.size(); ++i)
+        std::cout << " " << fp16_to_fp32(got[(size_t)0*sq+i]);
+    std::cout << " | expected y[0][0]=" << r00 << "\n";
+    print_stats(st, 2.0 * ic * oc * sq / (st.mean_ms * 1e-3) / 1e9);
+    ane_request_release(req);
+    ane_model_release(model);
+    return ok ? 0 : 1;
+}
+
 // ---------------------------------------------------------------------------
 
 int main(int argc, char** argv) {
@@ -907,6 +1052,7 @@ int main(int argc, char** argv) {
         rc |= test_int4(ane);
         rc |= test_palettized_load(ane, req_iters);
         rc |= test_packed_mil_roundtrip(ane, req_iters);
+        rc |= test_dyn_matmul(ane, req_iters);
     }
 
     ane_context_destroy(ane);
