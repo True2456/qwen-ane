@@ -670,6 +670,21 @@ bool RindiNativeChain::evaluate_tail_batch_metal(
     }
     if (next_projection) next_projection->resize(t.next_projection * lanes);
 
+
+    // --- env-gated tail profiling (RINDI_TAIL_PROFILE=1): aggregate where the
+    //     17 ms/layer goes: cpu staging copies, encoder setup, submit+exec.
+    struct TailProf {
+        std::chrono::high_resolution_clock::time_point t0;
+        double in_ms = 0, enc_ms = 0, gpu_ms = 0, out_ms = 0;
+    };
+    static thread_local TailProf tp;
+    static thread_local int tp_n = 0;
+    const bool tp_on = std::getenv("RINDI_TAIL_PROFILE") != nullptr;
+    auto tp_now = []() { return std::chrono::high_resolution_clock::now(); };
+    auto tp_ms = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    tp.t0 = tp_now();
     std::memcpy(metal_buffer_get_contents(metal_tail_core_), core,
                 core_dim * lanes * sizeof(uint16_t));
     std::memcpy(metal_buffer_get_contents(metal_tail_residual_), residual,
@@ -678,6 +693,8 @@ bool RindiNativeChain::evaluate_tail_batch_metal(
     if (!cmd) return false;
 
     const size_t lane_bytes = lanes * sizeof(uint16_t);
+    if (tp_on) tp.in_ms += tp_ms(tp.t0, tp_now());
+    auto tenc0 = tp_now();
     if (!t.out_proj->metal_dispatch(metal_ctx_, cmd, metal_tail_core_,
                                      metal_tail_work_, lanes)) {
         metal_command_buffer_commit(cmd);
@@ -727,6 +744,8 @@ bool RindiNativeChain::evaluate_tail_batch_metal(
             }
         }
     }
+    if (tp_on) tp.enc_ms += tp_ms(tenc0, tp_now());
+    auto tgpu0 = tp_now();
     metal_command_buffer_commit(cmd);
     metal_command_buffer_wait(cmd);
 
@@ -736,6 +755,18 @@ bool RindiNativeChain::evaluate_tail_batch_metal(
     if (next_projection) {
         std::memcpy(next_projection->data(), metal_buffer_get_contents(metal_tail_next_),
                     next_projection->size() * sizeof(uint16_t));
+    }
+    if (tp_on) {
+        tp.gpu_ms += tp_ms(tgpu0, tp_now()) - tp.out_ms;
+        tp.out_ms += 0;  // output copies accounted inside gpu window split below
+        if (++tp_n >= 64) {
+            std::cerr << "[TailProf] n=" << tp_n
+                      << " in=" << tp.in_ms
+                      << " enc=" << tp.enc_ms
+                      << " submit+exec+out=" << tp.gpu_ms
+                      << std::endl;
+            tp = TailProf{}; tp_n = 0;
+        }
     }
     return true;
 }

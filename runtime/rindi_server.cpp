@@ -704,7 +704,9 @@ void handle_client(int client_fd, RindiEngine* engine) {
 
             if (g_tui) {
                 g_tui->record_request_end(real_prompt_tokens, token_count, ttft_ms,
-                                          decode_tps, sstats.prefill_tps(), false, 0);
+                                          decode_tps, sstats.prefill_tps(),
+                                          g_engine->last_apc_hit(),
+                                          g_engine->last_apc_saved());
                 char lbuf[160];
                 snprintf(lbuf, sizeof(lbuf),
                          "Stream complete: %zu tokens in %.2fs (%.1f tok/s) [TTFT: %.1fms, prefill %zu tok @ %.1f tok/s]",
@@ -775,7 +777,9 @@ void handle_client(int client_fd, RindiEngine* engine) {
 
             if (g_tui) {
                 g_tui->record_request_end(stats.prompt_tokens, stats.generated_tokens,
-                                          ttft_ms, decode_tps, stats.prefill_tps(), false, 0);
+                                          ttft_ms, decode_tps, stats.prefill_tps(),
+                                          g_engine->last_apc_hit(),
+                                          g_engine->last_apc_saved());
                 char lbuf[160];
                 snprintf(lbuf, sizeof(lbuf),
                          "Non-stream complete: %zu tokens in %.2fs (%.1f tok/s) [TTFT: %.1fms, prefill %zu tok @ %.1f tok/s]",

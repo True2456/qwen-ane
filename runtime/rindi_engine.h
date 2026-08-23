@@ -150,6 +150,32 @@ private:
     };
     void capture_snapshot(DecodeSnapshot& snap) const;
     void restore_snapshot(const DecodeSnapshot& snap);
+
+    // ---- APC: exact-prefix prompt cache ----
+    // Stores the full recurrent/KV state at end-of-prefill keyed by prompt
+    // tokens. A later request whose tokens extend the cached prefix restores
+    // that state and prefills only the suffix.
+    struct ApcEntry {
+        std::vector<int> tokens;
+        std::vector<size_t> attn_pos;
+        std::vector<std::vector<uint16_t>> attn_keys, attn_values;
+        std::vector<std::vector<uint16_t>> gdn_conv, gdn_state;
+        size_t mtp_pos{0};
+        std::vector<uint16_t> last_hidden;   // hidden of final prompt token
+        bool valid{false};
+    };
+    ApcEntry apc_;
+    bool apc_last_hit_{false};
+    size_t apc_last_saved_{0};
+
+public:
+    bool last_apc_hit() const { return apc_last_hit_; }
+    size_t last_apc_saved() const { return apc_last_saved_; }
+
+private:
+    void apc_store(const std::vector<int>& tokens,
+                   const std::vector<uint16_t>& last_hidden);
+    bool apc_restore();
     bool forward_token(const std::vector<uint16_t>& input,
                        std::vector<uint16_t>& output);
     bool forward_prompt_batch(const std::vector<uint16_t>& input,

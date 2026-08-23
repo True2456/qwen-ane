@@ -372,6 +372,48 @@ void RindiEngine::restore_snapshot(const DecodeSnapshot& snap) {
     mtp_.restore_kv(snap.mtp_pos, {}, {});
 }
 
+// Snapshot the complete prefill-end state (attention KV incl. host+Metal
+// mirrors, GDN conv/recurrence, MTP draft position) keyed by prompt tokens.
+void RindiEngine::apc_store(const std::vector<int>& tokens,
+                            const std::vector<uint16_t>& last_hidden) {
+    apc_ = ApcEntry{};
+    apc_.tokens = tokens;
+    for (const auto& a : attention_layers_) {
+        if (!a) { apc_.attn_pos.push_back(0);
+                  apc_.attn_keys.emplace_back();
+                  apc_.attn_values.emplace_back(); continue; }
+        apc_.attn_pos.push_back(a->position());
+        std::vector<uint16_t> k, v;
+        a->snapshot_kv(0, k, v);
+        apc_.attn_keys.push_back(std::move(k));
+        apc_.attn_values.push_back(std::move(v));
+    }
+    apc_.gdn_conv.resize(gdn_layers_.size());
+    apc_.gdn_state.resize(gdn_layers_.size());
+    for (size_t i = 0; i < gdn_layers_.size(); ++i)
+        if (gdn_layers_[i])
+            gdn_layers_[i]->snapshot_state(apc_.gdn_conv[i], apc_.gdn_state[i]);
+    apc_.mtp_pos = mtp_.position();
+    apc_.last_hidden = last_hidden;
+    apc_.valid = !tokens.empty();
+}
+
+// Restore the cached state so prefill can resume at the matched prefix.
+bool RindiEngine::apc_restore() {
+    if (!apc_.valid) return false;
+    for (size_t i = 0; i < attention_layers_.size(); ++i) {
+        auto* a = attention_layers_[i].get();
+        if (!a || i >= apc_.attn_keys.size()) continue;
+        a->restore_kv(0, apc_.attn_keys[i], apc_.attn_values[i]); // pos <- row count
+        a->set_position(apc_.attn_pos[i]);                        // then exact pos
+    }
+    for (size_t i = 0; i < gdn_layers_.size() && i < apc_.gdn_conv.size(); ++i)
+        if (gdn_layers_[i])
+            gdn_layers_[i]->restore_state(apc_.gdn_conv[i], apc_.gdn_state[i]);
+    mtp_.restore_kv(apc_.mtp_pos, {}, {});
+    return true;
+}
+
 bool RindiEngine::apply_rms_norm(const std::vector<uint16_t>& input,
                                  const std::vector<uint16_t>& weight,
                                  std::vector<uint16_t>& output) const {
@@ -923,6 +965,40 @@ std::string RindiEngine::generate(
     auto t0 = std::chrono::high_resolution_clock::now();
 
     reset_scheduler();
+    // APC: if the prompt strictly extends the cached prefix, roll the model
+    // back to end-of-prefix state and prefill only the suffix.
+    size_t prefill_offset = 0;
+    apc_last_hit_ = false;
+    apc_last_saved_ = 0;
+    const bool apc_enabled = !std::getenv("RINDI_DISABLE_APC");
+    if (apc_enabled && apc_.valid &&
+        prompt_tokens.size() >= apc_.tokens.size()) {
+        bool prefix_match = true;
+        for (size_t i = 0; i < apc_.tokens.size(); ++i)
+            if (prompt_tokens[i] != apc_.tokens[i]) { prefix_match = false; break; }
+        if (prefix_match && apc_restore()) {
+            if (prompt_tokens.size() == apc_.tokens.size() &&
+                apc_.last_hidden.size() == hidden_dim_) {
+                // Full reuse: state already reflects every prompt token; the
+                // cached end-of-prefill hidden feeds decode directly.
+                prefill_offset = prompt_tokens.size();
+                hidden_state = apc_.last_hidden;
+                apc_last_hit_ = true;
+                apc_last_saved_ = prompt_tokens.size();
+                if (std::getenv("RINDI_DEBUG_TIMING"))
+                    std::cerr << "[APC] full hit: " << prompt_tokens.size()
+                              << " tokens reused" << std::endl;
+            } else if (prompt_tokens.size() > apc_.tokens.size()) {
+                prefill_offset = apc_.tokens.size();
+                apc_last_hit_ = true;
+                apc_last_saved_ = prefill_offset;
+                if (std::getenv("RINDI_DEBUG_TIMING"))
+                    std::cerr << "[APC] prefix hit: reuse=" << prefill_offset
+                              << " of " << prompt_tokens.size() << std::endl;
+            }
+        }
+    }
+
     const auto prefill_start = std::chrono::high_resolution_clock::now();
 
     // Prefill prompt chunks through the 32-column ANE tails. GDN's causal
@@ -931,7 +1007,7 @@ std::string RindiEngine::generate(
     // batched core functions, while each fused tail is evaluated once per
     // chunk instead of once per token.
     const size_t kPrefillLanes = ane_width_ - 3;   // minus GDN history columns
-    for (size_t offset = 0; offset < prompt_tokens.size(); offset += kPrefillLanes) {
+    for (size_t offset = prefill_offset; offset < prompt_tokens.size(); offset += kPrefillLanes) {
         const size_t lanes = std::min(kPrefillLanes, prompt_tokens.size() - offset);
         std::vector<uint16_t> batch_input(hidden_dim_ * lanes);
         std::vector<uint16_t> row;
@@ -972,6 +1048,9 @@ std::string RindiEngine::generate(
                                       : 0.0)
                   << std::endl;
     }
+    // Cache end-of-prefill state for exact-prefix reuse by later requests.
+    if (apc_enabled && prompt_tokens.size() <= 8192)
+        apc_store(prompt_tokens, hidden_state);
 
     // Decode from the final RMSNorm and tied embedding head. The head remains
     // on the mapped safetensors file, while all transformer blocks are native.
@@ -986,6 +1065,17 @@ std::string RindiEngine::generate(
                       prompt_tokens.size() > 0;
     const bool dbg_mtp = std::getenv("RINDI_DEBUG_MTP") != nullptr;
     size_t spec_steps = 0;
+    // Acceptance-aware speculation guard: EMA of accepted drafts per round.
+    // When drafting is persistently net-negative (EMA below the break-even
+    // bound), cool off for 7 plain rounds, then re-probe once. Verified
+    // replay keeps exactness regardless of this policy.
+    float mtp_ema = 1.0f;
+    int mtp_rounds = 0;
+    int mtp_cool = 0;
+    // Default OFF (0 disables cooling): the current draft head sits near
+    // break-even on this workload; opt in via RINDI_MTP_EMA_MIN (e.g. 1.25).
+    const float mtp_ema_min = std::getenv("RINDI_MTP_EMA_MIN")
+        ? std::atof(std::getenv("RINDI_MTP_EMA_MIN")) : 0.0f;
     const auto emit = [&](int token_id) {
         std::string token_str = tokenizer_.decode(token_id);
         if (token_str.empty()) token_str = " ";
@@ -1057,13 +1147,21 @@ std::string RindiEngine::generate(
             // drafter is hot, deeper drafts propose more near-free tokens.
             // Retreat on any miss. Acceptance still goes through the proven
             // re-forward replay, so drafting depth does not affect exactness.
+            ++mtp_rounds;
+            bool speculate = true;
+            if (mtp_cool > 0) { --mtp_cool; speculate = false; }
+            else if (mtp_rounds > 8 && mtp_ema < mtp_ema_min) {
+                mtp_cool = 7; speculate = false;   // re-probe on the 8th round
+            }
             int depth = mtp_depth_;
-            if (hot_streak >= 2) depth = std::min<int>(depth + 2, 8);
-            else if (hot_streak >= 1) depth = std::min<int>(depth + 1, 8);
+            if (speculate) {
+                if (hot_streak >= 2) depth = std::min<int>(depth + 2, 8);
+                else if (hot_streak >= 1) depth = std::min<int>(depth + 1, 8);
+            }
             int dtok = cur;
             std::vector<uint16_t> dh = hidden_state;
             std::vector<uint16_t> ho;
-            for (int i = 0; i < depth; ++i) {
+            for (int i = 0; speculate && i < depth; ++i) {
                 int t = -1;
                 if (!mtp_.draft(dtok, dh, ho, t)) break;
                 if (t == tokenizer_.eos_token_id()) break;
@@ -1126,6 +1224,7 @@ std::string RindiEngine::generate(
 
             size_t n_ok = 0;
             while (n_ok < drafts.size() && preds[n_ok] == drafts[n_ok]) ++n_ok;
+            mtp_ema = 0.75f * mtp_ema + 0.25f * (float)n_ok;
             if (dbg_mtp) {
                 std::fprintf(stderr, "[MTPTRACE] round cur=%d drafts=", cur);
                 for (int d : drafts) std::fprintf(stderr, "%d,", d);

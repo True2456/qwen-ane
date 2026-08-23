@@ -152,6 +152,38 @@ MLX's real int4 GEMM lives locally at
   register-blocked accumulation). It is a large careful port, NOT a oneshot
   glyph dump - the failed drafts underscore this.
 
+## P4f - APC prefix cache: IMPLEMENTED + MTP findings
+- APC (exact-prefix prompt cache) now wired end-to-end. The TUI/metrics
+  plumbing existed but no cache was ever implemented (server passed
+  hardcoded `false, 0`).
+  Design: after prefill, snapshot FULL state (attention KV rows + positions
+  incl. Metal mirrors via snapshot_kv/restore_kv, GDN conv+recurrence,
+  MTP draft pos, and the end-of-prefill hidden). Later request whose tokens
+  extend the cached sequence restores state and prefills only the suffix;
+  equal-length regenerations reuse everything (no suffix prefill; cached
+  hidden feeds decode directly).
+  OFF-BY-ONE that mattered: equal-length resume must NOT replay the final
+  token - the snapshot is AFTER it (double-advances every recurrent state,
+  outputs diverge). Fixed by caching last_hidden.
+- VALIDATED (temperature 0): cold 9.8s vs cached 4.7s on a ~500-token prompt
+  (2.9x TTFT at 16-token generations; pure-prefill saving is larger),
+  outputs BIT-IDENTICAL across cold/cached runs, single-chunk and
+  multi-chunk both exact. RINDI_DISABLE_APC=1 disables.
+- KNOWN LIMIT: multi-turn growth does NOT hit when the previous prompt ended
+  with generation-prime tokens - a grown conversation is never a strict
+  token-prefix of the old prompt. Fixing needs segment-boundary snapshots
+  (cache state before the prime), tracked as follow-up.
+- MTP STATUS (separate pre-existing issue): accepted/step ~1.1-1.8,
+  speedup 0.84-0.99x (net loss) ALREADY BEFORE today's kernel work (clean
+  tree measured 0.90x this morning vs d17de73-era claims of 4.57 acc).
+  RINDI_MTP_DEPTH has NO effect (identical steps across depths 1-4);
+  deep drafts keep missing. Added an acceptance-EMA guard
+  (RINDI_MTP_EMA_MIN, default OFF) that cools speculation for 7 rounds
+  when EMA-accepted drafts fall below threshold; verified replay keeps
+  exactness regardless. Root-causing the draft-quality regression is an
+  open item - today's changes are ruled out (fails identically with
+  RINDI_DISABLE_APC=1 and guard disabled).
+
 ## P4e - ANE transfer audit: what the Metal work does/doesn't give the ANE
 - DIRECT: nothing - kernels do not cross processors. What transfers is
   measurement + strategy:
