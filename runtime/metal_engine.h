@@ -270,6 +270,25 @@ void metal_dispatch_gemm_int4_groupwise_batch(
     int lanes
 );
 
+/* Register-blocked simdgroup-MMA int4 groupwise GEMM (MLX steel-gemm
+ * structure). BM=32 x BN=32 x BK=64 tiles, 128-thread threadgroups.
+ * fp16-dequant rounding (~1e-3 rel) - NOT bit-exact vs the scalar kernel;
+ * validated in probes/test_metal_simd_gemm.mm. 2.4x faster than batch. */
+void metal_dispatch_gemm_int4_simd(
+    MetalContext* ctx,
+    MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle input_buf,
+    MetalBufferHandle weight_buf,
+    MetalBufferHandle scale_buf,
+    MetalBufferHandle bias_buf,
+    MetalBufferHandle output_buf,
+    int rows,
+    int logical_cols,
+    int packed_cols,
+    int groups,
+    int lanes
+);
+
 /* Same projection with byte offsets into the input/output channel-major
  * buffers. This lets a fused tail write several folded projections into one
  * contiguous next-layer buffer without a CPU concat. */

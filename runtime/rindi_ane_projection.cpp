@@ -550,6 +550,14 @@ bool RindiAneProjection::metal_dispatch(
         }
     } else {
         if (lanes > 1 && input_offset == 0 && output_offset == 0 &&
+                   !std::getenv("RINDI_METAL_GEMM_BATCH") &&
+                   !std::getenv("RINDI_DISABLE_BATCH_GEMM")) {
+            metal_dispatch_gemm_int4_simd(
+                ctx, cmd, input, metal_weights_, metal_scales_, metal_biases_,
+                output, static_cast<int>(output_dim_), static_cast<int>(input_dim_),
+                static_cast<int>(metal_packed_cols_), static_cast<int>(metal_groups_),
+                static_cast<int>(lanes));
+        } else if (lanes > 1 && input_offset == 0 && output_offset == 0 &&
                    !std::getenv("RINDI_DISABLE_BATCH_GEMM")) {
             metal_dispatch_gemm_int4_groupwise_batch(
                 ctx, cmd, input, metal_weights_, metal_scales_, metal_biases_,

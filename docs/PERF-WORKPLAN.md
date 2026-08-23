@@ -152,6 +152,37 @@ MLX's real int4 GEMM lives locally at
   register-blocked accumulation). It is a large careful port, NOT a oneshot
   glyph dump - the failed drafts underscore this.
 
+## P4c - simdgroup MMA port: WIRED (validated, 2.5x over batch)
+- gemm_int4_simd (runtime/metal_engine.m): MLX steel-gemm structure adapted to
+  int4-groupwise. BM=32 x BN=32 x BK=64 tiles (BK == quant group width);
+  128-thread threadgroups = 4 simdgroups; each simdgroup accumulates four
+  8x8 fp32 fragments over rows [sg*8,+8) via simdgroup_multiply_accumulate.
+  Per K-step the W block is dequantized to fp16 in threadgroup memory and
+  activations staged alongside; output staged fp32 then bounds-check
+  converted to fp16 C (fully general rows/lanes, zero-padded overhang).
+- GOTCHA that cost a debug cycle: kernel threadgroup args MUST use the
+  pointer + [[threadgroup(N)]] form WITH setThreadgroupMemoryLength at
+  dispatch. Fixed-size array params silently give zeros otherwise.
+- GOTCHA 2: the probe's self-contained preamble (includes + bf16_to_float)
+  must NOT be pasted into kDefaultShadersSource - duplicate definition kills
+  the WHOLE library => NULL defaultLibrary => every Metal dispatch silently
+  no-ops (garbage output). Library compile must be asserted, not assumed.
+- GATE RESULTS (probes/test_metal_simd_gemm.mm):
+  correctness bad=0 vs scalar ref on 5 shapes incl. lanes 8/16/24/32,
+  maxabs ~1-2e-3 = fp16-dequant rounding class (batch itself is ~1e-3);
+  perf 34816x5120 lanes=32: 2.17 ms vs batch 5.43 ms = 2.50x (5.25 TFLOPS).
+  NOT bit-exact vs scalar by construction (same tradeoff MLX makes).
+- END-TO-END: MTP_EXACT=PASS with simd wired; generation coherent.
+  Fallback toggle RINDI_METAL_GEMM_BATCH forces the old batch kernel.
+- HONEST CAVEAT: in-server prefill measured ~21 tok/s (simd) vs ~19 tok/s
+  (batch) at pp1024 - statistically equal; the tail path itself is currently
+  far below its historical ~900 tok/s for BOTH kernels and both show
+  "Batched tail unavailable"/fallback unless RINDI_ENABLE_METAL_TAIL=1.
+  In-engine prefill parity + the tail regression are separate open items;
+  the 2.5x kernel win is real and isolated by the micro harness.
+- Cumulative GEMM: naive 15.98 ms -> batch 5.43 ms -> simd MMA 2.17 ms
+  = 7.4x total; ~42% of MLX fp16 steel-gemm throughput on this shape.
+
 ## P4b - Attempted row-tile - REJECTED by harness (measured facts)
 - ATTEMPTED gemm_int4_groupwise_tile: one threadgroup per 16-row x 32-lane
   block, A-block + W-block streamed into threadgroup once per K-step (the
