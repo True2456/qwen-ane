@@ -592,20 +592,19 @@ static int test_fused_gated_conv(ANEContext* ane, int C, int S, int K, int iters
 // ---------------------------------------------------------------------------
 
 static int test_int4(ANEContext* ane) {
-    std::cout << "\n[7] INT4 weight-path probe\n";
-    const int C = 4, S = 32, K = 4;
-    // 16 int4 values packed 2-per-byte, low nibble first: v[j] = j - 8 (-8..7).
-    std::vector<uint8_t> packed((size_t)C*K/2);
-    for (size_t b = 0; b < packed.size(); ++b) {
-        const int lo = ((int)(b*2)   % 16) & 0xf;
-        const int hi = ((int)(b*2+1) % 16) & 0xf;
-        packed[b] = (uint8_t)(lo | (hi << 4));
-    }
-    const char* names[] = {"w.bin"};
-    const void* data[] = {packed.data()};
-    const size_t sizes[] = {packed.size()};
-    // expected decode under (sign, low-first): w[j] = (j%16) - 8
-    auto make_variant = [](const char* body) {
+    std::cout << "\n[7] compressed-weight probe: int4/int3/int2 dtypes + palettized LUT\n";
+    const char* names[] = {"w.bin", "lut.bin"};
+    // Uniform-value bitstreams are packing-order invariant: filling every
+    // payload byte with 0xFF makes every decoded element the max-magnitude
+    // negative under ANY nibble/bit order, so lane sums verify sign handling
+    // without knowing the packing convention.
+    std::vector<uint8_t> ff(16 / 2, 0xFF);            // int4: 16 elems
+    std::vector<uint8_t> ff12((12 + 7) / 8, 0xFF);    // int3: 12 elems (bitstream)
+    std::vector<uint8_t> ff8(8 / 4, 0xFF);            // int2: 8 elems
+    std::vector<uint8_t> u8_idx(16, 3);               // LUT: all indices -> 3
+    std::vector<uint16_t> lut4 = {0x3800, 0x4000, 0x4200, 0x4400}; // 0.5,1,3,4 fp16
+
+    auto mk = [](const char* body) {
         char buf[2048];
         std::snprintf(buf, sizeof(buf),
             "program(1.3)\n%s\n"
@@ -622,24 +621,48 @@ static int test_int4(ANEContext* ane) {
             "}\n", kBuildInfo, body);
         return std::string(buf);
     };
-    const char* var_a =
+    const char* var_int4 =
         "    tensor<int4, [4, 1, 1, 4]> w4 = const()[name=string(\"w4\"), val=tensor<int4, [4, 1, 1, 4]>(BLOBFILE(path=string(\"@model_path/weights/w.bin\"), offset=uint64(64)))];\n"
         "    tensor<fp16, [4, 1, 1, 4]> w = cast(x=w4, dtype=string(\"fp16\"))[name=string(\"w\")];\n";
-    const char* var_b =
-        "    tensor<uint8, [8]> qd = const()[name=string(\"qd\"), val=tensor<uint8, [8]>(BLOBFILE(path=string(\"@model_path/weights/w.bin\"), offset=uint64(64)))];\n"
-        "    tensor<fp16, [4, 1, 1, 4]> w = constexpr_affine_to_dense(quantized_data=qd, zero_point=fp16(0x0p+0), scale=fp16(0x1p+0), axis=-1)[name=string(\"w\")];\n";
-    const char* var_c =
-        "    tensor<uint8, [8]> qd = const()[name=string(\"qd\"), val=tensor<uint8, [8]>(BLOBFILE(path=string(\"@model_path/weights/w.bin\"), offset=uint64(64)))];\n"
-        "    tensor<fp16, [4, 1, 1, 4]> w = dequantize(weight=qd, scale=fp16(0x1p+0), bias=fp16(0x0p+0))[name=string(\"w\")];\n";
+    const char* var_uint4 =
+        "    tensor<uint4, [4, 1, 1, 4]> w4 = const()[name=string(\"w4\"), val=tensor<uint4, [4, 1, 1, 4]>(BLOBFILE(path=string(\"@model_path/weights/w.bin\"), offset=uint64(64)))];\n"
+        "    tensor<fp16, [4, 1, 1, 4]> w = cast(x=w4, dtype=string(\"fp16\"))[name=string(\"w\")];\n";
+    const char* var_int3 =
+        "    tensor<int3, [4, 1, 1, 4]> w3 = const()[name=string(\"w3\"), val=tensor<int3, [4, 1, 1, 4]>(BLOBFILE(path=string(\"@model_path/weights/w.bin\"), offset=uint64(64)))];\n"
+        "    tensor<fp16, [4, 1, 1, 4]> w = cast(x=w3, dtype=string(\"fp16\"))[name=string(\"w\")];\n";
+    const char* var_int2 =
+        "    tensor<int2, [4, 1, 1, 4]> w2c = const()[name=string(\"w2c\"), val=tensor<int2, [4, 1, 1, 4]>(BLOBFILE(path=string(\"@model_path/weights/w.bin\"), offset=uint64(64)))];\n"
+        "    tensor<fp16, [4, 1, 1, 4]> w = cast(x=w2c, dtype=string(\"fp16\"))[name=string(\"w\")];\n";
+    const char* var_lut_u8 =
+        "    tensor<fp16, [4]> lut = const()[name=string(\"lut\"), val=tensor<fp16, [4]>(BLOBFILE(path=string(\"@model_path/weights/lut.bin\"), offset=uint64(64)))];\n"
+        "    tensor<uint8, [4, 1, 1, 4]> idx = const()[name=string(\"idx\"), val=tensor<uint8, [4, 1, 1, 4]>(BLOBFILE(path=string(\"@model_path/weights/w.bin\"), offset=uint64(64)))];\n"
+        "    tensor<fp16, [4, 1, 1, 4]> w = constexpr_lut_to_dense(indices=idx, lut=lut)[name=string(\"w\")];\n";
+    const char* var_lut_i32 =
+        "    tensor<fp16, [4]> lut = const()[name=string(\"lut\"), val=tensor<fp16, [4]>(BLOBFILE(path=string(\"@model_path/weights/lut.bin\"), offset=uint64(64)))];\n"
+        "    tensor<int32, [4, 1, 1, 4]> idx = const()[name=string(\"idx\"), val=tensor<int32, [4, 1, 1, 4]>(BLOBFILE(path=string(\"@model_path/weights/w.bin\"), offset=uint64(64)))];\n"
+        "    tensor<fp16, [4, 1, 1, 4]> w = constexpr_lut_to_dense(indices=idx, lut=lut)[name=string(\"w\")];\n";
 
-    int rc = 1;
-    for (auto&& [tag, body] : {std::pair<const char*, const char*>{"A int4-tensor+cast", var_a},
-                               {"B constexpr_affine_to_dense", var_b},
-                               {"C dequantize", var_c}}) {
-        const std::string mil = make_variant(body);
-        ANEModel* model = ane_model_compile_mil(ane, mil.c_str(), names, data, sizes, 1, 0, 21);
+    struct Var { const char* tag; const char* body; const void* data; size_t size;
+                 float expect; const char* note; };
+    std::vector<Var> vars = {
+        // all-elements-negative uniform streams; expected lane0 sum over 4
+        {"int4+cast",     var_int4,  ff.data(), ff.size(),   -32.0f, "all=-8 => sum -32"},
+        {"uint4+cast",    var_uint4, ff.data(), ff.size(),    60.0f, "all=15 => sum 60"},
+        {"int3+cast",     var_int3,  ff.data(), ff.size(),     -4.0f, "all=-1 => sum -4"},
+        {"int2+cast",     var_int2,  ff.data(), ff.size(),     -8.0f, "all=-2 => sum -8"},
+        {"lut(u8 idx)",   var_lut_u8, u8_idx.data(), u8_idx.size(), 16.0f, "idx=3 -> lut 4.0 => sum 16"},
+        {"lut(i32 idx)",  var_lut_i32, nullptr, 0,             16.0f, "idx=3 -> lut 4.0 => sum 16"},
+    };
+
+    int any_ok = 0;
+    for (const Var& v : vars) {
+        const void* data[2] = {v.data, lut4.data()};
+        const size_t sizes[2] = {v.size, lut4.size()*2};
+        ANEModel* model = ane_model_compile_mil(ane, mk(v.body).c_str(), names,
+                                                data, sizes, 2, 0, 21);
         if (!model) {
-            std::cout << "  variant " << tag << ": REJECTED by compiler\n";
+            std::cout << "  " << std::left << std::setw(13) << v.tag
+                      << ": REJECTED\n";
             continue;
         }
         IoSurface in(4*32*2), out(4*32*2);
@@ -648,22 +671,21 @@ static int test_int4(ANEContext* ane) {
         if (!req) { ane_model_release(model); continue; }
         ane_request_evaluate(ane, model, req, nullptr, 0, nullptr, 0);
         const auto got = surface_read(out.get(), 128);
-        // ones-input conv sums 4 consecutive decoded weights starting at lane l:
-        // lane0 sums w[0..3]. With low-first signed decode those are -8..-5 => -26.
         float v0 = got.empty() ? 0.f : fp16_to_fp32(got[0]);
-        bool matches_low_first_signed = (v0 == -26.0f);
-        std::cout << "  variant " << tag << ": COMPILED, lane0 sum=" << v0
-                  << (matches_low_first_signed ? " => signed int4, LOW nibble first CONFIRMED"
-                                               : " => compiled but decode differs (investigate)") << "\n";
+        const bool match = (v0 == v.expect);
+        if (match) ++any_ok;
+        std::cout << "  " << std::left << std::setw(13) << v.tag
+                  << ": COMPILED, lane0=" << v0 << " expected " << v.expect
+                  << " (" << v.note << ")" << (match ? " CONFIRMED" : " MISMATCH")
+                  << "\n";
         ane_request_release(req);
         ane_model_release(model);
-        rc = 0;
     }
-    if (rc) std::cout << "  => NEGATIVE RESULT: compiler accepts no probed int4 form;"
-                         " envelope 'INT4 packed' claim unverified.\n";
-    return 0; // probe: never fail the suite, just report
+    std::cout << "  => " << (any_ok ? "sub-fp16 weight encodings ARE usable"
+                                    : "no sub-fp16 encoding accepted through this pipeline")
+              << "\n";
+    return 0;
 }
-
 // ---------------------------------------------------------------------------
 
 int main(int argc, char** argv) {

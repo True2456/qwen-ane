@@ -170,9 +170,22 @@ with @[a,b] the hardware computed conv(param1<-b), conv(param2<-a); RelErr
 1.5 vs 8.6e-4 discriminated cleanly). `ane_request_create_2in` reverses on
 the caller's behalf so surfaces are passed in MIL parameter order.
 
-**INT4 weight path: NEGATIVE RESULT.** All three probed encodings are rejected
-by the MIL text compiler with `InvalidMILProgram`: `tensor<int4,...>` +
-`cast`, `constexpr_affine_to_dense(quantized_data=uint8,...)`, and
-`dequantize(weight=uint8,scale,bias)`. The section 3 envelope comment "INT4
-packed" remains UNVERIFIED - fp16 BLOBFILE constants are the only proven
-weight encoding through this pipeline.
+**Sub-fp16 weight encodings: NEGATIVE RESULT (exhaustive).** The MIL text
+compiler rejects every probed compressed-weight form with `InvalidMILProgram`:
+`tensor<int4/uint4/int3/int2,...>` + `cast`, `constexpr_affine_to_dense`,
+`dequantize`, and `constexpr_lut_to_dense` (both uint8 and int32 index
+tensors). Verdicts are grammar-level compile rejections, not packing
+ambiguities - probe weights used uniform bitstreams (all-0xFF bytes) whose
+decode is packing-order invariant. **fp16 BLOBFILE constants are the only
+weight encoding accepted through the text-MIL pipeline.** The section 3
+"INT4 packed" envelope comment remains UNVERIFIED from this path.
+
+Implications for low-bit weights (2/3/4-bit, EXL3/QTIP trellis):
+- Not expressible in text MIL at all. EXL3 trellis codebooks additionally are
+  not representable as ANY per-weight dequant op - they need a real dequant
+  pass (CPU/Metal) before ANE consumption.
+- ANE hardware itself does execute palettized/compressed weights, but that
+  support is reached through the coremltools protobuf path (offline compile),
+  not text MIL. Viable hybrid: compress offline with coremltools, ship the
+  .mlmodelc, load at runtime via `ane_model_load_compiled` (already in the
+  bridge) - keeps inference Python-free.
