@@ -152,6 +152,21 @@ MLX's real int4 GEMM lives locally at
   register-blocked accumulation). It is a large careful port, NOT a oneshot
   glyph dump - the failed drafts underscore this.
 
+## P5b - Lever 1 RESULT: wide-width tails work but prefill does NOT accelerate
+- MEASURED: width 32 and 62 both ~90 tok/s? NO - ~70 tok/s prefill on the same
+  ~1500-token prompt (~14.5s vs ~14.8s wall incl decode). Raising the lane
+  ceiling from 29 (width 32) to 59 (width 62, ~2x fewer chunk passes) does NOT
+  move prefill throughput.
+- The ~70 tok/s is a THROUGHPUT PLATEAU independent of lane count. The tail
+  cost per pass does not amortize with lanes (double lanes -> ~same time per
+  pass, ~2x tokens but not 2x throughput suggests a fixed per-FLOP/weight
+  ceiling, not chunk overhead).
+- Widening DOES evaluate: width 62 runs correctly, 64 rejected; the shipped
+  width-32 is over-conservative. Parametric plumbing (P5a) is correct, kept.
+- CONCLUSION: wides prefill is not the throughput lever; the unique path is
+  compute (ALU int8) or fusing. Defer prefill. PIVOT to Lever 2 (decode):
+  per-lane recurrence state checkpoints for O(1) MTP rollback - the only
+  clear win and width-independent.
 ## P5a - Lever 1 (wide-width tails): compile OK, EVAL blocked - groundwork landed
 - CONFIRMED: the ANE fused tails are runtime-compiled from build_tail_mil()
   (NOT frozen package blobs - earlier conclusion was wrong). At
