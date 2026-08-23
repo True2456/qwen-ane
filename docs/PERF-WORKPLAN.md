@@ -559,3 +559,22 @@ RISK: low-medium. Contained to engine.cpp generate() partial branch + one
   evaluate_tail(1) (both stream weights once; expected parity).
 - STATUS: all P6 code remains in tree, env-gated OFF by default
   (RINDI_STATE_REBUILD=1 enables). Default behavior unchanged.
+
+## P11 - DUAL-DEBUG RESULT: divergence isolated to first attention layer KV
+- Same-process A/B (restore -> rebuild -> hash vs restore -> legacy replay ->
+  hash) eliminates trajectory contamination entirely.
+- RESULT (consistent every partial round): GDN layers 0-2 state BIT-IDENTICAL
+  between rebuild and replay. First divergence: layer 3 = first ATTENTION
+  layer, KV-cache hash (component includes keys+values rows [0,position)).
+- Also validated again at fine grain: layer-0 GDN norm input, conv history
+  and recurrence state bit-identical across both paths ([RB0]/[LG0] equal).
+- SUSPECT: the attention np projections (qkv/z/b/a folded program) may be
+  width-dependent - the P7 tail-invariance proof covered only the hidden
+  outputs of evaluate_tail_batch, NOT the next_projection gather. The rebuild
+  feeds STORED np (captured at k+1-wide verify) while legacy replay
+  regenerates np at keep-wide; if np differs => attention KV differs.
+  Alternative suspect: an attention KV-write subtlety under repacked q/k/v.
+- NEXT (mechanical): hash the captured np vs replay-regenerated np per layer;
+  if np matches, diff attention KV rows individually (row-by-row bisect);
+  if np differs, extend the tail-invariance proof to np channels and/or pad
+  np staging to constant width like P9 did for the conv surface.

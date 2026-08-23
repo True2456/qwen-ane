@@ -584,174 +584,18 @@ void RindiEngine::reset_scheduler() {
 
 bool RindiEngine::forward_token(const std::vector<uint16_t>& input,
                                 std::vector<uint16_t>& output) {
-    if (!scheduler_ready_ || input.size() != hidden_dim_ ||
-        attention_layers_.size() != num_layers_ || gdn_layers_.size() != num_layers_) {
+    // P11 UNIFICATION: every single-token step now takes the SAME batched
+    // forward path (forward_prompt_batch at lanes=1) that speculative
+    // verification uses. Base-vs-spec numerics are bit-identical by
+    // construction, which is the precondition for MTP exactness.
+    // Cost parity: both paths stream all layer weights once per token; the
+    // batched tails/cores at lanes=1 do the same work as the legacy
+    // single-lane programs.
+    if (!scheduler_ready_ || input.size() != hidden_dim_) return false;
+    std::vector<uint16_t> out;
+    if (!forward_prompt_batch(input, 1, out) || out.size() != hidden_dim_)
         return false;
-    }
-
-    static thread_local size_t debug_forward_index = 0;
-    const auto timing_start = std::chrono::high_resolution_clock::now();
-    const size_t this_forward_index = debug_forward_index++;
-    const char* debug_index_text = std::getenv("RINDI_DEBUG_FORWARD_INDEX");
-    const bool debug_layers = std::getenv("RINDI_DEBUG_LAYER_STATS") &&
-                              debug_index_text &&
-                              this_forward_index == static_cast<size_t>(std::strtoull(debug_index_text, nullptr, 10));
-
-    std::vector<uint16_t> hidden = input;
-    std::vector<uint16_t> normalized;
-    if (!apply_rms_norm(hidden, first_input_norm_, normalized)) {
-        std::cerr << "[RindiEngine] first RMSNorm failed" << std::endl;
-        return false;
-    }
-
-    // These bind to the member scratch buffers: tail N folds layer N+1's
-    // projection into next_projection_, and each layer's core output lands in
-    // core_scratch_ without a fresh allocation.
-    std::vector<uint16_t>& next_projection = next_projection_;
-    std::vector<uint16_t>& core = core_scratch_;
-    std::vector<uint16_t>& z = z_scratch_;
-    std::vector<uint16_t>& gated = gated_scratch_;
-    for (size_t layer = 0; layer < num_layers_; ++layer) {
-        const auto layer_core_start = std::chrono::high_resolution_clock::now();
-        residual_scratch_ = hidden;
-        const std::vector<uint16_t>& residual = residual_scratch_;
-        const bool attention = attention_layers_[layer] != nullptr;
-
-        if (layer == 0) {
-            if (attention) {
-                std::vector<uint16_t> q, k, v;
-                std::vector<uint16_t> attended;
-                if (!attention_layers_[layer]->project(normalized.data(), 1, q, k, v) ||
-                    !attention_layers_[layer]->core_step(q, k, v, attended)) {
-                    std::cerr << "[RindiEngine] attention core failed at layer " << layer << std::endl;
-                    return false;
-                }
-                // q_proj is [q, gate]. Match mlx_lm: apply sigmoid(gate)
-                // before the fused tail, whose input is core + residual.
-                core.swap(attended);
-                for (size_t h = 0; h < 24; ++h) {
-                    for (size_t d = 0; d < 256; ++d) {
-                        const size_t c = h * 256 + d;
-                        const float gate = engine_half_to_float(q[h * 512 + 256 + d]);
-                        const float sigmoid = 1.0f / (1.0f + std::exp(-gate));
-                        core[c] = engine_float_to_half(
-                            engine_half_to_float(core[c]) * sigmoid);
-                    }
-                }
-            } else if (!gdn_layers_[layer]->core_step(normalized.data(), 1, core, z)) {
-                std::cerr << "[RindiEngine] GDN core failed at layer " << layer << std::endl;
-                return false;
-            } else {
-                if (!gdn_layers_[layer]->gate_core(core, z, gated)) return false;
-                core.swap(gated);
-            }
-        } else {
-            if (next_projection.empty()) {
-                std::cerr << "[RindiEngine] missing folded projection at layer " << layer << std::endl;
-                return false;
-            }
-            if (attention) {
-                constexpr size_t Q = 24 * 256;
-                constexpr size_t K = 4 * 256;
-                constexpr size_t QG = 2 * Q;
-                if (next_projection.size() != QG + 2 * K) {
-                    std::cerr << "[RindiEngine] attention folded projection shape at layer " << layer
-                              << ": " << next_projection.size() << std::endl;
-                    return false;
-                }
-                // q_proj is laid out per head as [q(256), gate(256)]. Read the
-                // q/k/v slices straight out of the folded projection buffer.
-                const uint16_t* np = next_projection.data();
-                if (!attention_layers_[layer]->core_step(np, QG, np + QG, K,
-                                                         np + QG + K, K, core)) {
-                    std::cerr << "[RindiEngine] attention folded core failed at layer " << layer << std::endl;
-                    return false;
-                }
-                for (size_t h = 0; h < 24; ++h) {
-                    for (size_t d = 0; d < 256; ++d) {
-                        const size_t c = h * 256 + d;
-                        const float gate = engine_half_to_float(np[h * 512 + 256 + d]);
-                        const float sigmoid = 1.0f / (1.0f + std::exp(-gate));
-                        core[c] = engine_float_to_half(
-                            engine_half_to_float(core[c]) * sigmoid);
-                    }
-                }
-            } else {
-                constexpr size_t QKV = 10240;
-                constexpr size_t Z = 6144;
-                constexpr size_t G = 48;
-                if (next_projection.size() != QKV + Z + 2 * G) {
-                    std::cerr << "[RindiEngine] GDN folded projection shape at layer " << layer
-                              << ": " << next_projection.size() << std::endl;
-                    return false;
-                }
-                const uint16_t* np = next_projection.data();
-                RindiGdnProjectionView projected{np, np + QKV, np + QKV + Z,
-                                                 np + QKV + Z + G};
-                if (!gdn_layers_[layer]->core_from_projected_view(projected, 1, core, z)) {
-                    std::cerr << "[RindiEngine] GDN folded core failed at layer " << layer << std::endl;
-                    return false;
-                }
-                if (!gdn_layers_[layer]->gate_core(core, z, gated)) return false;
-                core.swap(gated);
-            }
-        }
-
-        const bool has_next = layer + 1 < num_layers_;
-        if (debug_layers && layer == 0) {
-            float core_sq = 0.0f, residual_sq = 0.0f;
-            for (uint16_t value : core) {
-                const float x = engine_half_to_float(value); core_sq += x * x;
-            }
-            for (uint16_t value : residual) {
-                const float x = engine_half_to_float(value); residual_sq += x * x;
-            }
-            std::cerr << "[RindiDebug] layer0 core_rms="
-                      << std::sqrt(core_sq / core.size())
-                      << " residual_rms="
-                      << std::sqrt(residual_sq / residual.size()) << std::endl;
-        }
-        const auto layer_tail_start = std::chrono::high_resolution_clock::now();
-        if (!chain_->evaluate_tail(static_cast<int>(layer), core.data(), core.size(),
-                                   residual.data(), hidden, has_next ? &next_projection : nullptr)) {
-            std::cerr << "[RindiEngine] fused tail failed at layer " << layer << std::endl;
-            return false;
-        }
-        if (std::getenv("RINDI_DEBUG_TIMING") && this_forward_index == 0) {
-            const auto layer_end = std::chrono::high_resolution_clock::now();
-            const double core_ms = std::chrono::duration<double, std::milli>(
-                layer_tail_start - layer_core_start).count();
-            const double tail_ms = std::chrono::duration<double, std::milli>(
-                layer_end - layer_tail_start).count();
-            std::cerr << "[RindiTiming] layer=" << layer
-                      << " core_ms=" << core_ms
-                      << " tail_ms=" << tail_ms << std::endl;
-        }
-        if (debug_layers) {
-            float sum = 0.0f;
-            for (uint16_t value : hidden) {
-                const float x = engine_half_to_float(value);
-                sum += x * x;
-            }
-            std::cerr << "[RindiDebug] forward=" << this_forward_index
-                      << " layer=" << layer << " type=" << (attention ? "attn" : "gdn")
-                      << " hidden_rms=" << std::sqrt(sum / hidden.size()) << std::endl;
-        }
-        if (has_next) {
-            // The fused tail has already applied the next block's RMSNorm and
-            // input projection. It is therefore the next layer's core input,
-            // with no host-side normalization or projection required.
-            normalized.clear();
-        }
-    }
-    output = std::move(hidden);
-    if (std::getenv("RINDI_DEBUG_TIMING")) {
-        const auto timing_end = std::chrono::high_resolution_clock::now();
-        const double elapsed_ms = std::chrono::duration<double, std::milli>(
-            timing_end - timing_start).count();
-        std::cerr << "[RindiTiming] forward=" << this_forward_index
-                  << " ms=" << elapsed_ms << std::endl;
-    }
+    output = std::move(out);
     return true;
 }
 
@@ -810,22 +654,27 @@ bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
 
         if (layer == 0) {
             if (attention) {
-                std::vector<uint16_t> q, k, v, attended;
-                if (!attention_layers_[layer]->project(normalized.data(), lanes, q, k, v) ||
-                    !attention_layers_[layer]->core_step_batch(q, k, v, lanes, attended))
-                    return false;
-                core = std::move(attended);
-                for (size_t h = 0; h < 24; ++h) {
-                    for (size_t d = 0; d < 256; ++d) {
-                        const size_t c = h * 256 + d;
-                        const size_t qc = h * 512 + 256 + d;
-                        for (size_t lane = 0; lane < lanes; ++lane) {
-                            const float gate = engine_half_to_float(q[qc * lanes + lane]);
+                // P11: attention Metal kernels are NOT lane-count invariant
+                // (probes/test_attn_compose.cpp) - process lanes ONE AT A TIME
+                // so every token sees identical width-1 numerics regardless of
+                // chunking. Required for speculative-decode exactness.
+                constexpr size_t QA = 24 * 256;
+                core.assign(QA * lanes, 0);
+                std::vector<uint16_t> n1(hidden_dim_), q, k, v, a1;
+                for (size_t lane = 0; lane < lanes; ++lane) {
+                    for (size_t c = 0; c < hidden_dim_; ++c)
+                        n1[c] = normalized[c * lanes + lane];
+                    if (!attention_layers_[layer]->project(n1.data(), 1, q, k, v) ||
+                        !attention_layers_[layer]->core_step_batch(q, k, v, 1, a1))
+                        return false;
+                    for (size_t h = 0; h < 24; ++h)
+                        for (size_t d = 0; d < 256; ++d) {
+                            const size_t c = h * 256 + d;
+                            const float gate = engine_half_to_float(q[h * 512 + 256 + d]);
                             core[c * lanes + lane] = engine_float_to_half(
-                                engine_half_to_float(core[c * lanes + lane]) /
+                                engine_half_to_float(a1[c]) /
                                 (1.0f + std::exp(-gate)));
                         }
-                    }
                 }
             } else {
                 std::vector<uint16_t> gated;
@@ -850,23 +699,28 @@ bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
         } else {
             if (next_projection.empty()) return false;
             if (attention) {
-                if (next_projection.size() != (QG + 2 * K) * lanes) return false;
-                const uint16_t* np = next_projection.data();
-                if (!attention_layers_[layer]->core_step_batch(np, np + QG * lanes,
-                                                               np + (QG + K) * lanes,
-                                                               lanes, core))
-                    return false;
-                for (size_t h = 0; h < 24; ++h) {
-                    for (size_t d = 0; d < 256; ++d) {
-                        const size_t c = h * 256 + d;
-                        const size_t qc = h * 512 + 256 + d;
-                        for (size_t lane = 0; lane < lanes; ++lane) {
-                            const float gate = engine_half_to_float(np[qc * lanes + lane]);
+                // P11: per-lane processing (width-invariance requirement).
+                constexpr size_t QA = 24 * 256;
+                core.assign(QA * lanes, 0);
+                std::vector<uint16_t> nq(QG), nk(K), nv(K), a1;
+                for (size_t lane = 0; lane < lanes; ++lane) {
+                    for (size_t c = 0; c < QG; ++c)
+                        nq[c] = next_projection[c * lanes + lane];
+                    for (size_t c = 0; c < K; ++c) {
+                        nk[c] = next_projection[(QG + c) * lanes + lane];
+                        nv[c] = next_projection[(QG + K + c) * lanes + lane];
+                    }
+                    if (!attention_layers_[layer]->core_step_batch(nq, nk, nv, 1, a1))
+                        return false;
+                    for (size_t h = 0; h < 24; ++h)
+                        for (size_t d = 0; d < 256; ++d) {
+                            const size_t c = h * 256 + d;
+                            const float gate = engine_half_to_float(
+                                next_projection[(h * 512 + 256 + d) * lanes + lane]);
                             core[c * lanes + lane] = engine_float_to_half(
-                                engine_half_to_float(core[c * lanes + lane]) /
+                                engine_half_to_float(a1[c]) /
                                 (1.0f + std::exp(-gate)));
                         }
-                    }
                 }
             } else {
                 if (next_projection.size() != (QKV + Z + 2 * G) * lanes) return false;
@@ -1465,7 +1319,42 @@ std::string RindiEngine::generate(
                 {
                     const auto tr = std::chrono::high_resolution_clock::now();
                     restore_snapshot(snap);
-                    if (state_rebuild_enabled && spec_have_capture_) {
+                    const bool dual_debug =
+                        state_rebuild_enabled && std::getenv("RINDI_DEBUG_SPECSTATE");
+                    if (dual_debug) {
+                        // Same-process A/B: rebuild vs replay from identical snap.
+                        std::vector<uint16_t> hs_rb;
+                        rebuilt = rebuild_state_only(verify_input_, verify_hidden_,
+                                                     keep_len, hs_rb);
+                        auto hrb = spec_layer_hashes();
+                        restore_snapshot(snap);
+                        // legacy replay inline
+                        std::vector<uint16_t> rh;
+                        rh.clear();
+                        {
+                            std::vector<uint16_t> bin(hidden_dim_ * keep_len);
+                            std::vector<int> seq;
+                            seq.push_back(cur);
+                            for (size_t i = 0; i < n_ok; ++i) seq.push_back(drafts[i]);
+                            std::vector<uint16_t> row;
+                            for (size_t lane = 0; lane < keep_len; ++lane) {
+                                safetensors_.get_embedding_row_fp16(seq[lane], hidden_dim_, row);
+                                for (size_t c = 0; c < hidden_dim_; ++c)
+                                    bin[c * keep_len + lane] = row[c];
+                            }
+                            forward_prompt_batch(bin, keep_len, rh);
+                        }
+                        auto hleg = spec_layer_hashes();
+                        long firstdiff = -1;
+                        for (size_t l = 0; l < hrb.size() && l < hleg.size(); ++l)
+                            if (hrb[l] != hleg[l]) { firstdiff = (long)l; break; }
+                        fprintf(stderr, "[DUAL] keep=%zu rebuild=%d first_diff_layer=%ld"
+                                " (layer=%zu comp=%zu)\n", keep_len, rebuilt?1:0, firstdiff,
+                                firstdiff<0?99:(size_t)firstdiff/3,
+                                firstdiff<0?99:(size_t)firstdiff%3);
+                        hidden_state = std::move(hs_rb);
+                    }
+                    else if (state_rebuild_enabled && spec_have_capture_) {
                         rebuilt = rebuild_state_only(verify_input_, verify_hidden_,
                                                      keep_len, hidden_state);
                     }
