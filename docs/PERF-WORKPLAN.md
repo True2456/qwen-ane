@@ -578,3 +578,46 @@ RISK: low-medium. Contained to engine.cpp generate() partial branch + one
   if np matches, diff attention KV rows individually (row-by-row bisect);
   if np differs, extend the tail-invariance proof to np channels and/or pad
   np staging to constant width like P9 did for the conv surface.
+
+## P12 - MTP_EXACT CLOSED: four compounding root causes found and fixed
+After the dual-debug isolation to attention-KV, a systematic bisection (new
+probes: test_np_width, conv-contamination test, in-situ FORK/PRED3/STH/LH
+instrumentation) uncovered FOUR independent defects that together kept
+MTP_EXACT failing for weeks. All four are now fixed and the full ladder is
+green: forced-keep1 PASS, legacy+real-acceptance PASS, **state-rebuild +
+real-acceptance PASS at 1.27-1.33x speedup** (256/512 tokens).
+
+1. PROJECTION KERNEL DUALITY (rindi_ane_projection.cpp): lanes==1 dispatched
+   gemv_int4_groupwise (threaded tree reduction) while lanes>1 dispatched
+   gemm_int4_groupwise - different fp32 accumulation orders over K made
+   per-lane projection values width-dependent. Base decode (always w1) and
+   verify/rebuild/prefill (w>1) therefore ran on subtly different numerics.
+   FIX: always take the per-lane GEMV loop (bit-identical to decode).
+2. REBUILD BATCHED ATTENTION (rindi_engine.cpp): rebuild_state_only fed
+   attention via one keep-wide core_step_batch while verify/replay/base use
+   per-lane width-1 calls (P11). FIX: mirror the per-lane discipline exactly.
+3. CHANNEL-MAJOR SLICING BUGS x3 (rindi_engine.cpp): fix_hidden (rebuild),
+   hidden_state (legacy replay) and prev_lane/last_lane (full-acceptance fast
+   path) all sliced channel-major buffers with contiguous lane-major offsets -
+   garbage whenever keep>1 (keep==1 coincided, masking the bug). FIX: proper
+   [c * lanes + lane] extraction everywhere.
+4. FINAL-NORM CONVENTION MISMATCH (rindi_engine.cpp): base predicts via
+   apply_rms_norm -> greedy_argmax -> argmax_over_hidden, which applies the
+   final RMSNorm AGAIN (double norm). Spec verify predicted from RAW hiddens
+   (single norm). The logits differ enough to flip near-tie argmaxes ("the"
+   vs "output" at char 107). FIX: spec preds replicate base's exact
+   double-norm pipeline. NOTE: base is MLX-text-validated under double-norm;
+   unifying both on true single-norm is a possible future cleanup (would need
+   revalidation).
+
+Also proven along the way (negative results, documented here so nobody chases
+them again): ANE tail programs are pointwise/column-invariant (hiddens AND np);
+GDN conv surface bytes never affect gathered outputs; Metal gdn_recurrence
+kernel is sequentially per-lane exact; gemm_bf16 LM head is row-exact across
+M; restore_snapshot is complete (recurrence Metal buffer aliases the ANE
+surface). The only cross-width state residue is benign: conv surface stale
+columns + written_lanes_ (surfw hash component), which no gathered output ever
+reads. Debug hooks added (all env-gated): RINDI_DEBUG_NP/COREIN/SURF/CORE0/
+STATEHASH/LAYERHASH/LMCHECK/FORK, RINDI_SPEC_FORCE_KEEP1, RINDI_DEBUG_AB(_W).
+Tradeoff to revisit: layer-0 GDN projections now run lanes x GEMV dispatches
+per multi-lane call (prefill cost); acceptable until gemm matches gemv order.

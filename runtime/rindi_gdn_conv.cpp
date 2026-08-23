@@ -65,6 +65,8 @@ bool RindiGdnConv::evaluate(const uint16_t* current, size_t lanes,
     // call. Columns beyond 3+lanes feed conv outputs that are never gathered,
     // so a per-call full-surface memset is only needed when the lane count
     // changes and would otherwise expose stale values in the read window.
+    // (P12 experiment: unconditional memset changed nothing - surface state
+    // is not part of any divergence path.)
     if (written_lanes_ != lanes) {
         std::memset(dst, 0, channels_ * width_ * sizeof(uint16_t));
         written_lanes_ = lanes;

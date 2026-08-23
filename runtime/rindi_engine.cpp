@@ -5,6 +5,7 @@
 
 #include "rindi_engine.h"
 #include <iostream>
+#include <map>
 #include <chrono>
 #include <cmath>
 #include <random>
@@ -354,6 +355,31 @@ bool RindiEngine::argmax_over_hidden(const std::vector<uint16_t>& hidden,
         if (toks[lane] >= 0 && static_cast<size_t>(toks[lane]) < vocab)
             tokens[lane] = toks[lane];
     }
+    // P12 CHECK: recompute each lane with an M=1 dispatch (row staged alone)
+    // and compare - isolates M-dependence of the batched LM head.
+    if (std::getenv("RINDI_DEBUG_LMCHECK") && lanes > 1) {
+        static MetalBufferHandle chk_in = nullptr;
+        if (!chk_in) chk_in = metal_buffer_create(metal_ctx_, hidden_dim_ * sizeof(uint16_t));
+        auto* ci = static_cast<uint16_t*>(metal_buffer_get_contents(chk_in));
+        for (size_t lane = 0; lane < lanes; ++lane) {
+            std::memcpy(ci, staged + lane * hidden_dim_, hidden_dim_ * sizeof(uint16_t));
+            MetalCommandBufferHandle cmd2 = metal_command_buffer_create(metal_ctx_);
+            metal_dispatch_gemm_bf16(metal_ctx_, cmd2, chk_in,
+                                     lm_head_gpu_, lm_head_batch_logits_,
+                                     1, static_cast<int>(vocab),
+                                     static_cast<int>(hidden_dim_));
+            metal_dispatch_argmax_fp16(metal_ctx_, cmd2, lm_head_batch_logits_,
+                                       lm_head_batch_tokens_, 1,
+                                       static_cast<int>(vocab));
+            metal_command_buffer_commit(cmd2);
+            metal_command_buffer_wait(cmd2);
+            const int32_t* t2 = static_cast<const int32_t*>(
+                metal_buffer_get_contents(lm_head_batch_tokens_));
+            if (t2[0] != toks[lane])
+                fprintf(stderr, "[LMCHECK] lane=%zu batched=%d single=%d MISMATCH\n",
+                        lane, toks[lane], t2[0]);
+        }
+    }
     return true;
 }
 
@@ -487,11 +513,29 @@ bool RindiEngine::rebuild_state_only(const std::vector<uint16_t>& verify_input,
                     normalized[c * keep + lane] = lane_norm[c];
             }
             if (attention) {
-                std::vector<uint16_t> q, k, v, attended;
-                if (!attention_layers_[layer]->project(normalized.data(), keep, q, k, v) ||
-                    !attention_layers_[layer]->core_step_batch(q, k, v, keep, attended))
-                    return false;
-                core = std::move(attended);
+                // P12: attention numerics are width-dependent
+                // (probes/test_attn_compose.cpp): batched keep-wide call does
+                // NOT reproduce the per-lane width-1 calls used by verify,
+                // replay and base decode. Mirror forward_prompt_batch's
+                // per-lane discipline exactly so rebuild state is
+                // bit-identical.
+                core.assign(Q * keep, 0);
+                std::vector<uint16_t> n1(hidden_dim_), q, k, v, a1;
+                for (size_t lane = 0; lane < keep; ++lane) {
+                    for (size_t c = 0; c < hidden_dim_; ++c)
+                        n1[c] = normalized[c * keep + lane];
+                    if (!attention_layers_[layer]->project(n1.data(), 1, q, k, v) ||
+                        !attention_layers_[layer]->core_step_batch(q, k, v, 1, a1))
+                        return false;
+                    for (size_t h = 0; h < 24; ++h)
+                        for (size_t d = 0; d < 256; ++d) {
+                            const size_t c = h * 256 + d;
+                            const float gate = engine_half_to_float(q[h * 512 + 256 + d]);
+                            core[c * keep + lane] = engine_float_to_half(
+                                engine_half_to_float(a1[c]) /
+                                (1.0f + std::exp(-gate)));
+                        }
+                }
             } else {
                 {
                     unsigned long long hh=1469598103934665603ull;
@@ -501,6 +545,13 @@ bool RindiEngine::rebuild_state_only(const std::vector<uint16_t>& verify_input,
                 if (!gdn_layers_[layer]->core_step(normalized.data(), keep, core, z) ||
                     !gdn_layers_[layer]->gate_core_batch(core, z, keep, gated))
                     return false;
+                if (std::getenv("RINDI_DEBUG_CORE0")) {
+                    unsigned long long hg=1469598103934665603ull,hz=1469598103934665603ull;
+                    const size_t chg = core.size()/keep, chz = z.size()/keep;
+                    for (size_t c=0;c<chg;++c){hg^=core[c*keep+0];hg*=1099511628211ull;}
+                    for (size_t c=0;c<chz;++c){hz^=z[c*keep+0];hz*=1099511628211ull;}
+                    fprintf(stderr,"\n[CORE0-RB] keep=%zu gated0=%llx z0=%llx",keep,(unsigned long long)hg,(unsigned long long)hz);
+                }
                 {
                     std::vector<uint16_t> c2,r2;
                     gdn_layers_[layer]->snapshot_state(c2,r2);
@@ -525,23 +576,41 @@ bool RindiEngine::rebuild_state_only(const std::vector<uint16_t>& verify_input,
                         spec_np_[layer][c * spec_in_lanes_ + l];
             const uint16_t* np = np_repack_scratch_.data();
             if (attention) {
-                std::vector<uint16_t> q(QG * keep), k(K * keep), v(K * keep), attended;
-                for (size_t c2 = 0; c2 < QG; ++c2)
-                    for (size_t l = 0; l < keep; ++l)
-                        q[c2 * keep + l] = np[c2 * spec_in_lanes_ + l];
-                for (size_t c2 = 0; c2 < K; ++c2) {
-                    for (size_t l = 0; l < keep; ++l)
-                        k[c2 * keep + l] = np[(QG + c2) * spec_in_lanes_ + l];
-                    for (size_t l = 0; l < keep; ++l)
-                        v[c2 * keep + l] = np[(QG + K + c2) * spec_in_lanes_ + l];
+                // P12: per-lane width-1 attention calls, mirroring
+                // forward_prompt_batch (batched keep-wide attention is not
+                // bit-compatible with the width-1 path).
+                core.assign(Q * keep, 0);
+                std::vector<uint16_t> nq(QG), nk(K), nv(K), a1;
+                for (size_t lane = 0; lane < keep; ++lane) {
+                    for (size_t c2 = 0; c2 < QG; ++c2)
+                        nq[c2] = np[c2 * keep + lane];
+                    for (size_t c2 = 0; c2 < K; ++c2) {
+                        nk[c2] = np[(QG + c2) * keep + lane];
+                        nv[c2] = np[(QG + K + c2) * keep + lane];
+                    }
+                    if (!attention_layers_[layer]->core_step_batch(nq, nk, nv, 1, a1))
+                        return false;
+                    for (size_t h = 0; h < 24; ++h)
+                        for (size_t d = 0; d < 256; ++d) {
+                            const size_t c = h * 256 + d;
+                            const float gate = engine_half_to_float(
+                                np[(h * 512 + 256 + d) * keep + lane]);
+                            core[c * keep + lane] = engine_float_to_half(
+                                engine_half_to_float(a1[c]) /
+                                (1.0f + std::exp(-gate)));
+                        }
                 }
-                if (!attention_layers_[layer]->core_step_batch(q, k, v, keep, attended))
-                    return false;
-                core = std::move(attended);
             } else {
                 RindiGdnProjectionView pv{np, np + QKV * keep,
                                           np + (QKV + Z) * keep,
                                           np + (QKV + Z + G) * keep};
+                if (std::getenv("RINDI_DEBUG_COREIN")) {
+                    unsigned long long h1=1469598103934665603ull,h2=1469598103934665603ull;
+                    for (size_t t=0;t<QKV*keep;++t){h1^=pv.qkv[t];h1*=1099511628211ull;}
+                    for (size_t t=0;t<Z*keep;++t){h2^=pv.z[t];h2*=1099511628211ull;}
+                    std::fprintf(stderr,"[COREIN-RB] layer=%zu keep=%zu qkv=%llx z=%llx\n",
+                                 layer, keep, (unsigned long long)h1, (unsigned long long)h2);
+                }
                 if (!gdn_layers_[layer]->core_from_projected_view(pv, keep, core, z) ||
                     !gdn_layers_[layer]->gate_core_batch(core, z, keep, gated))
                     return false;
@@ -550,8 +619,13 @@ bool RindiEngine::rebuild_state_only(const std::vector<uint16_t>& verify_input,
         }
         (void)core; (void)z; (void)gated;
     }
-    fix_hidden.assign(verify_hidden.begin() + (size_t)(keep - 1) * hidden_dim_,
-                      verify_hidden.begin() + (size_t)keep * hidden_dim_);
+    // P12 LAYOUT FIX: verify_hidden is channel-major [c * spec_in_lanes_ +
+    // lane]; the old contiguous slice treated it as lane-major and produced a
+    // cross-channel mix whenever keep > 1 (keep==1 coincided by accident).
+    fix_hidden.resize(hidden_dim_);
+    const size_t fix_lane = keep - 1;
+    for (size_t c = 0; c < hidden_dim_; ++c)
+        fix_hidden[c] = verify_hidden[c * spec_in_lanes_ + fix_lane];
     return true;
 }
 
@@ -599,6 +673,68 @@ bool RindiEngine::forward_token(const std::vector<uint16_t>& input,
     return true;
 }
 
+
+void RindiEngine::debug_ab_w2(int ta, int tb) {
+    debug_ab_wN({ta, tb});
+}
+
+void RindiEngine::debug_ab_wN(const std::vector<int>& toks) {
+    const size_t W = toks.size();
+    DecodeSnapshot snap;
+    capture_snapshot(snap);
+    std::vector<std::vector<uint16_t>> e(W);
+    std::vector<uint16_t> bin(hidden_dim_ * W), out;
+    for (size_t i = 0; i < W; ++i)
+        if (!safetensors_.get_embedding_row_fp16(toks[i], hidden_dim_, e[i])) return;
+    for (size_t i = 0; i < W; ++i)
+        for (size_t c = 0; c < hidden_dim_; ++c) bin[c * W + i] = e[i][c];
+    lh_tag_ = "abWN";
+    if (!forward_prompt_batch(bin, W, out)) return;
+    const auto ha = spec_layer_hashes();
+    std::vector<std::vector<uint16_t>> hidA(W, std::vector<uint16_t>(hidden_dim_));
+    for (size_t i = 0; i < W; ++i)
+        for (size_t c = 0; c < hidden_dim_; ++c) hidA[i][c] = out[c * W + i];
+    restore_snapshot(snap);
+    lh_tag_ = "abW1";
+    std::vector<std::vector<uint16_t>> hidB(W);
+    for (size_t i = 0; i < W; ++i) {
+        std::vector<uint16_t> step_out;
+        if (!forward_prompt_batch(e[i], 1, step_out)) return;
+        hidB[i] = std::move(step_out);
+    }
+    const auto hb = spec_layer_hashes();   // AFTER the sequential chain
+    // map index -> name
+    size_t idx = 0; int ndiff = 0; std::string first;
+    std::map<std::string, int> bykind;
+    for (size_t l = 0; l < num_layers_; ++l) {
+        if (attention_layers_[l]) {
+            for (int ci = 0; ci < 2; ++ci, ++idx) {
+                const char* nm = ci ? "pos" : "kv";
+                if (ha[idx] != hb[idx]) { ++ndiff; ++bykind[nm]; if (first.empty()) first = "L" + std::to_string(l) + ":" + nm; }
+            }
+        } else {
+            static const char* nm[3] = {"convh", "surfw", "rec"};
+            for (int ci = 0; ci < 3; ++ci, ++idx) {
+                if (ha[idx] != hb[idx]) { ++ndiff; ++bykind[nm[ci]]; if (first.empty()) first = "L" + std::to_string(l) + ":" + nm[ci]; }
+            }
+        }
+    }
+    std::string kinds;
+    for (auto& kv : bykind) kinds += " " + kv.first + ":" + std::to_string(kv.second);
+    size_t nonzero_lanes = 0;
+    std::string per_lane;
+    for (size_t i = 0; i < W; ++i) {
+        size_t d = 0;
+        for (size_t c = 0; c < hidden_dim_; ++c)
+            if (hidB[i][c] != hidA[i][c]) ++d;
+        if (d) ++nonzero_lanes;
+        per_lane += " L" + std::to_string(i) + ":" + std::to_string(d);
+    }
+    fprintf(stderr,
+            "[AB-W%zu] state_diffs=%d/%zu [%s ] first=%s | hidden diffs (of %zu):%s\n",
+            W, ndiff, idx, kinds.c_str(), first.c_str(), (size_t)hidden_dim_, per_lane.c_str());
+}
+
 bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
                                        size_t lanes,
                                        std::vector<uint16_t>& output) {
@@ -621,6 +757,7 @@ bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
     constexpr size_t QKV = 10240;
     constexpr size_t Z = 6144;
     constexpr size_t G = 48;
+    static thread_local int corein_g_depth = 0; (void)corein_g_depth;
     static thread_local size_t debug_batch_index = 0;
     const size_t this_batch_index = debug_batch_index++;
     const bool debug_batch_timing = std::getenv("RINDI_DEBUG_TIMING") &&
@@ -686,6 +823,13 @@ bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
                 if (!gdn_layers_[layer]->core_step(normalized.data(), lanes, core, z) ||
                     !gdn_layers_[layer]->gate_core_batch(core, z, lanes, gated))
                     return false;
+                if (std::getenv("RINDI_DEBUG_CORE0")) {
+                    unsigned long long hg=1469598103934665603ull,hz=1469598103934665603ull;
+                    const size_t chg = core.size()/lanes, chz = z.size()/lanes;
+                    for (size_t c=0;c<chg;++c){hg^=core[c*lanes+0];hg*=1099511628211ull;}
+                    for (size_t c=0;c<chz;++c){hz^=z[c*lanes+0];hz*=1099511628211ull;}
+                    fprintf(stderr,"\n[CORE0-LG] lanes=%zu gated0=%llx z0=%llx",lanes,(unsigned long long)hg,(unsigned long long)hz);
+                }
                 {
                     std::vector<uint16_t> c2,r2;
                     gdn_layers_[layer]->snapshot_state(c2,r2);
@@ -728,6 +872,13 @@ bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
                 RindiGdnProjectionView projected{np, np + QKV * lanes,
                                                  np + (QKV + Z) * lanes,
                                                  np + (QKV + Z + G) * lanes};
+                if (std::getenv("RINDI_DEBUG_COREIN")) {
+                    unsigned long long h1=1469598103934665603ull,h2=1469598103934665603ull;
+                    for (size_t t=0;t<QKV*lanes;++t){h1^=projected.qkv[t];h1*=1099511628211ull;}
+                    for (size_t t=0;t<Z*lanes;++t){h2^=projected.z[t];h2*=1099511628211ull;}
+                    std::fprintf(stderr,"[COREIN-LG] layer=%zu keep=%zu qkv=%llx z=%llx\n",
+                                 layer, lanes, (unsigned long long)h1, (unsigned long long)h2);
+                }
                 if (!gdn_layers_[layer]->core_from_projected_view(projected, lanes, core, z) ||
                     !gdn_layers_[layer]->gate_core_batch(core, z, lanes, gated))
                     return false;
@@ -745,6 +896,38 @@ bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
             spec_np_[layer + 1] = next_projection;
             spec_np_ch_[layer + 1] = next_projection.size() / lanes;
         }
+        if (std::getenv("RINDI_DEBUG_LAYERHASH") && has_next) {
+            // Per-layer lane-0 hidden hash: lets a width-2 verify pass be
+            // compared layer-by-layer against a width-1 replay from the same
+            // restored state (forced-keep1 dual flow).
+            unsigned long long hh = 1469598103934665603ull;
+            const size_t ch = hidden.size() / lanes;
+            for (size_t c = 0; c < ch; ++c) { hh ^= hidden[c * lanes]; hh *= 1099511628211ull; }
+            unsigned long long hl = 1469598103934665603ull;
+            if (lanes > 1)
+                for (size_t c = 0; c < ch; ++c) { hl ^= hidden[c * lanes + lanes - 1]; hl *= 1099511628211ull; }
+            std::fprintf(stderr, "[LH][%s] lanes=%zu layer=%zu hid0=%llx hidL=%llx\n",
+                         lh_tag_.c_str(), lanes, layer, (unsigned long long)hh, (unsigned long long)hl);
+        }
+        if (std::getenv("RINDI_DEBUG_NP") && has_next) {
+            const size_t nch = next_projection.size() / lanes;
+            auto np_lane_hash = [&](size_t l) {
+                unsigned long long h = 1469598103934665603ull;
+                for (size_t c = 0; c < nch; ++c) {
+                    h ^= next_projection[c * lanes + l];
+                    h *= 1099511628211ull;
+                }
+                return h;
+            };
+            unsigned long long zh = 1469598103934665603ull;
+            for (size_t c = 0; c < nch; ++c) { zh ^= (uint16_t)0; zh *= 1099511628211ull; }
+            unsigned long long h0 = np_lane_hash(0), h1 = np_lane_hash(1);
+            std::fprintf(stderr,
+                         "[NPDBG] layer=%zu lanes=%zu ch=%zu np_lane0=%llx np_lane1=%llx "
+                         "lane1_all_zero=%d lane0_eq_lane1=%d\n",
+                         layer, lanes, nch, (unsigned long long)h0,
+                         (unsigned long long)h1, (int)(h1 == zh), (int)(h0 == h1));
+        }
         if (debug_batch_timing) {
             const auto layer_end = std::chrono::high_resolution_clock::now();
             std::cerr << "[RindiTiming] batch_layer=" << layer
@@ -753,6 +936,15 @@ bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
                       << " tail_ms=" << std::chrono::duration<double, std::milli>(
                              layer_end - core_end).count() << std::endl;
         }
+    }
+    if (std::getenv("RINDI_DEBUG_LAYERHASH")) {
+        unsigned long long hf = 1469598103934665603ull, hfl = 1469598103934665603ull;
+        const size_t ch = hidden.size() / lanes;
+        for (size_t c = 0; c < ch; ++c) { hf ^= hidden[c * lanes]; hf *= 1099511628211ull; }
+        if (lanes > 1)
+            for (size_t c = 0; c < ch; ++c) { hfl ^= hidden[c * lanes + lanes - 1]; hfl *= 1099511628211ull; }
+        std::fprintf(stderr, "[LH][%s] lanes=%zu layer=63 FINAL hid0=%llx hidL=%llx\n",
+                     lh_tag_.c_str(), lanes, (unsigned long long)hf, (unsigned long long)hfl);
     }
     output = std::move(hidden);
     return true;
@@ -1218,6 +1410,7 @@ std::string RindiEngine::generate(
             }
 
             const size_t lanes = drafts.size() + 1;
+            lh_tag_ = "verify";
             batch_in.resize(hidden_dim_ * lanes);
             {
                 std::vector<int> seq;
@@ -1254,14 +1447,104 @@ std::string RindiEngine::generate(
                     std::chrono::duration<double, std::milli>(now2 - round_start).count());
                 round_start = now2;
             }
+            // P12 ROOT CAUSE (spec/base fork): base decode predicts via
+            // apply_rms_norm(...) -> greedy_argmax -> argmax_over_hidden,
+            // which applies the final RMSNorm AGAIN (double norm). The spec
+            // verify path fed RAW hiddens (single norm), producing slightly
+            // different logits that flipped near-tie argmaxes ("the" vs
+            // "output"). Replicate base's exact double-norm pipeline here.
+            std::vector<uint16_t> normed_batch(batch_hidden.size());
+            {
+                std::vector<uint16_t> lane_in(hidden_dim_), lane_norm;
+                for (size_t lane = 0; lane < lanes; ++lane) {
+                    for (size_t c = 0; c < hidden_dim_; ++c)
+                        lane_in[c] = batch_hidden[c * lanes + lane];
+                    if (!apply_rms_norm(lane_in, final_norm_, lane_norm))
+                        return generated_text;
+                    for (size_t c = 0; c < hidden_dim_; ++c)
+                        normed_batch[c * lanes + lane] = lane_norm[c];
+                }
+            }
             std::vector<int> preds;
-            if (!argmax_over_hidden(batch_hidden, lanes, preds)) {
+            if (!argmax_over_hidden(normed_batch, lanes, preds)) {
                 finalize_stats(std::chrono::high_resolution_clock::now());
                 return generated_text;
             }
+            // P12: three-way prediction cross-check on lane 0.
+            if (std::getenv("RINDI_DEBUG_FORK") && lanes >= 2 && cur == 72346) {
+                std::vector<uint16_t> lane0(hidden_dim_);
+                for (size_t c = 0; c < hidden_dim_; ++c) lane0[c] = batch_hidden[c * lanes];
+                std::vector<uint16_t> ln0;
+                apply_rms_norm(lane0, final_norm_, ln0);
+                int via_greedy = greedy_argmax(ln0);
+                std::vector<int> via_batch1;
+                argmax_over_hidden(batch_hidden, 1, via_batch1);  // WRONG layout on purpose? no: lanes=1 stride 1
+                // proper strided single-lane vector through the batched path:
+                std::vector<uint16_t> l0v(hidden_dim_);
+                for (size_t c = 0; c < hidden_dim_; ++c) l0v[c] = batch_hidden[c * lanes];
+                std::vector<int> via_argmax1;
+                argmax_over_hidden(l0v, 1, via_argmax1);
+                fprintf(stderr, "[PRED3] preds[0]=%d greedy=%d argmax1=%d\n",
+                        preds[0], via_greedy, via_argmax1[0]);
+            }
 
+            static thread_local size_t spec_ingested = 0;
             size_t n_ok = 0;
             while (n_ok < drafts.size() && preds[n_ok] == drafts[n_ok]) ++n_ok;
+            // P12 FORK PROBE: from this exact entry state, A/B the multi-lane
+            // verify against sequential width-1 forwards.
+            if (std::getenv("RINDI_DEBUG_FORK") && lanes >= 2) {
+                DecodeSnapshot fsnap;
+                capture_snapshot(fsnap);
+                std::vector<int> seq{cur};
+                for (int d : drafts) seq.push_back(d);
+                // A: batched
+                std::vector<uint16_t> bin(hidden_dim_ * lanes);
+                for (size_t i = 0; i < seq.size(); ++i) {
+                    std::vector<uint16_t> row;
+                    safetensors_.get_embedding_row_fp16(seq[i], hidden_dim_, row);
+                    for (size_t c = 0; c < hidden_dim_; ++c) bin[c * lanes + i] = row[c];
+                }
+                lh_tag_ = "forkW";
+                std::vector<uint16_t> hb_out;
+                forward_prompt_batch(bin, lanes, hb_out);
+                std::vector<int> preds_batched;
+                argmax_over_hidden(hb_out, lanes, preds_batched);
+                // B: sequential
+                restore_snapshot(fsnap);
+                lh_tag_ = "forkS";
+                std::vector<uint16_t> hs = hidden_state, step_out;
+                std::vector<int> preds_seq;
+                for (size_t i = 0; i + 1 < seq.size(); ++i) {
+                    std::vector<uint16_t> row;
+                    safetensors_.get_embedding_row_fp16(seq[i], hidden_dim_, row);
+                    forward_prompt_batch(row, 1, step_out);
+                    std::vector<int> p1;
+                    argmax_over_hidden(step_out, 1, p1);
+                    preds_seq.push_back(p1[0]);
+                }
+                // last token's prediction (from state after ingesting all but last)
+                {
+                    std::vector<int> p1;
+                    argmax_over_hidden(step_out, 1, p1);
+                    preds_seq.push_back(p1[0]);
+                }
+                restore_snapshot(fsnap);
+                fprintf(stderr, "[FORK] cur=%d batched_preds=", cur);
+                for (int x : preds_batched) fprintf(stderr, " %d", x);
+                fprintf(stderr, " | seq_preds=");
+                for (int x : preds_seq) fprintf(stderr, " %d", x);
+                fprintf(stderr, "\n");
+                int hidmm = 0;
+                for (size_t c = 0; c < hidden_dim_; ++c)
+                    if (hb_out[c * lanes] != step_out[c]) ++hidmm;
+                fprintf(stderr, "[FORK] lane0 final hidden diffs=%d/%zu\n", hidmm, hidden_dim_);
+            }
+            // P12 diagnostic: force all-rejection rounds (keep=1) so the spec
+            // path reduces to verify+restore only. If output still differs
+            // from base, the fault is in verify numerics or restore fidelity,
+            // not in multi-token acceptance.
+            if (std::getenv("RINDI_SPEC_FORCE_KEEP1")) n_ok = 0;
             mtp_ema = 0.75f * mtp_ema + 0.25f * (float)n_ok;
             if (dbg_mtp) {
                 std::fprintf(stderr, "[MTPTRACE] round cur=%d drafts=", cur);
@@ -1279,20 +1562,44 @@ std::string RindiEngine::generate(
                 // state at the position BEFORE it: lane L-2 of this verify
                 // batch, which is d_{k-1}'s position for k >= 1, or cur's own
                 // prior state when k == 1.
+                // P12 LAYOUT FIX: batch_hidden is channel-major
+                // [c * lanes + lane]. The old contiguous slices treated it as
+                // lane-major and produced cross-channel garbage for every
+                // lanes >= 2 full-acceptance round (the bonus token was then
+                // argmaxed over that garbage, forking the trajectory).
+                std::vector<uint16_t> prev_lane(hidden_dim_), last_lane(hidden_dim_);
+                if (lanes >= 2) {
+                    for (size_t c = 0; c < hidden_dim_; ++c)
+                        prev_lane[c] = batch_hidden[c * lanes + (lanes - 2)];
+                }
+                for (size_t c = 0; c < hidden_dim_; ++c)
+                    last_lane[c] = batch_hidden[c * lanes + (lanes - 1)];
                 {
-                    const uint16_t* prev_base = lanes >= 2
-                        ? batch_hidden.data() + (lanes - 2) * hidden_dim_
-                        : snap.last_hidden.data();
-                    std::vector<uint16_t> prev_lane(prev_base,
-                                                    prev_base + hidden_dim_);
-                    mtp_.advance(drafts.back(), prev_lane);
+                    const std::vector<uint16_t>& prev_ref =
+                        lanes >= 2 ? prev_lane : snap.last_hidden;
+                    mtp_.advance(drafts.back(), prev_ref);
                 }
                 const int bonus = preds[lanes - 1];
-                hidden_state.assign(batch_hidden.end() - hidden_dim_,
-                                    batch_hidden.end());
+                hidden_state = last_lane;
+                if (std::getenv("RINDI_DEBUG_STATEHASH")) {
+                    unsigned long long h = 1469598103934665603ull;
+                    for (auto x : hidden_state) { h ^= x; h *= 1099511628211ull; }
+                    std::fprintf(stderr, "[STH-S] ingested=%zu h=%llx layers=",
+                                 spec_ingested += drafts.size() + 1, (unsigned long long)h);
+                    for (auto x : spec_layer_hashes()) {
+                        h ^= x; h *= 1099511628211ull;
+                        std::fprintf(stderr, " %llx", (unsigned long long)x);
+                    }
+                    std::fprintf(stderr, "\n");
+                }
                 std::vector<int> confirmed(drafts);
                 if (bonus != tokenizer_.eos_token_id()) confirmed.push_back(bonus);
                 const size_t allowed = max_tokens - generated_tokens;
+                if (dbg_mtp) {
+                    std::fprintf(stderr, "[SPECEMIT] fast:");
+                    for (int t : confirmed) std::fprintf(stderr, " %d", t);
+                    std::fprintf(stderr, "\n");
+                }
                 const size_t took = emit_batch(confirmed, allowed);
                 cur = confirmed[took - 1];
                 if (took < confirmed.size() || bonus == tokenizer_.eos_token_id()) {
@@ -1314,7 +1621,7 @@ std::string RindiEngine::generate(
                     fprintf(stderr, "%s\n", s.c_str());
                 };
                 dump_specstate("PRE");
-                const size_t keep_len = n_ok + 1;   // [cur] + accepted drafts
+            const size_t keep_len = n_ok + 1;   // [cur] + accepted drafts
                 bool rebuilt = false;
                 {
                     const auto tr = std::chrono::high_resolution_clock::now();
@@ -1345,13 +1652,65 @@ std::string RindiEngine::generate(
                             forward_prompt_batch(bin, keep_len, rh);
                         }
                         auto hleg = spec_layer_hashes();
+                        // P12: also compare the returned fix_hidden against
+                        // the replay's last-lane hidden.
+                        size_t fh_diff = 0; {
+                            std::vector<uint16_t> rh_last(hidden_dim_), vh_last(hidden_dim_);
+                            for (size_t c = 0; c < hidden_dim_; ++c)
+                                rh_last[c] = rh[c * keep_len + (keep_len - 1)];
+                            const size_t vlane = keep_len - 1;
+                            for (size_t c = 0; c < hidden_dim_; ++c)
+                                vh_last[c] = verify_hidden_[c * spec_in_lanes_ + vlane];
+                            for (size_t c = 0; c < hidden_dim_; ++c)
+                                if (hs_rb[c] != rh_last[c]) ++fh_diff;
+                            unsigned long long hv = 1469598103934665603ull, hr = 1469598103934665603ull;
+                            for (auto x : vh_last){hv^=x;hv*=1099511628211ull;}
+                            for (auto x : rh_last){hr^=x;hr*=1099511628211ull;}
+                            fprintf(stderr, "[FH] vh=%llx rh=%llx hs_rb==vh:%d raw_hs=", (unsigned long long)hv,
+                                    (unsigned long long)hr, (int)(hs_rb == vh_last ? -1 : (hs_rb[0]==vh_last[0])));
+                            for (int i = 0; i < 4; ++i) fprintf(stderr, " %04x", hs_rb[i]);
+                            fprintf(stderr, " raw_rh=");
+                            for (int i = 0; i < 4; ++i) fprintf(stderr, " %04x", rh_last[i]);
+                            fprintf(stderr, " raw_vh=");
+                            for (int i = 0; i < 4; ++i) fprintf(stderr, " %04x", vh_last[i]);
+                            fprintf(stderr, "\n");
+                        }
                         long firstdiff = -1;
                         for (size_t l = 0; l < hrb.size() && l < hleg.size(); ++l)
                             if (hrb[l] != hleg[l]) { firstdiff = (long)l; break; }
+                        // P12: map ALL differing indices to layer/component so
+                        // divergence patterns are readable at a glance.
+                        std::string diffmap;
+                        {
+                            size_t idx = 0;
+                            int nd = 0;
+                            for (size_t l = 0; l < num_layers_ && idx < hrb.size() && nd < 10; ++l) {
+                                if (attention_layers_[l]) {
+                                    if (idx < hrb.size() && idx < hleg.size() && hrb[idx] != hleg[idx]) {
+                                        diffmap += " L" + std::to_string(l) + ":kv"; ++nd;
+                                    }
+                                    ++idx;
+                                    if (idx < hrb.size() && idx < hleg.size() && hrb[idx] != hleg[idx]) {
+                                        diffmap += " L" + std::to_string(l) + ":pos"; ++nd;
+                                    }
+                                    ++idx;
+                                } else {
+                                    static const char* names[3] = {"convh", "surfw", "rec"};
+                                    for (int ci = 0; ci < 3; ++ci, ++idx) {
+                                        if (idx < hrb.size() && idx < hleg.size() && hrb[idx] != hleg[idx]) {
+                                            diffmap += std::string(" L") + std::to_string(l) + ":" + names[ci]; ++nd;
+                                        }
+                                    }
+                                }
+                            }
+                            if (hrb.size() != hleg.size())
+                                diffmap += " LEN" + std::to_string(hrb.size()) + "v" + std::to_string(hleg.size());
+                        }
                         fprintf(stderr, "[DUAL] keep=%zu rebuild=%d first_diff_layer=%ld"
-                                " (layer=%zu comp=%zu)\n", keep_len, rebuilt?1:0, firstdiff,
+                                " (layer=%zu comp=%zu) fix_hidden_diff=%zu%s\n", keep_len, rebuilt?1:0, firstdiff,
                                 firstdiff<0?99:(size_t)firstdiff/3,
-                                firstdiff<0?99:(size_t)firstdiff%3);
+                                firstdiff<0?99:(size_t)firstdiff%3,
+                                fh_diff, diffmap.c_str());
                         hidden_state = std::move(hs_rb);
                     }
                     else if (state_rebuild_enabled && spec_have_capture_) {
@@ -1382,19 +1741,55 @@ std::string RindiEngine::generate(
                                 batch_in[c * keep_len + lane] = row[c];
                         }
                     }
+                    lh_tag_ = "replay";
                     if (!forward_prompt_batch(batch_in, keep_len, replay_hidden) ||
                         replay_hidden.size() != hidden_dim_ * keep_len) {
                         finalize_stats(std::chrono::high_resolution_clock::now());
                         return generated_text;
                     }
-                    hidden_state.assign(
-                        replay_hidden.end() - hidden_dim_, replay_hidden.end());
+                    // P12 LAYOUT FIX: replay_hidden is channel-major
+                    // [c * keep_len + lane]; take the last confirmed lane's
+                    // slice with the proper stride (the old contiguous tail
+                    // slice was a cross-channel mix whenever keep_len > 1).
+                    hidden_state.resize(hidden_dim_);
+                    for (size_t c = 0; c < hidden_dim_; ++c)
+                        hidden_state[c] =
+                            replay_hidden[c * keep_len + (keep_len - 1)];
                 }
-                const int fix = preds[n_ok];
+                // P12 EXACTNESS: the fix token must come from the SAME
+                // computation base decode performs - norm+argmax over the
+                // post-round hidden_state - not from verify-time predictions
+                // captured at width k+1. Any residual width-dependent ULP
+                // noise in the batched pass could otherwise fork the emitted
+                // trajectory from the base trajectory at a near-tie.
+                if (std::getenv("RINDI_DEBUG_STATEHASH")) {
+                    unsigned long long h = 1469598103934665603ull;
+                    for (auto x : hidden_state) { h ^= x; h *= 1099511628211ull; }
+                    std::fprintf(stderr, "[STH-S] ingested=%zu h=%llx layers=",
+                                 spec_ingested += keep_len, (unsigned long long)h);
+                    for (auto x : spec_layer_hashes()) {
+                        h ^= x; h *= 1099511628211ull;
+                        std::fprintf(stderr, " %llx", (unsigned long long)x);
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+                std::vector<uint16_t> fix_logits_input;
+                if (!apply_rms_norm(hidden_state, final_norm_, fix_logits_input)) {
+                    finalize_stats(std::chrono::high_resolution_clock::now());
+                    return generated_text;
+                }
+                const int fix = (temperature <= 0.0f)
+                    ? greedy_argmax(fix_logits_input)
+                    : sample_next_token(fix_logits_input, temperature, rng);
                 std::vector<int> confirmed(drafts.begin(),
                                            drafts.begin() + n_ok);
                 if (fix != tokenizer_.eos_token_id()) confirmed.push_back(fix);
                 const size_t allowed = max_tokens - generated_tokens;
+                if (dbg_mtp) {
+                    std::fprintf(stderr, "[SPECEMIT] norm:");
+                    for (int t : confirmed) std::fprintf(stderr, " %d", t);
+                    std::fprintf(stderr, "\n");
+                }
                 const size_t took = emit_batch(confirmed, allowed);
                 if (fix == tokenizer_.eos_token_id()) {
                     mtp_.restore_kv(snap.mtp_pos, {}, {});
@@ -1428,6 +1823,7 @@ std::string RindiEngine::generate(
         return generated_text;
     }
 
+    size_t plain_ingested = 0;
     for (int step = 0; step < max_tokens; ++step) {
         std::vector<uint16_t> logits_input;
         if (!apply_rms_norm(hidden_state, final_norm_, logits_input)) {
@@ -1483,10 +1879,26 @@ std::string RindiEngine::generate(
                 finalize_stats(std::chrono::high_resolution_clock::now());
                 return generated_text;
             }
+            if (std::getenv("RINDI_DEBUG_STATEHASH")) {
+                unsigned long long h = 1469598103934665603ull;
+                for (auto x : hidden_state) { h ^= x; h *= 1099511628211ull; }
+                std::fprintf(stderr, "[STH-B] ingested=%zu h=%llx layers=",
+                             plain_ingested += 1, (unsigned long long)h);
+                for (auto x : spec_layer_hashes()) {
+                    h ^= x; h *= 1099511628211ull;
+                    std::fprintf(stderr, " %llx", (unsigned long long)x);
+                }
+                std::fprintf(stderr, "\n");
+            }
         }
     }
 
     auto t1 = std::chrono::high_resolution_clock::now();
+    if (std::getenv("RINDI_DEBUG_AB")) {
+        const int ab_toks[4] = {9720, 9721, 9722, 9723};
+        const size_t ab_w = std::getenv("RINDI_DEBUG_AB_W") ? (size_t)std::atoi(std::getenv("RINDI_DEBUG_AB_W")) : 2;
+        debug_ab_wN(std::vector<int>(ab_toks, ab_toks + ab_w));
+    }
     last_eval_ms_ = std::chrono::duration<double, std::milli>(t1 - t0).count();
     finalize_stats(t1);
     if (std::getenv("RINDI_DEBUG_TIMING")) {

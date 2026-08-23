@@ -451,13 +451,46 @@ bool RindiAneProjection::evaluate(const uint16_t* input, size_t lanes,
         return true;
     }
     if (metal_ready_ && lanes <= 32) {
+        if (!metal_rowwise_) {
+            // P12 ROOT CAUSE of spec/base divergence: gemv_int4_groupwise
+            // (lanes==1) and gemm_int4_groupwise (lanes>1) accumulate K in
+            // different fp32 orders, so per-lane projection values depended on
+            // the batch width. Base decode (always lanes=1) then disagreed
+            // with verify/rebuild (lanes>1) in low-order bits, poisoning the
+            // captured np whenever a rounding boundary was crossed.
+            // Fix: ALWAYS run the lanes==1 GEMV, looping lanes, so every
+            // width is bit-identical to single-lane decode.
+            output.assign(output_dim_ * lanes, 0);
+            std::vector<uint16_t> lane_in(input_dim_);
+            for (size_t l = 0; l < lanes; ++l) {
+                for (size_t c = 0; c < input_dim_; ++c)
+                    lane_in[c] = input[c * lanes + l];
+                std::memcpy(metal_buffer_get_contents(metal_input_), lane_in.data(),
+                            input_dim_ * sizeof(uint16_t));
+                MetalCommandBufferHandle cmd = metal_command_buffer_create(metal_ctx_);
+                if (!cmd) return false;
+                metal_dispatch_gemv_int4_groupwise(
+                    metal_ctx_, cmd, metal_weights_, metal_scales_,
+                    metal_biases_, metal_input_, metal_output_,
+                    static_cast<uint32_t>(output_dim_),
+                    static_cast<uint32_t>(metal_packed_cols_),
+                    static_cast<uint32_t>(input_dim_),
+                    static_cast<uint32_t>(metal_groups_));
+                metal_command_buffer_commit(cmd);
+                metal_command_buffer_wait(cmd);
+                const uint16_t* src = static_cast<const uint16_t*>(
+                    metal_buffer_get_contents(metal_output_));
+                for (size_t r = 0; r < output_dim_; ++r)
+                    output[r * lanes + l] = src[r];
+            }
+            return true;
+        }
         std::memcpy(metal_buffer_get_contents(metal_input_), input,
                     input_dim_ * lanes * sizeof(uint16_t));
         MetalCommandBufferHandle cmd = metal_command_buffer_create(metal_ctx_);
         if (cmd) {
-            if (lanes == 1 && !metal_rowwise_) {
-                // K-parallel GEMV: orders of magnitude faster than the
-                // per-(row,lane) kernel at one lane.
+            if (!metal_rowwise_) {
+                // Unreachable (handled above); retained for safety.
                 metal_dispatch_gemv_int4_groupwise(
                     metal_ctx_, cmd, metal_weights_, metal_scales_,
                     metal_biases_, metal_input_, metal_output_,

@@ -45,6 +45,15 @@ struct GenerationStats {
 
 class RindiEngine {
 public:
+    // P12 debug: caller tag for [LH] per-layer trace lines.
+    std::string lh_tag_{"?"};
+
+    // P12 diagnostic: from the CURRENT state, run [ta,tb] as one width-2
+    // batched forward vs two width-1 forwards, restoring state between.
+    // Prints whether per-layer states / final hiddens match per lane.
+    void debug_ab_w2(int ta, int tb);
+    void debug_ab_wN(const std::vector<int>& toks);
+
     RindiEngine(const std::string& model_path);
     ~RindiEngine();
 

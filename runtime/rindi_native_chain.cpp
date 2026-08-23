@@ -576,6 +576,15 @@ bool RindiNativeChain::evaluate_tail_batch(int layer_idx, const uint16_t* core,
         std::memcpy(in + (core_dim + c) * seq_len_, residual + c * lanes,
                     lanes * sizeof(uint16_t));
 
+    const bool dbg_surf = std::getenv("RINDI_DEBUG_SURF") != nullptr && layer_idx == 0;
+    unsigned long long dbg_in_h = 0;
+    if (dbg_surf) {
+        const uint16_t* inb = static_cast<const uint16_t*>(
+            metal_iosurface_get_base_address(e.input_surface));
+        unsigned long long h = 1469598103934665603ull;
+        for (size_t i = 0; i < e.input_channels * seq_len_; ++i) { h ^= inb[i]; h *= 1099511628211ull; }
+        dbg_in_h = h;
+    }
     if (!ane_request_evaluate(ane_ctx_, e.model, e.req_a_to_b, nullptr, 0, nullptr, 0))
         return false;
     output.resize(hidden_dim_ * lanes);
@@ -591,6 +600,22 @@ bool RindiNativeChain::evaluate_tail_batch(int layer_idx, const uint16_t* core,
         for (size_t c = 0; c < e.projection_channels; ++c)
             std::memcpy(next_projection->data() + c * lanes, p + c * seq_len_,
                         lanes * sizeof(uint16_t));
+        if (dbg_surf) {
+            const uint16_t* outb = static_cast<const uint16_t*>(
+                metal_iosurface_get_base_address(e.output_surface));
+            unsigned long long ho = 1469598103934665603ull;
+            for (size_t i = 0; i < hidden_dim_ * seq_len_; ++i) { ho ^= outb[i]; ho *= 1099511628211ull; }
+            unsigned long long hp = 1469598103934665603ull;
+            for (size_t i = 0; i < e.projection_channels * seq_len_; ++i) { hp ^= p[i]; hp *= 1099511628211ull; }
+            // Column-0-only hashes too: isolates whether the live column itself differs.
+            unsigned long long hc0o = 1469598103934665603ull, hc0p = 1469598103934665603ull;
+            for (size_t c = 0; c < hidden_dim_; ++c) { hc0o ^= outb[c * seq_len_]; hc0o *= 1099511628211ull; }
+            for (size_t c = 0; c < e.projection_channels; ++c) { hc0p ^= p[c * seq_len_]; hc0p *= 1099511628211ull; }
+            std::fprintf(stderr,
+                         "[SURF] L0 lanes=%zu in=%llx out=%llx np=%llx col0_out=%llx col0_np=%llx\n",
+                         lanes, (unsigned long long)dbg_in_h, (unsigned long long)ho,
+                         (unsigned long long)hp, (unsigned long long)hc0o, (unsigned long long)hc0p);
+        }
     }
     if (compare_metal_tail && !metal_output.empty()) {
         auto compare_tensor = [](const std::vector<uint16_t>& ref,
