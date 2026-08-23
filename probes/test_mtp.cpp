@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
     std::printf("BASE   chars=%zu tps=%.2f\n", base.size(), base_tps);
 
     unsetenv("RINDI_DISABLE_MTP");
-    setenv("RINDI_MTP_DEPTH", "2", 1);
+    if (!std::getenv("RINDI_MTP_DEPTH")) setenv("RINDI_MTP_DEPTH", "2", 1);
     double mtp_tps = 0.0, mtp_acc = 0.0; size_t mtp_steps = 0;
     const std::string mtp = run_engine(model_path, prompt, max_tokens,
                                        &mtp_tps, &mtp_acc, &mtp_steps);

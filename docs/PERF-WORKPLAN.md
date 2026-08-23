@@ -152,6 +152,31 @@ MLX's real int4 GEMM lives locally at
   register-blocked accumulation). It is a large careful port, NOT a oneshot
   glyph dump - the failed drafts underscore this.
 
+## P4g - MTP root-caused: replay-on-partial economics + two real fixes landed
+- The probe was overriding RINDI_MTP_DEPTH (setenv "2" after env read) - all
+  earlier depth sweeps were void. With the fix: depth 1/2/4/8 -> accepted/step
+  1.60/1.78/2.00/2.00. Deeper drafts genuinely accept more.
+- Phase attribution (instrumented): draft iteration ~0.7-4 ms (MTP core +
+  int4 draft head are CHEAP); verify ~230 ms (lane-invariant, same as a plain
+  step); replay-on-partial ~230 ms more. Full-accept rounds emit k+1 tokens
+  for one verify => win; partial/miss rounds pay a second forward => lose.
+  Net: 0.89-0.91x at depths 1-8. THIS ARCHITECTURE (stateful GDN/ANE layers,
+  O(n) state rollback) cannot truncate state like KV-only stacks, so partials
+  inherently cost a rebuild pass. The Python prototype's speedup came from
+  KV-only rollback (O(1) trim) - not reproducible here without ANE-side
+  state snapshots.
+- EXACTNESS: base greedy decode now uses the GPU BF16 head
+  (greedy_argmax -> argmax_over_hidden lanes=1) - the SAME head speculation
+  verifies with. Plain rounds are now bit-identical to base (guard-ON run
+  PASSES). Remaining divergence enters via partial/replay rounds: batched
+  lane eval vs sequential eval differ in low-order fp16 bits, so near-tie
+  tokens can flip after a replay. Bit-exact MTP requires lane-invariant
+  numerics from the fused tails - open item.
+- LANDED: base decode 4.27 tok/s (up from ~3.9, GPU-head sampling);
+  probe depth override fixed; acceptance-EMA guard verified EXACT at parity
+  (4.15 tok/s, 0.98x) - recommended config for greedy traffic until
+  lane-invariant numerics land.
+
 ## P4f - APC prefix cache: IMPLEMENTED + MTP findings
 - APC (exact-prefix prompt cache) now wired end-to-end. The TUI/metrics
   plumbing existed but no cache was ever implemented (server passed

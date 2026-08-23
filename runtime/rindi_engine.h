@@ -134,6 +134,10 @@ private:
 
     // Greedy lm-head argmax over an already-normalized hidden vector.
     int argmax_token(const std::vector<uint16_t>& logits_input);
+    // Greedy argmax on the GPU BF16 head (falls back to CPU scan).
+    // Shared by base decode AND speculation so near-tie rounding
+    // decisions are identical on both paths.
+    int greedy_argmax(const std::vector<uint16_t>& norm_hidden);
     // Batched greedy predictions over channel-major hidden [C, lanes].
     bool argmax_over_hidden(const std::vector<uint16_t>& hidden,
                             size_t lanes, std::vector<int>& tokens);

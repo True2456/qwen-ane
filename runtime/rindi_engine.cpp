@@ -266,6 +266,16 @@ bool RindiEngine::init_mtp() {
     return true;
 }
 
+// Greedy next-token via the GPU BF16 LM head (identical rounding on every
+// caller). Falls back to the CPU mmap scan when the GPU head is unavailable.
+int RindiEngine::greedy_argmax(const std::vector<uint16_t>& norm_hidden) {
+    std::vector<int> toks;
+    if (lm_head_gpu_ready_ &&
+        argmax_over_hidden(norm_hidden, 1, toks) &&
+        !toks.empty() && toks[0] >= 0) return toks[0];
+    return argmax_token(norm_hidden);
+}
+
 int RindiEngine::argmax_token(const std::vector<uint16_t>& logits_input) {
     if (logits_input.size() != hidden_dim_) return -1;
     const size_t vocab = std::min(tokenizer_.vocab_size(), size_t(248320));
@@ -1112,7 +1122,7 @@ std::string RindiEngine::generate(
 
         auto sample_cur = [&]() -> bool {
             if (!apply_rms_norm(hidden_state, final_norm_, logits_input)) return false;
-            cur = argmax_token(logits_input);
+            cur = greedy_argmax(logits_input);
             return cur >= 0;
         };
         // Emit at most `allowed` tokens from a confirmed batch; returns the
@@ -1125,7 +1135,11 @@ std::string RindiEngine::generate(
 
         while (generated_tokens < max_tokens) {
             if (cur < 0) {
+                const auto ts_sample = std::chrono::high_resolution_clock::now();
                 if (!sample_cur()) break;
+                if (dbg_mtp) std::fprintf(stderr, "[MTPSAMPLE] ms=%.3f\n",
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::high_resolution_clock::now() - ts_sample).count());
                 if (cur == tokenizer_.eos_token_id()) break;
                 emit(cur);
                 if (got_first_token == false) { first_token_time = std::chrono::high_resolution_clock::now(); got_first_token = true; }
@@ -1162,8 +1176,12 @@ std::string RindiEngine::generate(
             std::vector<uint16_t> dh = hidden_state;
             std::vector<uint16_t> ho;
             for (int i = 0; speculate && i < depth; ++i) {
+                const auto ts_draft1 = std::chrono::high_resolution_clock::now();
                 int t = -1;
                 if (!mtp_.draft(dtok, dh, ho, t)) break;
+                if (dbg_mtp) std::fprintf(stderr, "[MTPDRAFT] i=%d ms=%.3f\n", i,
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::high_resolution_clock::now() - ts_draft1).count());
                 if (t == tokenizer_.eos_token_id()) break;
                 drafts.push_back(t);
                 draft_hs.push_back(ho);
@@ -1358,7 +1376,9 @@ std::string RindiEngine::generate(
             if (apply_rms_norm(metal_hidden_state, final_norm_, metal_logits_input))
                 debug_compare_logits(logits_input, metal_logits_input);
         }
-        int next_token_id = sample_next_token(logits_input, temperature, rng);
+        int next_token_id = (temperature <= 0.0f)
+            ? greedy_argmax(logits_input)
+            : sample_next_token(logits_input, temperature, rng);
         if (next_token_id == tokenizer_.eos_token_id()) break;
         if (std::getenv("RINDI_DEBUG_MTP"))
             std::fprintf(stderr, "[PLAINTRACE] emit %d\n", next_token_id);
