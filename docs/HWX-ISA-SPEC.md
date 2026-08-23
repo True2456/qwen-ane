@@ -309,3 +309,25 @@ Retry on future OS updates; until then sub-fp16 stays offline-route only.
 - Forward taps: concat extra outputs onto the main output surface to expose
   intermediates (MTP draft/verify states) without extra dispatches.
 - GQA per-head tiling/reduction pattern for attention with Q_DIM != KV_DIM.
+
+**On their "GPU prefill -> ANE decode" claim**: `gpu_prefill_ane_decode.m`
+and `gpu_ane_share.m` appear ONLY in README prose across all 42 commits -
+the files were never committed, and zero Metal/GPU code exists in the entire
+repository history (their opening line is literally "no Metal, no GPU").
+The quoted numbers (Stories110M 6.7ms prefill / 1.9ms decode) have no backing
+implementation. Treat as unverified aspiration.
+
+**However**, community M5 probes (PR #2, macOS 26.3, H16 family) establish
+the sync mechanism such a pipeline would need, corroborating our findings:
+- `_ANESharedEvents` require **IOSurfaceSharedEvent objects (Metal shared
+  events)**; `_ANESharedSignalEvent(signalEventWithValue:symbolIndex:eventType:
+  sharedEvent:)` + `_ANESharedWaitEvent(waitEventWithValue:...)` carry
+  `symbolIndex`/`agentMask` for GPU<->ANE handoff signaling.
+- Weight reload after compile FAILS on M5 (file overwrite + unload/load and
+  `weightsBuffer` IOSurface both ignored - weights baked at compile). This
+  makes our surface-packed dynamic kernels (test [10]) the correct
+  recompile-free architecture on M5, not an optimization nicety.
+- All QoS values 0-63 behave identically at eval (~0.07 ms small-kernel);
+  matches our real-time-path null result.
+- `_ANEModel.perfStatsMask` + `_ANEPerformanceStats.hwExecutionTime` (ns)
+  expose hardware execution timing for profiling.
