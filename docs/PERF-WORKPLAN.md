@@ -429,3 +429,29 @@ EXPECTED: partial rounds drop from ~468ms to ~270ms; with acc~1.7 (36%
    deeper depth and better draft quality (hot-streak), toward +50%.
 RISK: low-medium. Contained to engine.cpp generate() partial branch + one
    new forward_state_only; verified by MTP_EXACT.
+
+## P6 result (attempted, reverted - cost premise VALIDATED, correctness does not)
+- Implemented forward_prompt_batch capture + rebuild_gdn_state_only + partial
+  branch rewrite (RINDI_STATE_REBUILD=1). Result:
+  * rebuild ENGAGES and costs ~22ms restore vs ~230ms legacy replay - cost
+    premise is correct (the replay really is weight streaming).
+  * BUT MTP_EXACT=FAIL and acceptance DROPS (1.78 -> 1.07): the state-rebuild
+    does NOT reproduce the legacy replay's conv/recurrence state exactly. The
+    48 GDN layers' conv history + recurrence metal_state end up different
+    after my per-layer rebuild than after the single wide-batch verify that
+    the legacy replay was undoing. Next round's verifies reject => fewer
+    accepts => slower.
+  * Pre-existing note: depth-2 default MTP ALREADY FAILS exactness on partial
+    rounds (batch-vs-sequential drift) independent of P6.
+- WHY the rebuild diverges (hypothesis, untested): conv_.evaluate() threads
+  history_ left-to-right per LANE; calling it with keep=n_ok+1 lanes vs the
+  verify's k+1 lanes may advance history_ differently OR the causal conv
+  within-batch neighbor columns means a shorter batch sees different padding
+  than a longer batch at the same lane index. The test_tail_sync lane-count
+  invariance probe was written precisely for this and never concluded.
+- REVERTED. NEXT STEP (not a blind guess): before any P6 correctness work,
+  directly answer "is conv_.evaluate(lanes=k) state-identical to lanes=m for
+  the first k lanes?" via the standalone test_tail_sync.cpp route. Only if
+  yes is per-layer rebuild viable; if no, the O(1) rollback needs the
+  per-lane-conv-eval approach (call conv.evaluate K times, snapshot history_
+  after each) which is exact by construction at ~lanes cost.
