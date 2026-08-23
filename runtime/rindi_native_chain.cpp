@@ -83,6 +83,101 @@ std::string quant_decl(const char* name, size_t rows, size_t cols) {
     return s.str();
 }
 
+// P14: K-tiled conv for large-K projections. ANE efficiency collapses when
+// the reduction (input-channel) dimension exceeds ~2048 (~4.9 -> ~11.7
+// TFLOPS, measured in probes/test_ane_prefill_mm.cpp). ANECCompile rejects
+// slice_by_index over constexpr_blockwise_shift_scale outputs, so tiling is
+// BAKED: compile_layer deinterleaves each raw [rows, ic] nibble blob into
+// per-chunk [rows, kc] payloads registered as <base>_k{t}.bin, and the MIL
+// declares one int4 const + conv per chunk with partial-sum adds.
+struct KTilePlan {
+    bool tiled = false;
+    int T = 1;
+    std::vector<size_t> ks;
+};
+
+static KTilePlan ktile_plan(const char* env, size_t ic) {
+    KTilePlan p;
+    // OPT-IN: RINDI_KTILE_<CONV>=N tiles that projection's K into N chunks.
+    // Primitive-level win is proven (2.4x standalone), but multi-tile fused
+    // tail programs hit ANECCompile instability on macOS26.3/h17 (clean
+    // InvalidMILProgram rejections and intermittent SIGABRT during compile),
+    // so until that settles, tails stay monolithic unless explicitly enabled.
+    if (!std::getenv(env)) { p.T = 1; return p; }
+    p.T = std::atoi(std::getenv(env));
+    if (p.T <= 1 || ic <= 2048) { p.T = 1; return p; }
+    p.tiled = true;
+    p.ks.assign(p.T, (ic / p.T) & ~static_cast<size_t>(1));   // keep nibble-aligned
+    size_t rem = ic - p.ks[0] * p.T;
+    for (int t = 0; rem > 0; ++t %= p.T) {
+        const size_t add = std::min<size_t>(rem, 2);
+        p.ks[t] += add; rem -= add;
+    }
+    for (size_t k : p.ks)
+        if (k == 0 || (k & 1)) { p.tiled = false; p.T = 1; break; }  // safety
+    return p;
+}
+
+static std::string quant_decl_chunk(const char* base, size_t rows, size_t cols) {
+    std::ostringstream s;
+    s << "    tensor<int4, [" << rows << ", " << cols << ", 1, 1]> "
+      << base << "q = const()[name=string(\"" << base << "q\"), "
+      << "val=tensor<int4, [" << rows << ", " << cols << ", 1, 1]>"
+      << "(BLOBFILE(path=string(\"@model_path/weights/" << base
+      << ".bin\"), offset=uint64(64)))];\n"
+      << "    tensor<fp16, [" << rows << ", 1, 1, 1]> " << base
+      << "sc = const()[name=string(\"" << base << "sc\"), "
+      << "val=tensor<fp16, [" << rows << ", 1, 1, 1]>"
+      << "(BLOBFILE(path=string(\"@model_path/weights/" << base
+      << "s.bin\"), offset=uint64(64)))];\n"
+      << "    tensor<fp16, [" << rows << ", " << cols << ", 1, 1]> "
+      << base << "w = constexpr_blockwise_shift_scale(data=" << base
+      << "q, scale=" << base << "sc)[name=string(\"" << base << "dq\")];";
+    return s.str();
+}
+
+static std::string ksplit_conv_baked(const char* base, size_t rows, size_t ic,
+                                     const char* xexpr, size_t seq,
+                                     const char* out_name,
+                                     const KTilePlan& plan) {
+    std::ostringstream s;
+    (void)ic;
+    if (!plan.tiled) {
+        s << "    tensor<fp16, [1, " << rows << ", 1, " << seq << "]> " << out_name
+          << " = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight="
+          << base << "w, x=" << xexpr << ")[name=string(\"" << out_name << "\")];\n";
+        return s.str();
+    }
+    size_t off = 0;
+    for (int t = 0; t < plan.T; ++t) {
+        const size_t kc = plan.ks[t];
+        const std::string tag = std::string(base) + "_k" + std::to_string(t);
+        s << quant_decl_chunk(tag.c_str(), rows, kc) << "\n";
+        s << "    tensor<int32, [4]> " << tag << "_xb = const()[name=string(\"" << tag
+          << "_xb\"), val=tensor<int32, [4]>([0," << off << ",0,0])];\n"
+          << "    tensor<int32, [4]> " << tag << "_xe = const()[name=string(\"" << tag
+          << "_xe\"), val=tensor<int32, [4]>([1," << (off + kc) << ",1," << seq
+          << "])];\n"
+          << "    tensor<fp16, [1, " << kc << ", 1, " << seq << "]> " << tag
+          << "_x = slice_by_index(begin=" << tag << "_xb, end=" << tag << "_xe, x="
+          << xexpr << ")[name=string(\"" << tag << "_x\")];\n";
+        if (t == 0) {
+            s << "    tensor<fp16, [1, " << rows << ", 1, " << seq << "]> " << out_name
+              << " = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight="
+              << tag << "w, x=" << tag << "_x)[name=string(\"" << out_name << "\")];\n";
+        } else {
+            s << "    tensor<fp16, [1, " << rows << ", 1, " << seq << "]> " << tag
+              << "_p = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight="
+              << tag << "w, x=" << tag << "_x)[name=string(\"" << tag << "_p\")];\n"
+              << "    tensor<fp16, [1, " << rows << ", 1, " << seq << "]> " << out_name
+              << " = add(x=" << out_name << ", y=" << tag << "_p)[name=string(\""
+              << out_name << "_a" << t << "\")];\n";
+        }
+        off += kc;
+    }
+    return s.str();
+}
+
 std::string build_tail_mil(size_t hidden, size_t core, size_t intermediate,
                            size_t seq, size_t next_projection,
                            bool attention_tail) {
@@ -118,7 +213,11 @@ std::string build_tail_mil(size_t hidden, size_t core, size_t intermediate,
     s << "    tensor<fp16, [1, " << core << ", 1, " << seq << "]> core = slice_by_index(begin=tensor<int32, [4]>([0,0,0,0]), end=tensor<int32, [4]>([1," << core << ",1," << seq << "]), x=xin)[name=string(\"core\")];\n";
     s << "    tensor<fp16, [1, " << hidden << ", 1, " << seq << "]> res = slice_by_index(begin=tensor<int32, [4]>([0," << core << ",0,0]), end=tensor<int32, [4]>([1," << (input_core + hidden) << ",1," << seq << "]), x=xin)[name=string(\"res\")];\n"
       << "    tensor<fp16, [1, " << core << ", 1, " << seq << "]> gated = identity(x=core)[name=string(\"gated\")];\n";
-    s << "    tensor<fp16, [1, " << hidden << ", 1, " << seq << "]> r = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=ow, x=gated)[name=string(\"outp\")];\n"
+    const KTilePlan po = ktile_plan("RINDI_KTILE_O", core);
+    const KTilePlan pg = ktile_plan("RINDI_KTILE_GU", hidden);
+    const KTilePlan pdn = ktile_plan("RINDI_KTILE_DN", intermediate);
+    const KTilePlan pip = ktile_plan("RINDI_KTILE_IP", hidden);
+    s << ksplit_conv_baked("o", hidden, core, "gated", seq, "r", po)
       << "    tensor<fp16, [1, " << hidden << ", 1, " << seq << "]> h = add(x=res, y=r)[name=string(\"h\")];\n"
       << "    tensor<fp16, [1, " << hidden << ", 1, " << seq << "]> sq = mul(x=h, y=h)[name=string(\"sq\")];\n"
       << "    tensor<fp16, [1, 1, 1, " << seq << "]> ms = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=onw, x=sq)[name=string(\"ms\")];\n"
@@ -127,13 +226,13 @@ std::string build_tail_mil(size_t hidden, size_t core, size_t intermediate,
       << "    tensor<fp16, [1, 1, 1, " << seq << "]> sd = sqrt(x=msa)[name=string(\"sd\")];\n"
       << "    tensor<fp16, [1, " << hidden << ", 1, " << seq << "]> nx = real_div(x=h, y=sd)[name=string(\"nx\")];\n"
       << "    tensor<fp16, [1, " << hidden << ", 1, " << seq << "]> n = mul(x=nx, y=pnw)[name=string(\"n\")];\n"
-      << "    tensor<fp16, [1, " << (2 * intermediate) << ", 1, " << seq << "]> c = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=guw, x=n)[name=string(\"gu\")];\n"
+      << ksplit_conv_baked("gu", 2 * intermediate, hidden, "n", seq, "c", pg)
       << "    tensor<fp16, [1, " << intermediate << ", 1, " << seq << "]> g0 = slice_by_index(begin=tensor<int32, [4]>([0,0,0,0]), end=tensor<int32, [4]>([1," << intermediate << ",1," << seq << "]), x=c)[name=string(\"g0\")];\n"
       << "    tensor<fp16, [1, " << intermediate << ", 1, " << seq << "]> u0 = slice_by_index(begin=tensor<int32, [4]>([0," << intermediate << ",0,0]), end=tensor<int32, [4]>([1," << (2 * intermediate) << ",1," << seq << "]), x=c)[name=string(\"u0\")];\n"
       << "    tensor<fp16, [1, " << intermediate << ", 1, " << seq << "]> sg = sigmoid(x=g0)[name=string(\"sg\")];\n"
       << "    tensor<fp16, [1, " << intermediate << ", 1, " << seq << "]> si = mul(x=g0, y=sg)[name=string(\"si\")];\n"
       << "    tensor<fp16, [1, " << intermediate << ", 1, " << seq << "]> ac = mul(x=si, y=u0)[name=string(\"ac\")];\n"
-      << "    tensor<fp16, [1, " << hidden << ", 1, " << seq << "]> m = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=dnw, x=ac)[name=string(\"dn\")];\n";
+      << ksplit_conv_baked("dn", hidden, intermediate, "ac", seq, "m", pdn);
     if (has_next) {
         s << "    tensor<fp16, [1, " << hidden << ", 1, " << seq << "]> o0 = add(x=h, y=m)[name=string(\"o0\")];\n"
           << "    tensor<fp16, [1, " << hidden << ", 1, " << seq << "]> y = identity(x=o0)[name=string(\"y\")];\n"
@@ -143,7 +242,7 @@ std::string build_tail_mil(size_t hidden, size_t core, size_t intermediate,
           << "    tensor<fp16, [1, 1, 1, " << seq << "]> nsd = sqrt(x=nmsa)[name=string(\"nsd\")];\n"
           << "    tensor<fp16, [1, " << hidden << ", 1, " << seq << "]> nnx = real_div(x=o0, y=nsd)[name=string(\"nnx\")];\n"
           << "    tensor<fp16, [1, " << hidden << ", 1, " << seq << "]> nn = mul(x=nnx, y=ilw)[name=string(\"nn\")];\n"
-          << "    tensor<fp16, [1, " << next_projection << ", 1, " << seq << "]> y2 = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=ipw, x=nn)[name=string(\"y2\")];\n"
+          << ksplit_conv_baked("ip", next_projection, hidden, "nn", seq, "y2", pip)
           << "  } -> (y, y2);\n";
     } else {
         s << "    tensor<fp16, [1, " << hidden << ", 1, " << seq << "]> y = add(x=h, y=m)[name=string(\"y\")];\n"
@@ -237,6 +336,29 @@ bool RindiNativeChain::load_layer(int layer_idx, const std::string& package_path
     return true;
 }
 
+// Deinterleave a raw row-major nibble blob [rows, ic] into per-K-chunk
+// payloads [rows, kc_t] (byte segments are contiguous within each row).
+static bool split_nibbles(const std::vector<uint8_t>& raw, size_t rows,
+                          size_t ic, const KTilePlan& plan,
+                          std::vector<std::vector<uint8_t>>& data_out,
+                          std::vector<std::vector<uint8_t>>& scale_out,
+                          const std::vector<uint8_t>& scales) {
+    data_out.assign(plan.T, {});
+    scale_out.assign(plan.T, scales);
+    for (int t = 0; t < plan.T; ++t)
+        data_out[t].resize((rows * plan.ks[t] + 1) / 2);
+    size_t col = 0;
+    for (int t = 0; t < plan.T; ++t) {
+        const size_t kc = plan.ks[t], seg = kc / 2;
+        for (size_t r = 0; r < rows; ++r) {
+            const uint8_t* src = raw.data() + r * (ic / 2) + col / 2;
+            std::memcpy(data_out[t].data() + r * seg, src, seg);
+        }
+        col += kc;
+    }
+    return true;
+}
+
 bool RindiNativeChain::compile_layer(int layer_idx, const std::string& package_path,
                                      const SafeTensorsLoader& loader) {
     if (!ane_ctx_ || layer_idx < 0) return false;
@@ -275,12 +397,30 @@ bool RindiNativeChain::compile_layer(int layer_idx, const std::string& package_p
                                       "dn.bin", "dns.bin", "pn.bin", "on.bin"};
     std::vector<std::vector<uint8_t>> payloads;
     payloads.reserve(12);
+    const KTilePlan po_l = ktile_plan("RINDI_KTILE_O", core_dim);
+    const KTilePlan pg_l = ktile_plan("RINDI_KTILE_GU", H);
+    const KTilePlan pdn_l = ktile_plan("RINDI_KTILE_DN", intermediate);
+    const KTilePlan pip_l = ktile_plan("RINDI_KTILE_IP", H);
     for (const char* kind : {"o", "gu", "dn"}) {
         auto data = read_file(package_path + "/chain" + std::to_string(layer_idx) + "." + kind + "/__.bin");
         auto scale = read_file(package_path + "/chain" + std::to_string(layer_idx) + "." + kind + "/__s.bin");
         if (data.empty() || scale.empty()) return false;
-        payloads.push_back(std::move(data));
-        payloads.push_back(std::move(scale));
+        const KTilePlan& pl = (kind[0]=='o') ? po_l : (kind[0]=='g' ? pg_l : pdn_l);
+        if (!pl.tiled) {
+            payloads.push_back(std::move(data));
+            payloads.push_back(std::move(scale));
+            continue;
+        }
+        const size_t ric = (kind[0]=='o') ? core_dim : (kind[0]=='g' ? H : intermediate);
+        const size_t roc = (kind[0]=='g') ? 2 * intermediate : hidden_dim_;
+        std::vector<std::vector<uint8_t>> dchunks, schunks;
+        split_nibbles(data, roc, ric, pl, dchunks, schunks, scale);
+        for (int t = 0; t < pl.T; ++t) {
+            names.push_back(std::string(kind) + "_k" + std::to_string(t) + ".bin");
+            payloads.push_back(std::move(dchunks[t]));
+            names.push_back(std::string(kind) + "_k" + std::to_string(t) + "s.bin");
+            payloads.push_back(schunks[t]);
+        }
     }
     std::vector<uint16_t> norm;
     if (!loader.get_tensor_fp16(layer + "post_attention_layernorm.weight", norm)) return false;
@@ -297,8 +437,19 @@ bool RindiNativeChain::compile_layer(int layer_idx, const std::string& package_p
         auto data = read_file(package_path + "/chain" + std::to_string(layer_idx) + ".ip/__.bin");
         auto scale = read_file(package_path + "/chain" + std::to_string(layer_idx) + ".ip/__s.bin");
         if (data.empty() || scale.empty()) return false;
-        names.push_back("ip.bin"); names.push_back("ips.bin");
-        payloads.push_back(std::move(data)); payloads.push_back(std::move(scale));
+        if (!pip_l.tiled) {
+            names.push_back("ip.bin"); names.push_back("ips.bin");
+            payloads.push_back(std::move(data)); payloads.push_back(std::move(scale));
+        } else {
+            std::vector<std::vector<uint8_t>> dchunks, schunks;
+            split_nibbles(data, next_projection, H, pip_l, dchunks, schunks, scale);
+            for (int t = 0; t < pip_l.T; ++t) {
+                names.push_back("ip_k" + std::to_string(t) + ".bin");
+                payloads.push_back(std::move(dchunks[t]));
+                names.push_back("ip_k" + std::to_string(t) + "s.bin");
+                payloads.push_back(schunks[t]);
+            }
+        }
         std::vector<uint16_t> next_norm;
         if (!loader.get_tensor_fp16("layers." + std::to_string(layer_idx + 1) + ".input_layernorm.weight", next_norm)) return false;
         names.push_back("il.bin");
@@ -307,6 +458,12 @@ bool RindiNativeChain::compile_layer(int layer_idx, const std::string& package_p
     }
     const std::string mil = build_tail_mil(H, core_dim, intermediate, seq_len_,
                                             next_projection, is_attention);
+    if (std::getenv("RINDI_DUMP_TAIL")) {
+        char pf[96];
+        std::snprintf(pf, sizeof(pf), "/tmp/tail_L%zu_s%zu.mil", (size_t)layer_idx, seq_len_);
+        FILE* f = fopen(pf, "w");
+        if (f) { fwrite(mil.data(), 1, mil.size(), f); fclose(f); }
+    }
     std::vector<const char*> name_ptrs;
     std::vector<const void*> data_ptrs;
     std::vector<size_t> sizes;

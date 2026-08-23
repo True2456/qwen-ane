@@ -186,8 +186,10 @@ static std::vector<uint16_t> readv(IOSurfaceRef s, size_t n) {
 int main(int argc, char** argv) {
     const int ic = getenv("IC") ? std::atoi(getenv("IC")) : 5120;
     const int oc = getenv("OC") ? std::atoi(getenv("OC")) : ic;
-    int Ss[] = {32, 128, 512, 1024, 2048};
-    if (getenv("S0")) Ss[0] = std::atoi(getenv("S0"));
+    int Ss[] = {getenv("S0") ? std::atoi(getenv("S0")) : 32,
+                getenv("S0") ? std::atoi(getenv("S0")) : 128,
+                getenv("S0") ? std::atoi(getenv("S0")) : 512};
+    if (!getenv("S0")) { Ss[1] = 128; Ss[2] = 512; }
     if (argc > 1) Ss[0] = std::atoi(argv[1]); // allow single-shape runs
 
     ANEContext* ane = ane_context_create();
