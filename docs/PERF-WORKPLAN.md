@@ -152,6 +152,33 @@ MLX's real int4 GEMM lives locally at
   register-blocked accumulation). It is a large careful port, NOT a oneshot
   glyph dump - the failed drafts underscore this.
 
+## P4d - hardware ceilings measured + ROWWISE simd kernel wired
+- MMA rate probes (this machine, Apple M5 Max): simdgroup_multiply_accumulate
+  saturates at ~15.4 TFLOPS (8 independent fragment chains/simdgroup;
+  16 chains regresses to 14.1; 2 chains 7.6). bf16 == fp16 exactly (15.4 vs
+  15.4) - there is NO bf16 advantage on this documented MSL path. Scalar fp32
+  FMA peak ~11.5 TFLOPS. The rumored 70 TFLOPS is NOT reachable through
+  simdgroup_matrix; it would require the neural-accelerator tensor path,
+  which this SDK's metal_tensor/metal_cooperative_tensor headers do not yet
+  expose as an MMA op. Practical planning ceiling: ~15 TFLOPS.
+- ROOT CAUSE of "prefill lower than ANE": ALL transformer-tail projections
+  are compile_chain_int4 => ROWWISE layout, so P4c's groupwise kernel never
+  ran in-server. Built gemm_int4_rw_simd (rowwise: signed int4 nibbles,
+  2/byte, per-row fp16 scale; same validated tile structure).
+  GOTCHA: scale_sh[] preload needs its own barrier before cross-simdgroup
+  readers; rowwise nibbles are SIGNED (q>=8 -> -=16), unlike groupwise.
+- GATE (probes/test_metal_rw_simd.mm): bad=0 vs scalar ref on 5 shapes incl
+  lanes=7; production shapes 1.7-3.3x faster than gemm_int4_rowwise_batched
+  (gate/up 9.15->2.75 ms, down 4.73->1.59 ms @ lanes=32).
+- IN-SERVER A/B pp1024/tg128 with RINDI_ENABLE_METAL_TAIL=1:
+  batched 84.3s vs rw_simd 54.2s TTFT = 1.55x. MTP_EXACT=PASS; output sane.
+- HONEST STATUS: even with fast kernels, Metal tails (19.8 tok/s) still lose
+  to the pure-ANE fallback (71.5 tok/s) because each layer serializes ANE
+  attention core eval then one Metal MLP submit+wait with zero overlap.
+  RECOMMENDATION: run WITHOUT RINDI_ENABLE_METAL_TAIL until the tail path is
+  restructured (overlap ANE/Metal via double-buffered passes, or move MLP to
+  ANE too). The simd kernels are the necessary fast primitive for either.
+
 ## P4c - simdgroup MMA port: WIRED (validated, 2.5x over batch)
 - gemm_int4_simd (runtime/metal_engine.m): MLX steel-gemm structure adapted to
   int4-groupwise. BM=32 x BN=32 x BK=64 tiles (BK == quant group width);

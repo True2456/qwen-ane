@@ -354,6 +354,22 @@ void metal_dispatch_gemm_int4_rowwise_batched(
     int lanes
 );
 
+/* Register-blocked simdgroup-MMA ROWWISE int4 GEMM (signed nibbles, per-row
+ * fp16 scales). Validated in probes/test_metal_rw_simd.mm: 1.7-3.3x faster
+ * than gemm_int4_rowwise_batched. fp16-dequant rounding (~1e-3 rel). */
+void metal_dispatch_gemm_int4_rw_simd(
+    MetalContext* ctx,
+    MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle input_buf,
+    MetalBufferHandle weight_buf,
+    MetalBufferHandle scale_buf,
+    MetalBufferHandle output_buf,
+    int rows,
+    int logical_cols,
+    int packed_cols,
+    int lanes
+);
+
 void metal_dispatch_add_channel_fp16(
     MetalContext* ctx,
     MetalCommandBufferHandle cmd_buf,

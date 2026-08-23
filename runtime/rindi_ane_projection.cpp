@@ -529,7 +529,14 @@ bool RindiAneProjection::metal_dispatch(
     if (!metal_ready_ || !ctx || !cmd || !input || !output || lanes == 0 || lanes > 32)
         return false;
     if (metal_rowwise_) {
-        if (std::getenv("RINDI_METAL_TAIL_TILED")) {
+        if (lanes > 1 && input_offset == 0 && output_offset == 0 &&
+                   !std::getenv("RINDI_METAL_GEMM_BATCH") &&
+                   !std::getenv("RINDI_DISABLE_BATCH_GEMM")) {
+            metal_dispatch_gemm_int4_rw_simd(
+                ctx, cmd, input, metal_weights_, metal_scales_,
+                output, static_cast<int>(output_dim_), static_cast<int>(input_dim_),
+                static_cast<int>(metal_packed_cols_), static_cast<int>(lanes));
+        } else if (std::getenv("RINDI_METAL_TAIL_TILED")) {
             metal_dispatch_gemm_int4_rowwise_tiled_offset(
                 ctx, cmd, input, input_offset, metal_weights_, metal_scales_,
                 output, output_offset, static_cast<int>(output_dim_),
