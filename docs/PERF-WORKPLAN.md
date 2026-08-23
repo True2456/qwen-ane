@@ -670,3 +670,49 @@ route (P14) is the cheaper path to that end - proceed there first.
 its realistic ceiling (~12 TF, MLX parity) equals what ANE now delivers, at
 far higher implementation cost. Metal kernel port retains value only for
 decode-shaped M=1 GEMV (bandwidth-bound, where ANE offers nothing).
+
+## P15 - STRATEGIC PIVOT: Apple Core AI / coreai-opt (macOS 27 era)
+Apple shipped an OFFICIAL on-device inference stack that supersedes much of
+what we reverse-engineered:
+
+- **CoreAI.framework** (macOS 27 SDK): Swift runtime, low-level API
+  (PreparedModel.prepare / loadFunction / NDArray / InferenceFunction.run)
+  with IN-PLACE MUTABLE STATES across calls - natively expresses hybrid SSM
+  architectures (Qwen3.5 ships 4 states: keyCache/valueCache/convState/
+  recState - same shape family as our Qwen3.8 GDN conv+recurrence!).
+- **coreai-build compile** (Xcode 27 beta CLI, RUNS ON macOS 26.4): AOT
+  compile `.aimodel -> .aimodelc` with `--preferred-compute neural-engine`
+  and `--architecture h17` (M5). AOT output mmaps precompiled packages -
+  no on-device JIT, no ANECCompile-at-load instability.
+- **coreai-opt**: PyTorch-native INT2/4/8 + FP4/8 quantization, 1-8 bit
+  palettization, pruning -> the OFFICIAL path to sub-fp16 ANE weights we
+  could never get through text-MIL (P14 blocker irrelevant here: Apple's
+  own compiler does the K-splitting/fusion internally).
+- Installs fine on 26.4 (verified: pip coreai-opt import OK, python3.12).
+
+WHAT THIS REPLACES: the private _ANEClient/text-MIL pipeline AND its
+blockers (ANECCompile InvalidMILProgram/SIGABRT on multi-tile programs,
+int8/int2 rejections). Whole-layer fusion stops being hand-built MIL.
+WHAT IT DOES NOT REPLACE (yet): rindi's MTP scheduler, APC prefix cache,
+Metal decode path, tokenizer/safetensors loading. Integration shape: thin
+custom runner (low-level API, N-state generalization of Apple's
+CoreAISequentialEngine.swift) driven by rindi, or rindi calling a Swift shim.
+
+REQUIREMENTS/GOTCHAS (from community verification):
+- Runtime needs macOS 27 (.macOS("27.0") package floor); export/AOT OK on
+  26.4 with Xcode 27 beta via DEVELOPER_DIR (no sudo move needed).
+- High-level CoreAILM assumes standard archs (single KV) - custom runner
+  required for hybrid states.
+- Raw AIModel() defaults to ANE and crashes some graphs; use
+  PreparedModel.prepare + SpecializationOptions(preferredComputeUnitKind).
+- AOT arch naming is chip-ID style (h18p etc.) - ours would be h17 (M5).
+
+NEXT STEPS:
+1. [26.4] Prototype export: coreai-torch convert of a small GDN-layer graph;
+   apply coreai-opt int4 palettization; produce .aimodel artifact.
+2. [macOS 27 beta] xcrun coreai-build compile --preferred-compute
+   neural-engine --architecture h17; run via low-level API; benchmark one
+   fused layer vs our private pipeline (~6.9 ms/layer/chunk baseline).
+3. Decision gate: if CoreAI ANE throughput >= our numbers with int4 weights,
+   migrate prefill (then eval full-inference) onto CoreAI; keep rindi
+   scheduler/MTP/APC on top.
