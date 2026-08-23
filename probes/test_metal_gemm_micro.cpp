@@ -123,6 +123,49 @@ int main() {
     std::fprintf(stderr, "BATCH %d kernels in ONE buffer: %.3f ms total, %.3f ms/kernel (no per-call submit)\n",
                 M, one, one / M);
     std::fflush(stderr);
+    // P14: wake up the DEAD-CODE register-blocked MMA kernel (BM32/BN32/BK64,
+    // simdgroup fragments + staged w/a tiles) and race it against the shipped
+    // groupwise_batch at the same shape. Correctness = bitwise vs BATCH.
+    {
+        const int N2 = 10;
+        auto b3 = metal_buffer_create(ctx, rows * lanes * 2);
+        auto bb = metal_buffer_create(ctx, rows * lanes * 2);
+        {
+            auto ch = metal_command_buffer_create(ctx);
+            metal_dispatch_gemm_int4_groupwise_batch(ctx, ch, A, W, S, Bm, bb,
+                                                     rows, cols, cols/8, groups, lanes);
+            metal_command_buffer_commit(ch); metal_command_buffer_wait(ch);
+        }
+        for (int it = 0; it < 3; ++it) {
+            auto c = metal_command_buffer_create(ctx);
+            metal_dispatch_gemm_int4_simd(ctx, c, A, W, S, Bm, b3,
+                                          rows, cols, cols/8, groups, lanes);
+            metal_command_buffer_commit(c); metal_command_buffer_wait(c);
+        }
+        auto t2 = std::chrono::high_resolution_clock::now();
+        for (int it = 0; it < N2; ++it) {
+            auto c = metal_command_buffer_create(ctx);
+            metal_dispatch_gemm_int4_simd(ctx, c, A, W, S, Bm, b3,
+                                          rows, cols, cols/8, groups, lanes);
+            metal_command_buffer_commit(c); metal_command_buffer_wait(c);
+        }
+        double dt3 = ms_since(t2);
+        auto v3 = metal_buffer_get_contents(b3);
+        size_t mism3 = 0; double maxd3 = 0.0;
+        for (size_t i = 0; i < rows * lanes; ++i) {
+            uint16_t va = reinterpret_cast<uint16_t*>(bb)[i];
+            uint16_t vb = reinterpret_cast<uint16_t*>(v3)[i];
+            if (va != vb) { ++mism3;
+                double da = (va >> 15) ? -1.0 * double(va & 0x7fffu) / 1024.0 : double(va) / 1024.0;
+                double db = (vb >> 15) ? -1.0 * double(vb & 0x7fffu) / 1024.0 : double(vb) / 1024.0;
+                maxd3 = std::max(maxd3, std::fabs(da - db)); }
+        }
+        std::fprintf(stderr, "SIMD-MMA gemm 34816x5120 lanes=%d: %d calls %.3f ms = %.3f ms/call | vs BATCH: mism=%zu/%zu maxdiff=%.6g\n",
+                     lanes, N2, dt3, dt3 / N2, mism3, rows * lanes, maxd3);
+        std::fflush(stderr);
+        metal_buffer_release(b3); metal_buffer_release(bb);
+    }
+
     // RowWise correctness + speed: per-row scale, u8 packed nibbles
     {
         const size_t r2 = 17408, c2 = 5120, l2 = 32;

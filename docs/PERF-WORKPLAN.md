@@ -649,7 +649,24 @@ STATUS: primitive validated exact (probes/test_ane_prefill_mm.cpp,
 `make test-prefill-mm`, env IC/OC/S0/MM_CONV/K_TILES). Engine integration =
 P14: build qkv/gate/up/down fused prefill program (one dispatch per layer per
 chunk), wire into forward_prompt_batch behind RINDI_PREFILL_FUSED.
-NOTE: this also DEPRIORITIZES the Steel-style Metal GEMM port for prefill:
+### P13b - #1 attempted (Steel-style Metal kernel): surprise - it already ships
+Investigated the "port MLX structure" lever and discovered a
+register-blocked MMA kernel (`gemm_int4_simd`, BM32xBN32xBK64, simdgroup
+fragments, staged w/a tiles) ALREADY EXISTS in metal_engine.m AND is the
+primary lanes>1 dispatch in rindi_ane_projection (groupwise_batch is only
+the fallback). New exactness harness (probes/test_gemm_simd_exact.cpp,
+`make test-gemm-simd-exact`) proves it BIT-EXACT vs groupwise_batch at the
+real gate shape (0/1114112 mismatches) - an earlier micro-probe report of
+100%% mismatch was a buffer-reuse artifact in that probe.
+Standalone speed: 2.56 ms/call vs 5.43 ms/call batch (2.1x).
+
+CONSEQUENCE: the remaining Metal-prefill deficit vs ANE (~37 vs ~71 tok/s)
+is NOT the GEMM math anymore - it is everything around it: linear<->ANE
+channel-major layout conversions per projection, unfused elementwise ops,
+and per-kernel dispatch overhead across the tail's many small kernels.
+Both roads (#1 and #2) therefore converge on the same requirement: fuse
+whole-layer programs and eliminate intermediate materialization. The ANE
+route (P14) is the cheaper path to that end - proceed there first.
 its realistic ceiling (~12 TF, MLX parity) equals what ANE now delivers, at
 far higher implementation cost. Metal kernel port retains value only for
 decode-shaped M=1 GEMV (bandwidth-bound, where ANE offers nothing).

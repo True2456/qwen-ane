@@ -50,6 +50,10 @@ test-ane-as: bin/ane-as
 test-prefill-mm: /tmp/rindi-test-prefill-mm
 	/tmp/rindi-test-prefill-mm
 
+test-gemm-simd-exact: probes/test_gemm_simd_exact.cpp $(RUNTIME_DIR)/metal_engine.o
+	$(CXX) $(CXXFLAGS) -I. $< $(RUNTIME_DIR)/metal_engine.o -framework Metal -framework Foundation -framework IOSurface -o /tmp/rindi-gemm-simd-exact
+	/tmp/rindi-gemm-simd-exact
+
 test-cpp-safetensors: probes/test_cpp_safetensors.cpp runtime/safetensors_loader.h
 	$(CXX) $(CXXFLAGS) -I. $< -o /tmp/rindi-test-cpp-safetensors
 	/tmp/rindi-test-cpp-safetensors
