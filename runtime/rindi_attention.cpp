@@ -123,7 +123,7 @@ bool RindiAttention::project(const uint16_t* hidden, size_t lanes,
                              std::vector<uint16_t>& k,
                              std::vector<uint16_t>& v) {
     if (!ready_ || !hidden || lanes == 0 || lanes > width_) return false;
-    if (qkv_fused_ready_ && lanes <= 32) {
+    if (qkv_fused_ready_ && lanes <= width_) {
         std::vector<uint16_t> fused;
         if (!qkv_fused_.evaluate(hidden, lanes, fused)) return false;
         const size_t QG = 24 * 512, K = 4 * 256;
@@ -180,10 +180,13 @@ bool RindiAttention::ensure_metal_resources() {
             buf = metal_buffer_create(metal_ctx_, bytes);
             return buf != nullptr;
         };
-        if (!grow(ws.q, 32 * kQ * sizeof(uint16_t))) return false;
-        if (!grow(ws.scores, 32 * kHQ * context_ * sizeof(float))) return false;
-        if (!grow(ws.probs, 32 * kHQ * context_ * sizeof(float))) return false;
-        if (!grow(ws.out, 32 * kQ * sizeof(uint16_t))) return false;
+        // Workspace columns follow the compiled program width (32 shipped,
+        // wider under RINDI_ANE_WIDTH), not a literal.
+        const size_t ws_lanes = width_;
+        if (!grow(ws.q, ws_lanes * kQ * sizeof(uint16_t))) return false;
+        if (!grow(ws.scores, ws_lanes * kHQ * context_ * sizeof(float))) return false;
+        if (!grow(ws.probs, ws_lanes * kHQ * context_ * sizeof(float))) return false;
+        if (!grow(ws.out, ws_lanes * kQ * sizeof(uint16_t))) return false;
         ws.cap = context_;
     }
     return true;

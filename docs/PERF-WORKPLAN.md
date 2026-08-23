@@ -152,6 +152,30 @@ MLX's real int4 GEMM lives locally at
   register-blocked accumulation). It is a large careful port, NOT a oneshot
   glyph dump - the failed drafts underscore this.
 
+## P5a - Lever 1 (wide-width tails): compile OK, EVAL blocked - groundwork landed
+- CONFIRMED: the ANE fused tails are runtime-compiled from build_tail_mil()
+  (NOT frozen package blobs - earlier conclusion was wrong). At
+  RINDI_ANE_WIDTH=64 the engine compiles all 64 tails + cores at seq=64
+  ("Compiled 64 fused transformer tails").
+- Parametric fixes landed (all width-32-preserving, verified 69.9 tok/s
+  prefill / 4.0 tok/s decode unchanged):
+  * forward_prompt_batch guard: hardcoded 29 -> chain seq_len-3
+  * attention: fused-QKV gate + Metal workspaces sized by width_ not 32
+  * GDN recurrence: buffers + step_batch guard sized by width_ (160)
+  * GDN layer: recurrence kept at proven 160 (64 rejected by Espresso)
+  * ane_c_bridge: in-memory eval now falls through to direct-client
+    failover on failure (was hard-return false)
+- BLOCKER: seq>32 programs COMPILE but do NOT EVALUATE through the in-memory
+  request path (even 2 lanes fails at width 64). Direct-client failover added
+  but ctx->aneClient is unset for runtime-compiled models, so it never runs.
+  This matches the shipped package being 32-wide by design.
+- NEXT for Lever 1: populate ctx->aneClient for runtime models and test
+  doEvaluateDirectWithModel on a seq-64 tail; if that also fails, the
+  in-memory API caps spatial width at 32 and the raw-.hwx assembler route
+  (ANE-CUSTOM-COMPILER-RESEARCH.md) is the only path to wider prefill.
+- Lever 2 (per-lane state checkpoints) does NOT need width>32 and remains
+  the higher-confidence next step.
+
 ## P5 - Custom ANE compiler access: the two hardware-unlocked levers
 Context: reverse-engineered private-framework access exists (docs/
 ANE-CUSTOM-COMPILER-RESEARCH.md): direct _ANEModel/_ANEClient loading,

@@ -92,12 +92,12 @@ bool RindiGdnRecurrence::compile_prepared(ANEContext* ctx, size_t heads,
         // here silently forked state: prefill advanced the Metal copy while
         // decode started every token from the untouched ANE surface.
         metal_state_ = metal_buffer_from_iosurface(metal_ctx_, state_surface_);
-        metal_decay_ = metal_buffer_create(metal_ctx_, heads_ * 32 * sizeof(uint16_t));
-        metal_key_ = metal_buffer_create(metal_ctx_, hidden_keys_ * 32 * sizeof(uint16_t));
-        metal_query_ = metal_buffer_create(metal_ctx_, hidden_keys_ * 32 * sizeof(uint16_t));
-        metal_value_ = metal_buffer_create(metal_ctx_, heads_ * value_dim_ * 32 * sizeof(uint16_t));
-        metal_beta_ = metal_buffer_create(metal_ctx_, heads_ * 32 * sizeof(uint16_t));
-        metal_output_ = metal_buffer_create(metal_ctx_, heads_ * value_dim_ * 32 * sizeof(uint16_t));
+        metal_decay_ = metal_buffer_create(metal_ctx_, heads_ * width_ * sizeof(uint16_t));
+        metal_key_ = metal_buffer_create(metal_ctx_, hidden_keys_ * width_ * sizeof(uint16_t));
+        metal_query_ = metal_buffer_create(metal_ctx_, hidden_keys_ * width_ * sizeof(uint16_t));
+        metal_value_ = metal_buffer_create(metal_ctx_, heads_ * value_dim_ * width_ * sizeof(uint16_t));
+        metal_beta_ = metal_buffer_create(metal_ctx_, heads_ * width_ * sizeof(uint16_t));
+        metal_output_ = metal_buffer_create(metal_ctx_, heads_ * value_dim_ * width_ * sizeof(uint16_t));
     }
     reset();
     size_t channels[2] = {0, 0};
@@ -249,7 +249,7 @@ bool RindiGdnRecurrence::step_batch(const uint16_t* decay, const uint16_t* key,
                                     const uint16_t* query, const uint16_t* value,
                                     const uint16_t* beta, size_t lanes,
                                     std::vector<uint16_t>& output) {
-    if (!decay || !key || !query || !value || !beta || lanes == 0 || lanes > 32 ||
+    if (!decay || !key || !query || !value || !beta || lanes == 0 || lanes > width_ ||
         !metal_ctx_ || !metal_state_ || !metal_decay_ || !metal_key_ ||
         !metal_query_ || !metal_value_ || !metal_beta_ || !metal_output_) return false;
     std::memcpy(metal_buffer_get_contents(metal_decay_), decay,

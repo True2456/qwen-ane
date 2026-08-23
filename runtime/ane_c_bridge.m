@@ -471,7 +471,9 @@ bool ane_request_evaluate(
             NSError* err = nil;
             BOOL ok = evalMethod(target, modelEvalSel, 21, @{}, req->rawRequest, &err);
             if (!ok) NSLog(@"[ANE Bridge] In-memory evaluate returned false: %@", err ? [err description] : @"no error");
-            return ok && (err == nil);
+            if (ok && !err) return YES;   // success uses in-memory path
+            // else fall through to direct-client failover below (needed for
+            // width>32 programs that compile but don't evaluate in-memory).
         }
 
         // Directly loaded cache packages are owned by _ANEClient rather than

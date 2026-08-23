@@ -83,9 +83,18 @@ bool RindiGdnLayer::compile_core(ANEContext* ctx, const SafeTensorsLoader& loade
     const std::string alog_name = prefix + "A_log";
     const std::string dt_name = prefix + "dt_bias";
     const std::string gdn_norm_name = prefix + "norm.weight";
-    if (!conv_.compile(ctx, loader, conv_name, width_) ||
-        !recurrence_.compile(ctx, 48, 128, 128, 160) ||
-        !loader.get_tensor_fp16(alog_name, a_log_) ||
+    if (!conv_.compile(ctx, loader, conv_name, width_)) {
+        std::cerr << "[RindiGDN] conv compile failed layer=" << layer
+                  << " width=" << width_ << std::endl;
+        return false;
+    }
+    // Recurrence graph only compiles at its proven 160-column width; that
+    // covers every prefill chunk width we use (<= 157 live lanes).
+    if (!recurrence_.compile(ctx, 48, 128, 128, 160)) {
+        std::cerr << "[RindiGDN] recurrence compile failed layer=" << layer << std::endl;
+        return false;
+    }
+    if (!loader.get_tensor_fp16(alog_name, a_log_) ||
         !loader.get_tensor_fp16(dt_name, dt_bias_) ||
         !loader.get_tensor_fp16(gdn_norm_name, gdn_norm_) ||
         a_log_.size() != 48 || dt_bias_.size() != 48 ||

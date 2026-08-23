@@ -629,7 +629,8 @@ bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
                                        std::vector<uint16_t>& output) {
     // GDN's causal convolution has three history columns in a 32-column ANE
     // surface, so at most 29 new prompt tokens can be submitted together.
-    if (!scheduler_ready_ || lanes == 0 || lanes > 29 ||
+    const size_t max_prefill_lanes = chain_ ? chain_->get_seq_len() - 3 : 29;
+    if (!scheduler_ready_ || lanes == 0 || lanes > max_prefill_lanes ||
         input.size() != hidden_dim_ * lanes ||
         attention_layers_.size() != num_layers_ ||
         gdn_layers_.size() != num_layers_) return false;
