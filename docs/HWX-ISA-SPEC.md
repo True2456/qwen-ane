@@ -73,6 +73,14 @@ Offset       Size (Bytes)   Value / Content
 0x0080+      payload_size   Raw Tensor Data (FP16 / INT4 packed)
 ```
 
+**BLOBFILE offset semantics (empirically pinned by `ane-as` offset-probe):**
+the `offset=uint64(64)` argument in MIL `BLOBFILE(...)` is **not** a byte
+address into this container. Compiling the same graph with offsets
+`0 / 32 / 128` fails outright with `InvalidMILProgram`; only `64` compiles,
+regardless of payload size. Treat `uint64(64)` as a mandatory schema constant
+in every synthesized MIL. The compiler resolves tensor data via the envelope's
+own payload pointer (`0x0050`), not the MIL offset.
+
 ---
 
 ## 4. Validated Direct Objective-C API Sequence
@@ -102,3 +110,30 @@ BOOL ok = [client doEvaluateDirectWithModel:aneModel
                                         qos:21
                                       error:&error];
 ```
+
+---
+
+## 5. Measured Performance (M5 Max, `ane-as --iters 300`, Aug 2026)
+
+Dispatch overhead is noisy run-to-run (scheduler + thermal state); quote p50,
+not means. Numbers from the native C++ suite (`make test-ane-as`, no Python):
+
+| Workload | p50 | min | p90 | max |
+|---|---|---|---|---|
+| Direct dispatch (smoke conv) | 0.095 ms | 0.065 ms | 0.220 ms | 3.5 ms |
+| Depthwise causal conv C=64, S=32, K=4 | 0.092 ms | 0.065 ms | 0.115 ms | 3.4 ms |
+| Depthwise causal conv C=10240, S=32, K=4 | 0.099 ms | 0.076 ms | 0.182 ms | 3.4 ms |
+
+MIL compile: 16-24 ms one-time per program.
+
+Notes:
+- Occasional ~3.4 ms stalls appear in every run; means are misleading.
+- Numerical verification vs an fp32-accumulate scalar reference lands at
+  RelErr 5-6e-4 for the depthwise convs, consistent with fp16 internal
+  accumulation in the ANE kernel. PASS bar in `ane-as` is 1e-3 (warn 5e-3).
+- Single-op dispatch is overhead-dominated (~0.1 ms mailbox round trip); ANE
+  economics only favor fused multi-op graphs. `queueDepth: 127` asynchronous
+  submission is the obvious next lever (not yet exercised here).
+- Known environment quirk: binaries under `~/Desktop/...` get SIGKILL'd by the
+  ANE daemon on this machine; run the `/tmp/rindi-ane-as` staging copy (the
+  Makefile target already does).
