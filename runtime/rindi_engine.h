@@ -79,6 +79,7 @@ private:
     bool ready_{false};
 
     size_t hidden_dim_{5120};
+    size_t ane_width_{32};   // ANE program lane width (RINDI_ANE_WIDTH)
     size_t num_layers_{64};
 
     BPETokenizer tokenizer_;

@@ -114,7 +114,18 @@ bool RindiEngine::init_model() {
     // .rindi/ane_layers entries are quantized weight caches, so they must be
     // paired with the safetensors metadata and compiled into the exact fused
     // tail programs before execution.
-    chain_ = std::make_unique<RindiNativeChain>(hidden_dim_, 32);
+    // ANE program lane-width (columns per eval). 32 = shipped default; wider
+    // values recompile the cores with more parallel lanes for prefill chunks.
+    // GDN causal conv reserves 3 columns, so live prefill lanes = width - 3.
+    {
+        size_t w = 32;
+        if (const char* e = std::getenv("RINDI_ANE_WIDTH")) {
+            size_t v = (size_t)std::atoi(e);
+            if (v >= 32 && v <= 256 && (v % 32) == 0) w = v;
+        }
+        ane_width_ = w;
+    }
+    chain_ = std::make_unique<RindiNativeChain>(hidden_dim_, ane_width_);
     scheduler_ready_ = init_scheduler();
     if (!scheduler_ready_) {
         std::cerr << "[RindiEngine] Native transformer scheduler failed to initialize" << std::endl;
@@ -184,14 +195,16 @@ bool RindiEngine::init_scheduler() {
         if (safetensors_.has_tensor(p + "self_attn.o_proj.weight")) {
             attention_layers_[layer] = std::make_unique<RindiAttention>();
             if (!attention_layers_[layer]->compile_core(chain_->ane_context(), safetensors_,
-                                                        static_cast<int>(layer), 4096, 32)) {
+                                                        static_cast<int>(layer), 4096,
+                                                        ane_width_)) {
                 std::cerr << "[RindiEngine] Failed to compile attention core " << layer << std::endl;
                 return false;
             }
         } else {
             gdn_layers_[layer] = std::make_unique<RindiGdnLayer>();
             if (!gdn_layers_[layer]->compile_core(chain_->ane_context(), safetensors_,
-                                                  static_cast<int>(layer), 32)) {
+                                                  static_cast<int>(layer),
+                                                  ane_width_)) {
                 std::cerr << "[RindiEngine] Failed to compile GDN core " << layer << std::endl;
                 return false;
             }
@@ -917,7 +930,7 @@ std::string RindiEngine::generate(
     // Recurrent GDN and attention state are advanced in lane order inside the
     // batched core functions, while each fused tail is evaluated once per
     // chunk instead of once per token.
-    constexpr size_t kPrefillLanes = 29;
+    const size_t kPrefillLanes = ane_width_ - 3;   // minus GDN history columns
     for (size_t offset = 0; offset < prompt_tokens.size(); offset += kPrefillLanes) {
         const size_t lanes = std::min(kPrefillLanes, prompt_tokens.size() - offset);
         std::vector<uint16_t> batch_input(hidden_dim_ * lanes);

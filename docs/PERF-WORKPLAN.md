@@ -152,6 +152,32 @@ MLX's real int4 GEMM lives locally at
   register-blocked accumulation). It is a large careful port, NOT a oneshot
   glyph dump - the failed drafts underscore this.
 
+## P4e - ANE transfer audit: what the Metal work does/doesn't give the ANE
+- DIRECT: nothing - kernels do not cross processors. What transfers is
+  measurement + strategy:
+  1. BUDGETS (measured, pp1024 lanes=32): pure-ANE fused layer 6.9 ms
+     (442 ms/pass); ANE attention/GDN cores alone 4.5 ms; ANE MLP share
+     ~2.2 ms => ANE effective ~3.8 TFLOPS whole-layer, ~8.5 TFLOPS on MLP.
+  2. STRATEGIC NEGATIVE RESULT: documented GPU MMA ceiling is 15.4 TFLOPS
+     (bf16==fp16) and real-world GEMM kernels reach ~4-5. ANE already runs
+     matrices at ~8.5 effective. Moving ANE matrix work to Metal can never
+     win big; RINDI_ENABLE_METAL_TAIL stays OFF for prefill. Metal's role:
+     glue, draft head, fallback.
+  3. CPU-GLUE AUDIT FALSIFIED: the per-attention-layer scalar sigmoid gate
+     loop costs only 0.79 ms/layer (12.7 ms/pass, 2.8%); vForce rewrite
+     would save ~5 ms/pass (~1%). Not worth precision churn. (Benchmark:
+     /tmp/gatebench.cpp pattern - scalar exp is ~4 ns warm.)
+- CHUNK-WIDTH EXPERIMENT (RINDI_ANE_WIDTH): runtime plumbing added (chain
+  surface, core compile width, kPrefillLanes = width-3). RESULT: width>32
+  fails at first prompt batch ("prompt batch failed ... lanes=61") because
+  the FUSED ANE tails are precompiled blobs in the .rindi package, frozen at
+  32 columns. Widening prefill chunks requires an offline package rebuild,
+  not a runtime change. Default behavior unchanged; MTP_EXACT=PASS after.
+- REMAINING ANE LEVERS: (a) offline rebuild of .rindi tails at width 64+
+  (the only route to materially >71 tok/s prefill); (b) APC prefix caching
+  (currently 0%) for repeated prefixes; (c) decode is MTP-bound - recent
+  accepted/step dropped vs earlier sessions; retune draft depth/threshold.
+
 ## P4d - hardware ceilings measured + ROWWISE simd kernel wired
 - MMA rate probes (this machine, Apple M5 Max): simdgroup_multiply_accumulate
   saturates at ~15.4 TFLOPS (8 independent fragment chains/simdgroup;
