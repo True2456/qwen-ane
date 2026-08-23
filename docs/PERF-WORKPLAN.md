@@ -621,3 +621,35 @@ reads. Debug hooks added (all env-gated): RINDI_DEBUG_NP/COREIN/SURF/CORE0/
 STATEHASH/LAYERHASH/LMCHECK/FORK, RINDI_SPEC_FORCE_KEEP1, RINDI_DEBUG_AB(_W).
 Tradeoff to revisit: layer-0 GDN projections now run lanes x GEMV dispatches
 per multi-lane call (prefill cost); acceptable until gemm matches gemv order.
+
+## P13 - Prefill lever revisited: ANE K-tiled dynamic kernels - 2.4x on core primitive
+Post-MTP revisit of prefill (~70 tok/s plateau). maderix/ANE cross-pollination
+led to measuring ANE dynamic weight-as-input matmuls at OUR projection shape
+(5120x5120 fp16, weights streamed from IOSurface surface tail - no baked
+constants, no recompiles):
+
+| config | S=512 | S=1024 | S=2048 |
+|---|---|---|---|
+| monolithic matmul | 6.27 ms (4.3 TF) | 11.5 ms (4.7 TF) | 22.0 ms (4.9 TF) |
+| conv-form (same math) | identical | identical | identical |
+| **K-tiled T=3 (K<=2048)** | **2.37 ms (11.3 TF)** | **4.62 ms (11.6 TF)** | **9.20 ms (11.7 TF)** |
+
+ROOT CAUSE of the old plateau understanding: ANE efficiency collapses when the
+K (input-channel) dimension exceeds ~2048 (4.9 -> 12 TFLOPS crossing 2048).
+Output-channel width is irrelevant (ic=5120/oc=2048 stays slow; ic=2048/oc=5120
+runs fast). Channel-width sweep: 512ch ~= 2048ch ~= 11.6-11.8 TF >> 5120ch.
+
+IMPLICATION: fused whole-layer ANE prefill programs built from K-tiled dynamic
+kernels run at ~11.7 TFLOPS = 2.4x the hybrid's effective rate -> projected
+prefill ~150-170 tok/s once non-projection stages (conv/recurrence/attention)
+are fused alongside. Weights stay INT4 on disk, dequantized into the surface
+once per layer per sequence (amortized across chunks).
+
+STATUS: primitive validated exact (probes/test_ane_prefill_mm.cpp,
+`make test-prefill-mm`, env IC/OC/S0/MM_CONV/K_TILES). Engine integration =
+P14: build qkv/gate/up/down fused prefill program (one dispatch per layer per
+chunk), wire into forward_prompt_batch behind RINDI_PREFILL_FUSED.
+NOTE: this also DEPRIORITIZES the Steel-style Metal GEMM port for prefill:
+its realistic ceiling (~12 TF, MLX parity) equals what ANE now delivers, at
+far higher implementation cost. Metal kernel port retains value only for
+decode-shaped M=1 GEMV (bandwidth-bound, where ANE offers nothing).
