@@ -152,6 +152,46 @@ MLX's real int4 GEMM lives locally at
   register-blocked accumulation). It is a large careful port, NOT a oneshot
   glyph dump - the failed drafts underscore this.
 
+## P5 - Custom ANE compiler access: the two hardware-unlocked levers
+Context: reverse-engineered private-framework access exists (docs/
+ANE-CUSTOM-COMPILER-RESEARCH.md): direct _ANEModel/_ANEClient loading,
+captured Espresso net.plist dirs, parametric MIL builders, ALU mode
+registers. Physics-grounded plan, ranked:
+
+WALLS (measured, do not fight):
+- Decode floor: 12.7 GB int4 weights streamed/token at ~55 GB/s ANE DRAM BW
+  => 4.7 tok/s hard max; current 4.27 = 91% of wall. Only amortization
+  (speculation) or fewer bytes move it.
+- INT8 dual-lane ALU mode: irrelevant while weight-BW-bound; revisit only
+  for prefill after width scaling saturates.
+
+LEVER 1 - PREFILL x2+: recompile fused tails at width 64/128.
+- build_tail_mil() (rindi_native_chain.cpp) is already fully parametric in
+  seq; package weight payloads (___.bin/__s.bin per layer) are
+  width-independent and reusable directly.
+- Steps: (a) port build_tail_mil to the Python harness or dump MIL from C++;
+  (b) repack per-layer weight blobs at our own offsets (o/gu/dn/ip + norms);
+  (c) compile at seq=64 via q38_ane_engine; (d) A/B vs 2x width-32 evals:
+  bit-tolerance + ms/chunk; (e) wire engine to load regenerated tails
+  (compile_prepared pattern already exists for cores).
+- Expected: pp1024 71 -> ~120-140 tok/s (fewer chunk passes, compute still
+  ~20% of fp16 peak). Also frees us from the frozen shipped package.
+
+LEVER 2 - DECODE/MTP: per-lane state-checkpoint recurrence.
+- GDN recurrence MIL is already state-in/state-out (-> (y, s2)); MTP partial
+  rounds cost a 230ms replay ONLY because intermediate states inside a
+  multi-lane verify are not materialized.
+- Fix: emit an unrolled variant whose MIL exposes s2 after EACH lane as
+  extra outputs (MIL supports multi-output functions; harness compiles
+  arbitrary MIL). Partial acceptance then restores snapshot[n_ok] by copy -
+  O(1) instead of O(replay). Attention KV already truncates O(1).
+- Expected: kills the 230ms penalty; depth-1 spec projects ~4.9-5.2 tok/s
+  (>base), depth 2-4 with good acceptance up to ~6-8 tok/s.
+- Memory: state snapshot = HK*V*2B = 1.5 MB/layer - keep only the CURRENT
+  round's per-lane states (k <= 8 => <=12 MB transient).
+
+ORDER: Lever 1 first (isolated, big prefill win, no decode risk); Lever 2
+second (needs careful exactness validation vs sequential recurrence).
 ## P4g - MTP root-caused: replay-on-partial economics + two real fixes landed
 - The probe was overriding RINDI_MTP_DEPTH (setenv "2" after env read) - all
   earlier depth sweeps were void. With the fix: depth 1/2/4/8 -> accepted/step
