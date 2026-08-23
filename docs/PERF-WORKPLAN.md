@@ -479,3 +479,35 @@ RISK: low-medium. Contained to engine.cpp generate() partial branch + one
     feeding stored np for layers >= 1.
   * include attention core_step_batch (needed for KV) and gate_core_batch.
   * verify bit-exact state + MTP_EXACT=PASS before declaring win.
+
+## P8 - Faithful rebuild tested: compositionality PROVEN, but rebuild != replay
+- Followed P7: re-implemented P6 faithfully - rebuild_state_only() re-runs
+  EVERY layer's core exactly as forward_prompt_batch (attention core_step_batch
+  writes KV+advances position, GDN core_step/core_from_projected_view +
+  gate_core_batch advance conv+recurrence), feeding the verify's captured
+  per-layer np for layers >= 1)Skip the stateless MLP tails entirely.
+- drives from batch_hidden lane n_ok for the fix hidden (already free).
+- RESULT: fires on all partials (rebuild=1) but MTP_EXACT=FAIL and acceptance
+  DROPS 1.78 -> 1.07 (worse than legacy replay).
+- GDN conv+recurrence compositionality is PROVEN byte-identical
+  (probes/test_conv_compose.cpp). By reconstruction, the faithful rebuild
+  should equal the legacy replay's state. It does not in practice.
+- The residual unexplained divergence is a STATE detail the rebuild misses
+  but the replay's full forward_prompt_batch produces - most likely either:
+  (a) attention KV/position - core_step_batch writes row=position_+lane and
+      advances position_ += lanes; rebuild calls it once with keep lanes and
+      should match, BUT the verify's captured np for attention layers is the
+      FUSED qkv (+z/a/b) layout and my q/k/v repack may misalign.
+  (b) conv written_lanes_ / IOSurface state differing because the rebuild
+      calls conv with keep lanes while the verify used k+1 (the ANE conv
+      surface `written_lanes_` caching could produce byte-diff outputs even
+      if the pure state hash matches).
+- NEXT (decisive, not a guess): a direct state-diff - run verify(4 lanes),
+  then compare hash of all 64 layers' (attention KV + GDN conv_history +
+  recurrence state) against "restore-snapshot + rebuild_state_only(4)" vs
+  "restore-snapshot + legacy forward_prompt_batch(4)". One of the three state
+  sets will differ; bisect that layer. Use prefixes of the SAME real input.
+- NOTE: this is now a precision-debug of the rebuild, NOT a question of
+  whether O(1) rollback is possible - compositionality already answers that
+  (YES). The legacy replay itself also FAILS MTP_EXACT today (pre-existing),
+  so the rebuild WORTH is real once it matches the replay byte-for-byte.
