@@ -562,10 +562,14 @@ bool RindiNativeChain::evaluate_tail_batch(int layer_idx, const uint16_t* core,
     // Lane-width change is the only event that requires re-zeroing: columns
     // [lanes, written_lanes) may hold stale values from a wider chunk.
     auto* in = static_cast<uint16_t*>(metal_iosurface_get_base_address(e.input_surface));
-    if (e.written_lanes != lanes) {
-        std::memset(in, 0, e.input_channels * seq_len_ * sizeof(uint16_t));
-        e.written_lanes = lanes;
-    }
+    // P9: ALWAYS zero the full width before staging. The fused ANE tail is
+    // empirically NOT lane-count invariant (probes/test_tail_sync.cpp): the
+    // same lane-0 inputs give different outputs depending on total filled
+    // columns. Zero-padding every call to seq_len_ makes the width context
+    // constant => outputs become width-invariant, which speculative decoding
+    // requires for exactness (verify k+1 lanes vs sequential 1 lane).
+    std::memset(in, 0, e.input_channels * seq_len_ * sizeof(uint16_t));
+    e.written_lanes = lanes;
     for (size_t c = 0; c < core_dim; ++c)
         std::memcpy(in + c * seq_len_, core + c * lanes, lanes * sizeof(uint16_t));
     for (size_t c = 0; c < hidden_dim_; ++c)

@@ -537,3 +537,25 @@ RISK: low-medium. Contained to engine.cpp generate() partial branch + one
   rerun the diff. If conv-surface diverges at round 0 pre-core, add surface
   restore to snapshot/restore. This is mechanical now - the debug tooling
   (state hashes) is in place and committed.
+
+## P10 - RESOLVED pieces + remaining exactness root cause
+- P6 STATE REBUILD VALIDATED CORRECT: instrumented [RB0]/[LG0] hashes show
+  the rebuild produces BIT-IDENTICAL layer-0 GDN state (conv history +
+  recurrence) to the legacy replay at the partial round
+  (norm d9c9949c keep=2 -> conv 1fde9dcd rec 628229a5 in BOTH paths).
+- TAIL LANE-INVARIANCE PROVEN (probes/test_tail_width.cpp): same lane-0
+  data across widths 1/2/3/4/8/16 -> identical outputs. Old tail-sync
+  probe result was a staging artifact.
+- REMAINING ROOT CAUSE of MTP_EXACT=FAIL: base decode consumes tokens via
+  evaluate_tail (SINGLE-LANE ANE program req_a_to_b); spec verify consumes
+  via evaluate_tail_batch (batched programs). Two separately-compiled
+  program sets => low-order fp16 divergence between base trajectory and
+  spec trajectory. NOT a state problem - a program-path duality.
+- PATH TO CLOSURE: unify base greedy decode onto the SAME batched programs
+  (forward_prompt_batch at lanes=1 / evaluate_tail_batch(1)) so base and
+  spec share numerics end-to-end. Then MTP_EXACT should PASS with
+  RINDI_STATE_REBUILD=1, and the 230ms->22ms rollback saving becomes net
+  decode speedup. Cost check needed: evaluate_tail_batch(1) throughput vs
+  evaluate_tail(1) (both stream weights once; expected parity).
+- STATUS: all P6 code remains in tree, env-gated OFF by default
+  (RINDI_STATE_REBUILD=1 enables). Default behavior unchanged.

@@ -180,6 +180,20 @@ private:
     void apc_store(const std::vector<int>& tokens,
                    const std::vector<uint16_t>& last_hidden);
     bool apc_restore();
+
+    // P6 diagnostics + rebuild (see docs P6/P7/P8)
+    bool spec_capture_{false};
+    bool spec_have_capture_{false};
+    size_t spec_in_lanes_{0};
+    std::vector<std::vector<uint16_t>> spec_np_;
+    std::vector<uint16_t> np_repack_scratch_;
+    std::vector<size_t> spec_np_ch_;
+    bool spec_skip_tails_{false};
+    bool rebuild_state_only(const std::vector<uint16_t>& verify_input,
+                            const std::vector<uint16_t>& verify_hidden,
+                            size_t keep,
+                            std::vector<uint16_t>& fix_hidden);
+    std::vector<unsigned long long> spec_layer_hashes();
     bool forward_token(const std::vector<uint16_t>& input,
                        std::vector<uint16_t>& output);
     bool forward_prompt_batch(const std::vector<uint16_t>& input,

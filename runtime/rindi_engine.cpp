@@ -424,6 +424,137 @@ bool RindiEngine::apc_restore() {
     return true;
 }
 
+// P6 diagnostic: per-layer FNV hash of all recurrent state. Attention layers
+// hash KV rows [0, position) plus the position; GDN layers hash conv history
+// and recurrence state.
+std::vector<unsigned long long> RindiEngine::spec_layer_hashes() {
+    std::vector<unsigned long long> out;
+    auto mix = [](unsigned long long h, const uint16_t* p, size_t n) {
+        for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+        return h;
+    };
+    for (size_t l = 0; l < num_layers_; ++l) {
+        if (attention_layers_[l]) {
+            std::vector<uint16_t> k, v;
+            attention_layers_[l]->snapshot_kv(0, k, v);
+            unsigned long long hk = 1469598103934665603ull;
+            hk = mix(hk, k.data(), k.size());
+            hk = mix(hk, v.data(), v.size());
+            out.push_back(hk);
+            out.push_back((unsigned long long)attention_layers_[l]->position() * 2 + 1);
+        } else if (gdn_layers_[l]) {
+            std::vector<uint16_t> c, r, surf;
+            gdn_layers_[l]->snapshot_state(c, r);
+            gdn_layers_[l]->snapshot_conv_surface(surf);
+            unsigned long long hc = mix(1469598103934665603ull, c.data(), c.size());
+            unsigned long long hs = mix(1469598103934665603ull, surf.data(), surf.size())
+                                    ^ gdn_layers_[l]->conv_written_lanes();
+            unsigned long long hr = mix(1469598103934665603ull, r.data(), r.size());
+            out.push_back(hc);   // GDN: [conv-history, conv-surface(+wl), recurrence]
+            out.push_back(hs);
+            out.push_back(hr);
+        }
+    }
+    return out;
+}
+
+// P6 faithful rebuild: re-run every layer's CORE over the accepted prefix
+// (keep lanes) using the verify batch's captured projections. Attention
+// core_step_batch rewrites KV rows + advances position; GDN conv/recurrence
+// advance via core_from_projected_view / core_step. Tails are stateless and
+// skipped => no weight re-stream.
+// Returns the fix token's hidden via fix_hidden (batch output lane n_ok).
+bool RindiEngine::rebuild_state_only(const std::vector<uint16_t>& verify_input,
+                                     const std::vector<uint16_t>& verify_hidden,
+                                     size_t keep,
+                                     std::vector<uint16_t>& fix_hidden) {
+    if (!spec_have_capture_ || keep == 0) return false;
+    constexpr size_t Q = 24 * 256, K = 4 * 256, QG = 2 * Q;
+    constexpr size_t QKV = 10240, Z = 6144, G = 48;
+
+    std::vector<uint16_t> normalized(hidden_dim_ * keep), core, z, gated;
+    for (size_t layer = 0; layer < num_layers_; ++layer) {
+        const bool attention = attention_layers_[layer] != nullptr;
+        if (layer == 0) {
+            // Layer-0 core input: RMS-normed embeddings of the accepted prefix.
+            std::vector<uint16_t> lane_in(hidden_dim_), lane_norm;
+            for (size_t lane = 0; lane < keep; ++lane) {
+                for (size_t c = 0; c < hidden_dim_; ++c)
+                    lane_in[c] = verify_input[c * spec_in_lanes_ + lane];
+                if (!apply_rms_norm(lane_in, first_input_norm_, lane_norm))
+                    return false;
+                for (size_t c = 0; c < hidden_dim_; ++c)
+                    normalized[c * keep + lane] = lane_norm[c];
+            }
+            if (attention) {
+                std::vector<uint16_t> q, k, v, attended;
+                if (!attention_layers_[layer]->project(normalized.data(), keep, q, k, v) ||
+                    !attention_layers_[layer]->core_step_batch(q, k, v, keep, attended))
+                    return false;
+                core = std::move(attended);
+            } else {
+                {
+                    unsigned long long hh=1469598103934665603ull;
+                    for(auto x:normalized){hh^=x;hh*=1099511628211ull;}
+                    fprintf(stderr,"[RB0] norm_hash=%llx keep=%zu",(unsigned long long)hh,keep);
+                }
+                if (!gdn_layers_[layer]->core_step(normalized.data(), keep, core, z) ||
+                    !gdn_layers_[layer]->gate_core_batch(core, z, keep, gated))
+                    return false;
+                {
+                    std::vector<uint16_t> c2,r2;
+                    gdn_layers_[layer]->snapshot_state(c2,r2);
+                    unsigned long long h1=1469598103934665603ull,h2=1469598103934665603ull;
+                    for(auto x:c2){h1^=x;h1*=1099511628211ull;}
+                    for(auto x:r2){h2^=x;h2*=1099511628211ull;}
+                    fprintf(stderr,"[RB0] post conv=%llx rec=%llx",(unsigned long long)h1,(unsigned long long)h2);
+                }
+                core.swap(gated);
+            }
+        } else {
+            const bool is_attn_np = spec_np_ch_[layer] == QG + 2 * K;
+            const bool is_gdn_np  = spec_np_ch_[layer] == QKV + Z + 2 * G;
+            if (!(is_attn_np || is_gdn_np)) return false;
+            const size_t ch = spec_np_ch_[layer];
+            if (spec_np_[layer].size() != ch * spec_in_lanes_) return false;
+            // compact the accepted-lane prefix into [ch x keep]
+            np_repack_scratch_.assign(ch * keep, 0);
+            for (size_t c = 0; c < ch; ++c)
+                for (size_t l = 0; l < keep; ++l)
+                    np_repack_scratch_[c * keep + l] =
+                        spec_np_[layer][c * spec_in_lanes_ + l];
+            const uint16_t* np = np_repack_scratch_.data();
+            if (attention) {
+                std::vector<uint16_t> q(QG * keep), k(K * keep), v(K * keep), attended;
+                for (size_t c2 = 0; c2 < QG; ++c2)
+                    for (size_t l = 0; l < keep; ++l)
+                        q[c2 * keep + l] = np[c2 * spec_in_lanes_ + l];
+                for (size_t c2 = 0; c2 < K; ++c2) {
+                    for (size_t l = 0; l < keep; ++l)
+                        k[c2 * keep + l] = np[(QG + c2) * spec_in_lanes_ + l];
+                    for (size_t l = 0; l < keep; ++l)
+                        v[c2 * keep + l] = np[(QG + K + c2) * spec_in_lanes_ + l];
+                }
+                if (!attention_layers_[layer]->core_step_batch(q, k, v, keep, attended))
+                    return false;
+                core = std::move(attended);
+            } else {
+                RindiGdnProjectionView pv{np, np + QKV * keep,
+                                          np + (QKV + Z) * keep,
+                                          np + (QKV + Z + G) * keep};
+                if (!gdn_layers_[layer]->core_from_projected_view(pv, keep, core, z) ||
+                    !gdn_layers_[layer]->gate_core_batch(core, z, keep, gated))
+                    return false;
+                core.swap(gated);
+            }
+        }
+        (void)core; (void)z; (void)gated;
+    }
+    fix_hidden.assign(verify_hidden.begin() + (size_t)(keep - 1) * hidden_dim_,
+                      verify_hidden.begin() + (size_t)keep * hidden_dim_);
+    return true;
+}
+
 bool RindiEngine::apply_rms_norm(const std::vector<uint16_t>& input,
                                  const std::vector<uint16_t>& weight,
                                  std::vector<uint16_t>& output) const {
@@ -630,6 +761,11 @@ bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
     // GDN's causal convolution has three history columns in a 32-column ANE
     // surface, so at most 29 new prompt tokens can be submitted together.
     const size_t max_prefill_lanes = chain_ ? chain_->get_seq_len() - 3 : 29;
+    if (spec_capture_) {
+        spec_np_.assign(num_layers_, {});
+        spec_np_ch_.assign(num_layers_, 0);
+        spec_in_lanes_ = lanes;
+    }
     if (!scheduler_ready_ || lanes == 0 || lanes > max_prefill_lanes ||
         input.size() != hidden_dim_ * lanes ||
         attention_layers_.size() != num_layers_ ||
@@ -693,9 +829,22 @@ bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
                 }
             } else {
                 std::vector<uint16_t> gated;
+                {
+                    unsigned long long hh=1469598103934665603ull;
+                    for(auto x:normalized){hh^=x;hh*=1099511628211ull;}
+                    fprintf(stderr,"[LG0] norm_hash=%llx keep=%zu",(unsigned long long)hh,lanes);
+                }
                 if (!gdn_layers_[layer]->core_step(normalized.data(), lanes, core, z) ||
                     !gdn_layers_[layer]->gate_core_batch(core, z, lanes, gated))
                     return false;
+                {
+                    std::vector<uint16_t> c2,r2;
+                    gdn_layers_[layer]->snapshot_state(c2,r2);
+                    unsigned long long h1=1469598103934665603ull,h2=1469598103934665603ull;
+                    for(auto x:c2){h1^=x;h1*=1099511628211ull;}
+                    for(auto x:r2){h2^=x;h2*=1099511628211ull;}
+                    fprintf(stderr,"[LG0] post conv=%llx rec=%llx",(unsigned long long)h1,(unsigned long long)h2);
+                }
                 core = std::move(gated);
             }
         } else {
@@ -738,6 +887,10 @@ bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
                                          core.size() / lanes, residual.data(), lanes,
                                          hidden, has_next ? &next_projection : nullptr))
             return false;
+        if (spec_capture_ && has_next) {
+            spec_np_[layer + 1] = next_projection;
+            spec_np_ch_[layer + 1] = next_projection.size() / lanes;
+        }
         if (debug_batch_timing) {
             const auto layer_end = std::chrono::high_resolution_clock::now();
             std::cerr << "[RindiTiming] batch_layer=" << layer
@@ -1076,6 +1229,10 @@ std::string RindiEngine::generate(
                       prompt_tokens.size() > 0;
     const bool dbg_mtp = std::getenv("RINDI_DEBUG_MTP") != nullptr;
     size_t spec_steps = 0;
+    const bool state_rebuild_enabled =
+        std::getenv("RINDI_STATE_REBUILD") != nullptr;
+    std::vector<uint16_t> verify_input_;
+    std::vector<uint16_t> verify_hidden_;
     // Acceptance-aware speculation guard: EMA of accepted drafts per round.
     // When drafting is persistently net-negative (EMA below the break-even
     // bound), cool off for 7 plain rounds, then re-probe once. Verified
@@ -1224,8 +1381,16 @@ std::string RindiEngine::generate(
                         batch_in[c * lanes + lane] = row[c];
                 }
             }
-            if (!forward_prompt_batch(batch_in, lanes, batch_hidden) ||
-                batch_hidden.size() != hidden_dim_ * lanes) {
+            spec_capture_ = true;
+            spec_have_capture_ = false;
+            const bool verify_ok =
+                forward_prompt_batch(batch_in, lanes, batch_hidden) &&
+                batch_hidden.size() == hidden_dim_ * lanes;
+            spec_capture_ = false;
+            spec_have_capture_ = true;
+            verify_input_ = batch_in;
+            verify_hidden_ = batch_hidden;
+            if (!verify_ok) {
                 finalize_stats(std::chrono::high_resolution_clock::now());
                 return generated_text;
             }
@@ -1283,38 +1448,59 @@ std::string RindiEngine::generate(
                 }
             } else {
                 hot_streak = 0;   // a miss retreats the next round's draft depth
-                // Partial: rewind, replay the proven prefix, take the fix.
+                auto dump_specstate = [&](const char* tag) {
+                    if (!std::getenv("RINDI_DEBUG_SPECSTATE")) return;
+                    std::string s = "[SPECSTATE] ";
+                    s += tag;
+                    char buf[32];
+                    for (unsigned long long x : spec_layer_hashes()) {
+                        snprintf(buf, sizeof buf, " %llx", x);
+                        s += buf;
+                    }
+                    fprintf(stderr, "%s\n", s.c_str());
+                };
+                dump_specstate("PRE");
+                const size_t keep_len = n_ok + 1;   // [cur] + accepted drafts
+                bool rebuilt = false;
                 {
                     const auto tr = std::chrono::high_resolution_clock::now();
                     restore_snapshot(snap);
-                    if (dbg_mtp) std::fprintf(stderr, "[MTPPHASE] restore_ms=%.3f\n",
-                        std::chrono::duration<double, std::milli>(
-                            std::chrono::high_resolution_clock::now() - tr).count());
-                }
-                const size_t keep_len = n_ok + 1;   // [cur] + accepted drafts
-                replay_hidden.clear();
-                batch_in.resize(hidden_dim_ * keep_len);
-                {
-                    std::vector<int> seq;
-                    seq.push_back(cur);
-                    for (size_t i = 0; i < n_ok; ++i) seq.push_back(drafts[i]);
-                    std::vector<uint16_t> row;
-                    for (size_t lane = 0; lane < keep_len; ++lane) {
-                        if (!safetensors_.get_embedding_row_fp16(seq[lane], hidden_dim_, row)) {
-                            finalize_stats(std::chrono::high_resolution_clock::now());
-                            return generated_text;
-                        }
-                        for (size_t c = 0; c < hidden_dim_; ++c)
-                            batch_in[c * keep_len + lane] = row[c];
+                    if (state_rebuild_enabled && spec_have_capture_) {
+                        rebuilt = rebuild_state_only(verify_input_, verify_hidden_,
+                                                     keep_len, hidden_state);
                     }
+                    if (dbg_mtp) std::fprintf(stderr,
+                        "[MTPPHASE] restore_ms=%.3f rebuild=%d\n",
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::high_resolution_clock::now() - tr).count(),
+                        rebuilt ? 1 : 0);
                 }
-                if (!forward_prompt_batch(batch_in, keep_len, replay_hidden) ||
-                    replay_hidden.size() != hidden_dim_ * keep_len) {
-                    finalize_stats(std::chrono::high_resolution_clock::now());
-                    return generated_text;
+                dump_specstate(rebuilt ? "RB" : "LEG");
+                if (!rebuilt) {
+                    replay_hidden.clear();
+                    batch_in.resize(hidden_dim_ * keep_len);
+                    {
+                        std::vector<int> seq;
+                        seq.push_back(cur);
+                        for (size_t i = 0; i < n_ok; ++i) seq.push_back(drafts[i]);
+                        std::vector<uint16_t> row;
+                        for (size_t lane = 0; lane < keep_len; ++lane) {
+                            if (!safetensors_.get_embedding_row_fp16(seq[lane], hidden_dim_, row)) {
+                                finalize_stats(std::chrono::high_resolution_clock::now());
+                                return generated_text;
+                            }
+                            for (size_t c = 0; c < hidden_dim_; ++c)
+                                batch_in[c * keep_len + lane] = row[c];
+                        }
+                    }
+                    if (!forward_prompt_batch(batch_in, keep_len, replay_hidden) ||
+                        replay_hidden.size() != hidden_dim_ * keep_len) {
+                        finalize_stats(std::chrono::high_resolution_clock::now());
+                        return generated_text;
+                    }
+                    hidden_state.assign(
+                        replay_hidden.end() - hidden_dim_, replay_hidden.end());
                 }
-                hidden_state.assign(
-                    replay_hidden.end() - hidden_dim_, replay_hidden.end());
                 const int fix = preds[n_ok];
                 std::vector<int> confirmed(drafts.begin(),
                                            drafts.begin() + n_ok);

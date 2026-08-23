@@ -23,6 +23,21 @@ public:
     void reset();
     // Causal-window capture for speculative-decode rollback.
     void snapshot_history(std::vector<uint16_t>& out) const { out = history_; }
+    // P6 diagnostic/rollback: the ANE conv IOSurface is state NOT covered by
+    // history_ (stale columns + written_lanes_ affect nothing for gathered
+    // outputs in theory, but hash-diffs say otherwise - expose it).
+    void snapshot_surface(std::vector<uint16_t>& out) const {
+        const uint16_t* src =
+            static_cast<const uint16_t*>(IOSurfaceGetBaseAddress(input_surface_));
+        out.assign(src, src + channels_ * width_);
+    }
+    void restore_surface(const std::vector<uint16_t>& in) {
+        if (in.size() != channels_ * width_) return;
+        uint16_t* dst =
+            static_cast<uint16_t*>(IOSurfaceGetBaseAddress(input_surface_));
+        std::memcpy(dst, in.data(), in.size() * sizeof(uint16_t));
+    }
+    size_t written_lanes() const { return written_lanes_; }
     void restore_history(const std::vector<uint16_t>& in) {
         if (in.size() == history_.size()) history_ = in;
     }

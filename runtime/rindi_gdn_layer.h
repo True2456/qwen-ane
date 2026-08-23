@@ -72,6 +72,13 @@ public:
         conv_.snapshot_history(conv_history);
         recurrence_.snapshot_state(recurrence_state);
     }
+    void snapshot_conv_surface(std::vector<uint16_t>& out) const {
+        conv_.snapshot_surface(out);
+    }
+    void restore_conv_surface(const std::vector<uint16_t>& in) {
+        conv_.restore_surface(in);
+    }
+    size_t conv_written_lanes() const { return conv_.written_lanes(); }
     void restore_state(const std::vector<uint16_t>& conv_history,
                        const std::vector<uint16_t>& recurrence_state) {
         conv_.restore_history(conv_history);
