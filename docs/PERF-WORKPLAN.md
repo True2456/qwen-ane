@@ -395,3 +395,37 @@ second (needs careful exactness validation vs sequential recurrence).
   per-layer ANE floor; >6 needs concurrency, not submit-rate.
 - prefill >= 150 tok/s @1-2K ctx after P2 (from ~40)
 - every metric traceable to a timer in this repo (tools/bench_latency.py)
+
+## P6 - Lever 2 implementation spec (O(1) MTP partial rollback)
+BLOCKER analysis (why replay is 230ms but shouldn't be):
+- In forward_prompt_batch, ONLY the CORES are stateful (attention KV rows,
+  GDN conv history_ + recurrence metal_state_). The tails (MLP o/gu/dn + ip
+  projections) are STATELESS - they only compute.
+- Verify batch already computed: hidden lanes (batch_hidden), final
+  next_projection, and KV rows for every lane.
+- Partial with n_ok accepted: hidden for fix = batch_hidden lane n_ok (free).
+  Attention KV rows pre-fix are already correct; restore_snapshot already
+  rewinds position. So the ONLY missing state is GDN conv history +
+  recurrence state AFTER the accepted prefix (48 GDN layers).
+PLAN:
+1. forward_prompt_batch: keep a per-layer vector of the batched hidden
+   (layer_hiddens[l] = hidden at layer l entry, lanes x hidden_dim) so the
+   partial path can feed any layer's core directly.
+2. Add forward_state_only(input, keep_len): per layer, do ONLY the core stage
+   (attention core_step_batch from stored q/k/v slices OR GDN core_step from
+   stored slices), skipping evaluate_tail_batch entirely. GDN core_step is
+   self-contained (project() internally + conv + recurrence) - feeding it the
+   accepted-prefix hidden lanes rebuilds conv_history_ + metal_state_ via the
+   normal (cheap) kernels. Attention needs nothing (KV rows already correct).
+3. Partial branch in generate(): restore_snapshot(snap) [O(1) copies],
+   forward_state_only(accepted_prefix, n_ok+1) [no weight stream: ~48 x
+   small kernels, tens of ms total], hidden_state = batch_hidden lane n_ok,
+   cur = fix, emit. Replay of MLP weights eliminated: 230ms -> ~30-60ms.
+4. Exactness: state-only path must produce identical conv/recurrence state
+   as the full verify for the accepted prefix. Verify by rerunning
+   MTP_EXACT=PASS + tracing.
+EXPECTED: partial rounds drop from ~468ms to ~270ms; with acc~1.7 (36%
+    partials) round avg ~300ms -> ~5.3 tok/s vs base 4.27 = +25%; with
+   deeper depth and better draft quality (hot-streak), toward +50%.
+RISK: low-medium. Contained to engine.cpp generate() partial branch + one
+   new forward_state_only; verified by MTP_EXACT.
