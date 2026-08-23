@@ -402,6 +402,64 @@ ANERequest* ane_request_create(
     }
 }
 
+ANERequest* ane_request_create_2in(
+    ANEContext* ctx,
+    ANEModel* model,
+    IOSurfaceRef input1,
+    IOSurfaceRef input2,
+    IOSurfaceRef output_surface,
+    int procedure_index
+) {
+    if (!ctx || !model || !input1 || !input2 || !output_surface) return NULL;
+    @autoreleasepool {
+        id in1Obj = ane_wrap_iosurface(ctx, input1);
+        id in2Obj = ane_wrap_iosurface(ctx, input2);
+        id outObj = ane_wrap_iosurface(ctx, output_surface);
+        if (!in1Obj || !in2Obj || !outObj) return NULL;
+        // EMPIRICAL ISA FINDING (ane-as test [6]): _ANERequest input array
+        // positions map to MIL function parameters in REVERSE order - with
+        // @[a, b] the hardware computed conv(param1<-b) and conv(param2<-a).
+        // Reverse here so callers may pass surfaces in MIL parameter order.
+        NSArray* inputs = @[in2Obj, in1Obj];
+        NSArray* inputIndices = @[@0, @1];
+        NSArray* outputs = @[outObj];
+        NSArray* outputIndices = @[@0];
+        id rawReq = [ctx->aneRequestClass alloc];
+        SEL initSel = @selector(initWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:sharedEvents:transactionHandle:);
+        if (![rawReq respondsToSelector:initSel]) return NULL;
+        typedef id (*InitFn)(id, SEL, NSArray*, NSArray*, NSArray*, NSArray*, id, id, NSNumber*, id, id);
+        InitFn init = (InitFn)[rawReq methodForSelector:initSel];
+        id request = init(rawReq, initSel, inputs, inputIndices, outputs, outputIndices,
+                          nil, nil, [NSNumber numberWithInt:procedure_index], nil, nil);
+        if (!request) return NULL;
+        ANERequest* r = (ANERequest*)calloc(1, sizeof(ANERequest));
+        r->rawRequest = request;
+        r->inObj = in1Obj;
+        r->outObj = outObj;
+        r->procedureIndex = procedure_index;
+        return r;
+    }
+}
+
+bool ane_request_evaluate_realtime(
+    ANEContext* ctx,
+    ANEModel* model,
+    ANERequest* req
+) {
+    if (!ctx || !model || !req || !req->rawRequest) return false;
+    if (!ctx->aneClient ||
+        ![ctx->aneClient respondsToSelector:@selector(evaluateRealTimeWithModel:options:request:error:)])
+        return false;
+    @autoreleasepool {
+        id target = model->loadedModel ? model->loadedModel : ctx->aneClient;
+        SEL sel = @selector(evaluateRealTimeWithModel:options:request:error:);
+        typedef BOOL (*RtFn)(id, SEL, id, NSDictionary*, id, NSError**);
+        RtFn fn = (RtFn)[ctx->aneClient methodForSelector:sel];
+        NSError* err = nil;
+        return fn(ctx->aneClient, sel, target, @{}, req->rawRequest, &err);
+    }
+}
+
 ANERequest* ane_request_create_multi(
     ANEContext* ctx,
     ANEModel* model,

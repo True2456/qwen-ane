@@ -137,3 +137,42 @@ Notes:
 - Known environment quirk: binaries under `~/Desktop/...` get SIGKILL'd by the
   ANE daemon on this machine; run the `/tmp/rindi-ane-as` staging copy (the
   Makefile target already does).
+
+---
+
+## 6. Dispatch Concurrency, Real-Time Path, Fused Graphs & INT4 (Aug 2026)
+
+Probed empirically by `ane-as` tests [4]-[7]:
+
+**Real-time path** (`evaluateRealTimeWithModel:`): identical latency to
+`doEvaluateDirectWithModel:` (p50 0.09-0.10 ms both). It is a scheduling
+priority hint, not a fast path. No throughput benefit.
+
+**Client-side concurrency does NOT pipeline dispatches.** With 1/2/4/8
+threads each issuing synchronous direct dispatches on independent requests,
+aggregate throughput stays flat at ~4-5 kHz while per-request latency grows
+linearly (0.22 -> 1.93 ms/dispatch at 8 threads = pure queueing). The daemon
+mailbox serializes evaluations; concurrency cannot hide the ~100 us round
+trip. (`_ANEClient.doEnqueueSetsWithModel:outputSet:` + `_ANEOutputSetEnqueue`
+isOpenLoop and `_ANEChainingRequest` exist for true async, but require the
+program-surface IO mode - unexplored.) Consequence: fused programs are the
+only way to amortize dispatch overhead.
+
+**Fused gated depthwise conv works at single-dispatch cost.**
+`y = conv(x,w1) (*) sigmoid(conv(g,w2))` (2 inputs, 2 weights, 5 ops)
+compiles and runs in one dispatch: p50 0.093 ms @C=64 / 0.120 ms @C=10240 -
+i.e. five ops for the price of one mailbox round trip. RelErr vs fp32
+reference 5.2e-4 / 1.0e-3 (fp16 sigmoid noise; bar 3e-3).
+
+**Input binding is REVERSED**: `_ANERequest` initWithInputs array positions
+map to MIL function parameters right-to-left (proven via hypothesis testing:
+with @[a,b] the hardware computed conv(param1<-b), conv(param2<-a); RelErr
+1.5 vs 8.6e-4 discriminated cleanly). `ane_request_create_2in` reverses on
+the caller's behalf so surfaces are passed in MIL parameter order.
+
+**INT4 weight path: NEGATIVE RESULT.** All three probed encodings are rejected
+by the MIL text compiler with `InvalidMILProgram`: `tensor<int4,...>` +
+`cast`, `constexpr_affine_to_dense(quantized_data=uint8,...)`, and
+`dequantize(weight=uint8,scale,bias)`. The section 3 envelope comment "INT4
+packed" remains UNVERIFIED - fp16 BLOBFILE constants are the only proven
+weight encoding through this pipeline.

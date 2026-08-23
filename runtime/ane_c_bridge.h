@@ -78,6 +78,29 @@ ANERequest* ane_request_create(
     int procedure_index
 );
 
+/**
+ * Create an evaluation request binding TWO input IOSurfaces (arg order maps
+ * to the MIL function's first two parameters) and one output.
+ */
+ANERequest* ane_request_create_2in(
+    ANEContext* ctx,
+    ANEModel* model,
+    IOSurfaceRef input1,
+    IOSurfaceRef input2,
+    IOSurfaceRef output_surface,
+    int procedure_index
+);
+
+/**
+ * Evaluate via the real-time client path (evaluateRealTimeWithModel:) -
+ * lower-latency scheduling variant; same request/buffers as the direct path.
+ */
+bool ane_request_evaluate_realtime(
+    ANEContext* ctx,
+    ANEModel* model,
+    ANERequest* req
+);
+
 ANERequest* ane_request_create_multi(
     ANEContext* ctx,
     ANEModel* model,

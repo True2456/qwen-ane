@@ -29,6 +29,9 @@
 #include <cstdio>
 #include <algorithm>
 #include <numeric>
+#include <pthread.h>
+#include <tuple>
+#include <utility>
 
 #include <IOSurface/IOSurface.h>
 
@@ -374,6 +377,293 @@ static int test_depthwise(ANEContext* ane, int C, int S, int K, int iters) {
     return pass ? 0 : (warn ? 0 : 1);
 }
 
+
+// ---------------------------------------------------------------------------
+// [4] Real-time scheduling path (evaluateRealTimeWithModel:)
+// ---------------------------------------------------------------------------
+
+static int test_realtime(ANEContext* ane, int iters) {
+    std::cout << "\n[4] real-time path vs direct dispatch\n";
+    std::vector<uint16_t> weights(16, 0x3c00);
+    const char* names[] = {"w.bin"};
+    const void* data[] = {weights.data()};
+    const size_t sizes[] = {weights.size() * sizeof(uint16_t)};
+    ANEModel* model = ane_model_compile_mil(ane, make_smoke_mil(64).c_str(),
+                                            names, data, sizes, 1, 0, 21);
+    if (!model) { std::cout << "  [FAIL] compile\n"; return 1; }
+    IoSurface in(4 * 32 * sizeof(uint16_t)), out(4 * 32 * sizeof(uint16_t));
+    surface_fill(in.get(), std::vector<uint16_t>(4 * 32, 0x3c00));
+    ANERequest* req = ane_request_create(ane, model, in.get(), out.get(), 0);
+    if (!req) { ane_model_release(model); return 1; }
+
+    // direct baseline
+    const LatencyStats direct = bench_dispatch(ane, model, req, 5, iters);
+    // real-time path
+    bool rt_ok = true;
+    for (int i = 0; i < 10; ++i)
+        if (!ane_request_evaluate_realtime(ane, model, req)) { rt_ok = false; break; }
+    if (!rt_ok) {
+        std::cout << "  [NOTE] evaluateRealTimeWithModel: unavailable or refused on this OS build\n";
+        ane_request_release(req); ane_model_release(model);
+        return 0;
+    }
+    std::vector<double> ms(static_cast<size_t>(iters));
+    for (int i = 0; i < iters; ++i) {
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        ane_request_evaluate_realtime(ane, model, req);
+        ms[i] = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t0).count();
+    }
+    std::sort(ms.begin(), ms.end());
+    LatencyStats rt;
+    rt.mean_ms = std::accumulate(ms.begin(), ms.end(), 0.0) / ms.size();
+    rt.min_ms = ms.front(); rt.p50_ms = ms[ms.size()/2]; rt.max_ms = ms.back();
+    std::cout << "      direct : p50=" << direct.p50_ms << " ms min=" << direct.min_ms << "\n";
+    std::cout << "      realtim: p50=" << rt.p50_ms << " ms min=" << rt.min_ms << "\n";
+    ane_request_release(req);
+    ane_model_release(model);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// [5] Pipelined dispatch: concurrent requests hide the mailbox round trip
+// ---------------------------------------------------------------------------
+
+struct PipeThreadCtx {
+    ANEContext* ane;
+    ANEModel* model;
+    int iters;
+    double ms_per_dispatch;
+};
+
+static void* pipe_thread_fn(void* p) {
+    PipeThreadCtx* c = (PipeThreadCtx*)p;
+    IoSurface in(4 * 32 * sizeof(uint16_t)), out(4 * 32 * sizeof(uint16_t));
+    if (!in || !out) { c->ms_per_dispatch = -1; return nullptr; }
+    surface_fill(in.get(), std::vector<uint16_t>(4 * 32, 0x3c00));
+    ANERequest* req = ane_request_create(c->ane, c->model, in.get(), out.get(), 0);
+    if (!req) { c->ms_per_dispatch = -1; return nullptr; }
+    for (int i = 0; i < 5; ++i)
+        ane_request_evaluate(c->ane, c->model, req, nullptr, 0, nullptr, 0);
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < c->iters; ++i)
+        ane_request_evaluate(c->ane, c->model, req, nullptr, 0, nullptr, 0);
+    c->ms_per_dispatch = std::chrono::duration<double, std::milli>(
+        std::chrono::high_resolution_clock::now() - t0).count() / c->iters;
+    ane_request_release(req);
+    return nullptr;
+}
+
+static int test_pipelined(ANEContext* ane, int iters_total) {
+    std::cout << "\n[5] pipelined dispatch (concurrent requests, aggregate rate)\n";
+    std::vector<uint16_t> weights(16, 0x3c00);
+    const char* names[] = {"w.bin"};
+    const void* data[] = {weights.data()};
+    const size_t sizes[] = {weights.size() * sizeof(uint16_t)};
+    ANEModel* model = ane_model_compile_mil(ane, make_smoke_mil(64).c_str(),
+                                            names, data, sizes, 1, 0, 21);
+    if (!model) { std::cout << "  [FAIL] compile\n"; return 1; }
+
+    double base_rate = 0;
+    for (int threads : {1, 2, 4, 8}) {
+        const int iters_each = std::max(20, iters_total / threads);
+        std::vector<PipeThreadCtx> ctxs(threads);
+        for (auto& c : ctxs) { c = {ane, model, iters_each, 0}; }
+        std::vector<pthread_t> tids(threads);
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        for (int t = 0; t < threads; ++t)
+            pthread_create(&tids[t], nullptr, pipe_thread_fn, &ctxs[t]);
+        for (int t = 0; t < threads; ++t) pthread_join(tids[t], nullptr);
+        const double wall_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+        bool bad = false;
+        for (const auto& c : ctxs) if (c.ms_per_dispatch < 0) bad = true;
+        if (bad) { std::cout << "  [FAIL] thread setup\n"; break; }
+        const double rate_khz = (threads * iters_each) / wall_ms; // per-ms -> kHz
+        if (threads == 1) base_rate = rate_khz;
+        const double mean_indiv = std::accumulate(ctxs.begin(), ctxs.end(), 0.0,
+            [](double a, const PipeThreadCtx& c){ return a + c.ms_per_dispatch; }) / threads;
+        std::cout << std::fixed << std::setprecision(2)
+                  << "  threads=" << threads << ": aggregate " << rate_khz
+                  << " kHz (" << rate_khz / base_rate << "x single)"
+                  << ", per-request " << mean_indiv << " ms/dispatch\n";
+    }
+    ane_model_release(model);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// [6] Fused multi-op program: gated causal depthwise conv in ONE dispatch
+//     y = conv(x, w1) (*) sigmoid(conv(g, w2))   - the GDN gating pattern.
+// ---------------------------------------------------------------------------
+
+static std::string make_gated_conv_mil(int C, int S, int K) {
+    char buf[3072];
+    std::snprintf(buf, sizeof(buf),
+        "program(1.3)\n%s\n"
+        "{\n"
+        "  func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x, tensor<fp16, [1, %d, 1, %d]> g) {\n"
+        "    tensor<fp16, [%d, 1, 1, %d]> w1 = const()[name=string(\"w1\"), val=tensor<fp16, [%d, 1, 1, %d]>(BLOBFILE(path=string(\"@model_path/weights/w1.bin\"), offset=uint64(64)))];\n"
+        "    tensor<fp16, [%d, 1, 1, %d]> w2 = const()[name=string(\"w2\"), val=tensor<fp16, [%d, 1, 1, %d]>(BLOBFILE(path=string(\"@model_path/weights/w2.bin\"), offset=uint64(64)))];\n"
+        "    tensor<int32, [2]> strides = const()[name=string(\"strides\"), val=tensor<int32, [2]>([1,1])];\n"
+        "    tensor<int32, [2]> dil = const()[name=string(\"dil\"), val=tensor<int32, [2]>([1,1])];\n"
+        "    tensor<int32, [4]> pad = const()[name=string(\"pad\"), val=tensor<int32, [4]>([0,0,%d,0])];\n"
+        "    tensor<fp16, [1, %d, 1, %d]> c = conv(dilations=dil, groups=int32(%d), pad=pad, pad_type=string(\"custom\"), strides=strides, weight=w1, x=x)[name=string(\"c\")];\n"
+        "    tensor<fp16, [1, %d, 1, %d]> cg = conv(dilations=dil, groups=int32(%d), pad=pad, pad_type=string(\"custom\"), strides=strides, weight=w2, x=g)[name=string(\"cg\")];\n"
+        "    tensor<fp16, [1, %d, 1, %d]> sg = sigmoid(x=cg)[name=string(\"sg\")];\n"
+        "    tensor<fp16, [1, %d, 1, %d]> y = mul(x=c, y=sg)[name=string(\"y\")];\n"
+        "  } -> (y);\n"
+        "}\n",
+        kBuildInfo, C, S, C, S, C, K, C, K, C, K, C, K,
+        K - 1, C, S, C, C, S, C, C, S, C, S);
+    return std::string(buf);
+}
+
+static int test_fused_gated_conv(ANEContext* ane, int C, int S, int K, int iters) {
+    std::cout << "\n[6] fused gated depthwise conv C=" << C << " S=" << S << " K=" << K
+              << " (conv(*)sigmoid(conv): 5 ops, 1 dispatch)\n";
+    auto lcg = [s = 777u](float scale) mutable {
+        s = s * 1664525u + 1013904223u;
+        return ((s >> 8) & 0xffff) / 65535.0f * 2.0f * scale - scale;
+    };
+    std::vector<uint16_t> w1((size_t)C * K), w2((size_t)C * K), x((size_t)C * S), g((size_t)C * S);
+    for (auto& v : w1) v = fp32_to_fp16(lcg(0.15f));
+    for (auto& v : w2) v = fp32_to_fp16(lcg(0.15f));
+    for (auto& v : x)  v = fp32_to_fp16(lcg(0.2f));
+    for (auto& v : g)  v = fp32_to_fp16(lcg(0.2f));
+
+    const char* names[] = {"w1.bin", "w2.bin"};
+    const void* data[] = {w1.data(), w2.data()};
+    const size_t sizes[] = {w1.size() * sizeof(uint16_t), w2.size() * sizeof(uint16_t)};
+    ANEModel* model = ane_model_compile_mil(
+        ane, make_gated_conv_mil(C, S, K).c_str(), names, data, sizes, 2, 0, 21);
+    if (!model) { std::cout << "  [FAIL] compile\n"; return 1; }
+    IoSurface xin((size_t)C*S*2), gin((size_t)C*S*2), out((size_t)C*S*2);
+    if (!xin || !gin || !out) { ane_model_release(model); return 1; }
+    surface_fill(xin.get(), x);
+    surface_fill(gin.get(), g);
+    ANERequest* req = ane_request_create_2in(ane, model, xin.get(), gin.get(), out.get(), 0);
+    if (!req) { std::cout << "  [FAIL] 2-input request\n"; ane_model_release(model); return 1; }
+
+    const LatencyStats st = bench_dispatch(ane, model, req, 5, iters);
+    const auto got = surface_read(out.get(), (size_t)C*S);
+
+    // CPU reference; also compute input-swapped variant to catch binding order.
+    std::vector<float> ref(C*S), ref_swap(C*S);
+    std::vector<float> cxa, cga, cxb, cgb;
+    ref_causal_conv1d(x, w1, C, S, K, cxa);
+    ref_causal_conv1d(g, w2, C, S, K, cga);
+    ref_causal_conv1d(g, w1, C, S, K, cxb);
+    ref_causal_conv1d(x, w2, C, S, K, cgb);
+    for (size_t i = 0; i < ref.size(); ++i) {
+        ref[i]       = cxa[i] / (1.0f + std::exp(-cga[i]));
+        ref_swap[i]  = cxb[i] / (1.0f + std::exp(-cgb[i]));
+    }
+    // Hypothesis H3: both convs consumed input 0 (binding collapsed).
+    std::vector<float> cxx;
+    ref_causal_conv1d(x, w1, C, S, K, cxx);
+    std::vector<float> ref_h3(C*S);
+    for (size_t i = 0; i < ref.size(); ++i)
+        ref_h3[i] = cxx[i] / (1.0f + std::exp(-cxx[i]));
+    const float rel = rel_error(got, ref);
+    const float rel_swap = rel_error(got, ref_swap);
+    const float rel_h3 = rel_error(got, ref_h3);
+    const char* verdict =
+        rel < rel_swap * 0.1f && rel < rel_h3 * 0.1f ? "OK" :
+        rel_swap < rel * 0.1f ? "SWAPPED" :
+        rel_h3 < rel * 0.1f ? "BOTH-READ-INPUT0" : "UNRESOLVED";
+    // fp16 sigmoid adds ~1e-3 relative noise at width; bar is 3e-3 here vs
+    // 1e-3 for pure convs (matches measured 5.2e-4 @C=64, 1.0e-3 @C=10240).
+    const bool pass = rel < 3e-3f;
+    std::cout << "  [" << (pass ? "PASS" : (rel < 5e-3f ? "WARN" : "FAIL")) << "]"
+              << " RelErr=" << std::scientific << std::setprecision(2) << rel
+              << " (swap=" << rel_swap << " h3=" << rel_h3 << ") => " << verdict
+              << "\n";
+    print_stats(st, 3.0 * C * K * S / (st.mean_ms * 1e-3) / 1e9);
+    ane_request_release(req);
+    ane_model_release(model);
+    return pass ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// [7] INT4 weight encoding probe - which packed-int4 MIL forms does the
+//     compiler accept, and what do the nibbles decode to?
+// ---------------------------------------------------------------------------
+
+static int test_int4(ANEContext* ane) {
+    std::cout << "\n[7] INT4 weight-path probe\n";
+    const int C = 4, S = 32, K = 4;
+    // 16 int4 values packed 2-per-byte, low nibble first: v[j] = j - 8 (-8..7).
+    std::vector<uint8_t> packed((size_t)C*K/2);
+    for (size_t b = 0; b < packed.size(); ++b) {
+        const int lo = ((int)(b*2)   % 16) & 0xf;
+        const int hi = ((int)(b*2+1) % 16) & 0xf;
+        packed[b] = (uint8_t)(lo | (hi << 4));
+    }
+    const char* names[] = {"w.bin"};
+    const void* data[] = {packed.data()};
+    const size_t sizes[] = {packed.size()};
+    // expected decode under (sign, low-first): w[j] = (j%16) - 8
+    auto make_variant = [](const char* body) {
+        char buf[2048];
+        std::snprintf(buf, sizeof(buf),
+            "program(1.3)\n%s\n"
+            "{\n"
+            "  func main<ios18>(tensor<fp16, [1, 4, 1, 32]> x) {\n"
+            "%s"
+            "    string pt = const()[name=string(\"pt\"), val=string(\"valid\")];\n"
+            "    tensor<int32, [2]> st = const()[name=string(\"st\"), val=tensor<int32, [2]>([1,1])];\n"
+            "    tensor<int32, [4]> pd = const()[name=string(\"pd\"), val=tensor<int32, [4]>([0,0,0,0])];\n"
+            "    tensor<int32, [2]> dl = const()[name=string(\"dl\"), val=tensor<int32, [2]>([1,1])];\n"
+            "    int32 gr = const()[name=string(\"gr\"), val=int32(1)];\n"
+            "    tensor<fp16, [1, 4, 1, 32]> y = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=w, x=x)[name=string(\"y\")];\n"
+            "  } -> (y);\n"
+            "}\n", kBuildInfo, body);
+        return std::string(buf);
+    };
+    const char* var_a =
+        "    tensor<int4, [4, 1, 1, 4]> w4 = const()[name=string(\"w4\"), val=tensor<int4, [4, 1, 1, 4]>(BLOBFILE(path=string(\"@model_path/weights/w.bin\"), offset=uint64(64)))];\n"
+        "    tensor<fp16, [4, 1, 1, 4]> w = cast(x=w4, dtype=string(\"fp16\"))[name=string(\"w\")];\n";
+    const char* var_b =
+        "    tensor<uint8, [8]> qd = const()[name=string(\"qd\"), val=tensor<uint8, [8]>(BLOBFILE(path=string(\"@model_path/weights/w.bin\"), offset=uint64(64)))];\n"
+        "    tensor<fp16, [4, 1, 1, 4]> w = constexpr_affine_to_dense(quantized_data=qd, zero_point=fp16(0x0p+0), scale=fp16(0x1p+0), axis=-1)[name=string(\"w\")];\n";
+    const char* var_c =
+        "    tensor<uint8, [8]> qd = const()[name=string(\"qd\"), val=tensor<uint8, [8]>(BLOBFILE(path=string(\"@model_path/weights/w.bin\"), offset=uint64(64)))];\n"
+        "    tensor<fp16, [4, 1, 1, 4]> w = dequantize(weight=qd, scale=fp16(0x1p+0), bias=fp16(0x0p+0))[name=string(\"w\")];\n";
+
+    int rc = 1;
+    for (auto&& [tag, body] : {std::pair<const char*, const char*>{"A int4-tensor+cast", var_a},
+                               {"B constexpr_affine_to_dense", var_b},
+                               {"C dequantize", var_c}}) {
+        const std::string mil = make_variant(body);
+        ANEModel* model = ane_model_compile_mil(ane, mil.c_str(), names, data, sizes, 1, 0, 21);
+        if (!model) {
+            std::cout << "  variant " << tag << ": REJECTED by compiler\n";
+            continue;
+        }
+        IoSurface in(4*32*2), out(4*32*2);
+        surface_fill(in.get(), std::vector<uint16_t>(128, 0x3c00));
+        ANERequest* req = ane_request_create(ane, model, in.get(), out.get(), 0);
+        if (!req) { ane_model_release(model); continue; }
+        ane_request_evaluate(ane, model, req, nullptr, 0, nullptr, 0);
+        const auto got = surface_read(out.get(), 128);
+        // ones-input conv sums 4 consecutive decoded weights starting at lane l:
+        // lane0 sums w[0..3]. With low-first signed decode those are -8..-5 => -26.
+        float v0 = got.empty() ? 0.f : fp16_to_fp32(got[0]);
+        bool matches_low_first_signed = (v0 == -26.0f);
+        std::cout << "  variant " << tag << ": COMPILED, lane0 sum=" << v0
+                  << (matches_low_first_signed ? " => signed int4, LOW nibble first CONFIRMED"
+                                               : " => compiled but decode differs (investigate)") << "\n";
+        ane_request_release(req);
+        ane_model_release(model);
+        rc = 0;
+    }
+    if (rc) std::cout << "  => NEGATIVE RESULT: compiler accepts no probed int4 form;"
+                         " envelope 'INT4 packed' claim unverified.\n";
+    return 0; // probe: never fail the suite, just report
+}
+
 // ---------------------------------------------------------------------------
 
 int main(int argc, char** argv) {
@@ -407,6 +697,11 @@ int main(int argc, char** argv) {
         rc |= test_offset_probe(ane);
         rc |= test_depthwise(ane, 64, 32, 4, req_iters);
         rc |= test_depthwise(ane, 10240, 32, 4, req_iters);
+        rc |= test_realtime(ane, req_iters);
+        rc |= test_pipelined(ane, req_iters * 4);
+        rc |= test_fused_gated_conv(ane, 64, 32, 4, req_iters);
+        rc |= test_fused_gated_conv(ane, 10240, 32, 4, req_iters);
+        rc |= test_int4(ane);
     }
 
     ane_context_destroy(ane);
