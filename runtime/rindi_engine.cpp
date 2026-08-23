@@ -815,7 +815,7 @@ bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
                 }
             } else {
                 std::vector<uint16_t> gated;
-                {
+                if (std::getenv("RINDI_DEBUG_LG0")) {
                     unsigned long long hh=1469598103934665603ull;
                     for(auto x:normalized){hh^=x;hh*=1099511628211ull;}
                     fprintf(stderr,"[LG0] norm_hash=%llx keep=%zu",(unsigned long long)hh,lanes);
@@ -830,7 +830,7 @@ bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
                     for (size_t c=0;c<chz;++c){hz^=z[c*lanes+0];hz*=1099511628211ull;}
                     fprintf(stderr,"\n[CORE0-LG] lanes=%zu gated0=%llx z0=%llx",lanes,(unsigned long long)hg,(unsigned long long)hz);
                 }
-                {
+                if (std::getenv("RINDI_DEBUG_LG0")) {
                     std::vector<uint16_t> c2,r2;
                     gdn_layers_[layer]->snapshot_state(c2,r2);
                     unsigned long long h1=1469598103934665603ull,h2=1469598103934665603ull;
