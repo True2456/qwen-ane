@@ -29,11 +29,20 @@ OBJS = \
 TARGETS = \
 	$(RUNTIME_DIR)/libmetal_engine.dylib \
 	$(RUNTIME_DIR)/librindi_native.dylib \
-	$(RUNTIME_DIR)/rindi-server
+	$(RUNTIME_DIR)/rindi-server \
+	bin/ane-as
 
-.PHONY: all clean test-cpp-safetensors test-ane-bridge test-ane-projection test-ane-int4-projection test-gdn-state test-gdn-conv test-gdn-recurrence test-gdn-layer test-attention test-metal-attention test-mtp test-engine-sampling test-native-generate test-ane-multi-output test-ane-artifact-load
+.PHONY: all clean test-ane-as test-cpp-safetensors test-ane-bridge test-ane-projection test-ane-int4-projection test-gdn-state test-gdn-conv test-gdn-recurrence test-gdn-layer test-attention test-metal-attention test-mtp test-engine-sampling test-native-generate test-ane-multi-output test-ane-artifact-load
 
 all: $(TARGETS)
+
+bin/ane-as: tools/ane_as.cpp $(RUNTIME_DIR)/ane_c_bridge.o $(RUNTIME_DIR)/metal_engine.o
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) -I. $< $(RUNTIME_DIR)/ane_c_bridge.o $(RUNTIME_DIR)/metal_engine.o $(FRAMEWORKS) -o /tmp/rindi-ane-as
+	@cp /tmp/rindi-ane-as $@
+
+test-ane-as: bin/ane-as
+	/tmp/rindi-ane-as --iters 50
 
 test-cpp-safetensors: probes/test_cpp_safetensors.cpp runtime/safetensors_loader.h
 	$(CXX) $(CXXFLAGS) -I. $< -o /tmp/rindi-test-cpp-safetensors
