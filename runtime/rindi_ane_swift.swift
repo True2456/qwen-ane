@@ -125,6 +125,12 @@ public func rindi_ane_run(_ h: UnsafeMutableRawPointer,
                 for i in 0..<(min(inCount, 4096)) {
                     if src[i] != dstp[i] { bad += 1 }
                 }
+                if getenv("RINDI_SHIM_HASH") != nil {
+                    var hsh: UInt64 = 1469598103934665603
+                    let p = UnsafeRawPointer(xin).assumingMemoryBound(to: UInt8.self)
+                    for i in 0..<(inCount * 2) { hsh ^= UInt64(p[i]); hsh = hsh &* 1099511628211 }
+                    FileHandle.standardError.write(Data("[shim-in] count=\(inCount) fnv=\(hsh) x0=\(String(src[0], radix:16)) x1=\(String(src[1], radix:16))\n".utf8))
+                }
             }
             if bad > 0 { RindiErr.set("input writeback mismatch: \(bad)/4096") ; return -3 }
         } catch let e {

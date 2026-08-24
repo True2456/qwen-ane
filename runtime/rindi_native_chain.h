@@ -11,6 +11,7 @@
 #include <memory>
 #include <chrono>
 #include "ane_c_bridge.h"
+#include "rindi_ane_swift.h"
 #include "metal_engine.h"
 #include "rindi_ane_projection.h"
 #include "safetensors_loader.h"
@@ -105,6 +106,10 @@ private:
         size_t written_lanes{0};   // lanes currently valid in input_surface
         bool attention{false};
         std::unique_ptr<MetalTail> metal_tail;
+        // CoreAI backend (macOS 27): official-runtime bundle handle. When
+        // non-null, evaluate_tail_batch routes to the CoreAI path.
+        void* coreai_model{nullptr};
+        bool coreai_proj_queried{false};   // output-width discovery done
     };
     
     std::vector<LayerEntry> layers_;
@@ -130,6 +135,14 @@ private:
                                    size_t core_dim, const uint16_t* residual,
                                    size_t lanes, std::vector<uint16_t>& output,
                                    std::vector<uint16_t>* next_projection);
+    // Official CoreAI runtime backend (macOS 27). Loads exported INT4 tail
+    // bundles instead of hand-written MIL; layout conversion happens here.
+    bool evaluate_tail_batch_coreai(int layer_idx, const uint16_t* core,
+                                    size_t core_dim, const uint16_t* residual,
+                                    size_t lanes, std::vector<uint16_t>& output,
+                                    std::vector<uint16_t>* next_projection);
+    std::vector<uint16_t> coreai_xin_;      // token-major staging
+    std::vector<uint16_t> coreai_out_;      // concatenated outputs staging
 };
 
 #endif // RINDI_NATIVE_CHAIN_H

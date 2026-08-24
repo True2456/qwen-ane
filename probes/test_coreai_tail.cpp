@@ -10,7 +10,10 @@
 #include <chrono>
 #include <dlfcn.h>
 
+struct ANEContext;
 extern "C" {
+ANEContext* ane_context_create(void);
+void ane_context_destroy(ANEContext*);
 void* rindi_ane_load(const char* path, int preferANE);
 long  rindi_ane_run(void* h, const uint16_t* xin, long rows, long cols,
                     uint16_t* outs, long outCap);
@@ -62,6 +65,10 @@ int main(int argc, char** argv) {
     printf("[probe] input [%ld,%ld] out=%zu elems\n", ROWS, COLS, OUT_TOTAL);
 
     printf("[probe] bundle: %s  preferANE=%d\n", bundle.c_str(), preferANE);
+    if (getenv("RINDI_TEST_LEGACY_CTX")) {
+        ANEContext* ctx = ane_context_create();
+        printf("[probe] legacy ANEContext created: %p\n", (void*)ctx);
+    }
     void* h = rindi_ane_load(bundle.c_str(), preferANE);
     if (!h) {
         fprintf(stderr, "[probe] LOAD FAILED: %s\n", rindi_ane_last_error());
@@ -94,6 +101,7 @@ int main(int argc, char** argv) {
             scale_y2 = fmax(scale_y2, fabs(r));
         }
         double mrel_y = mabs_y / (scale_y + 1e-9);
+        {FILE* df=fopen("/tmp/out_tct.f16","wb");fwrite(out.data(),2,out.size(),df);fclose(df);}
         double mrel_y2 = mabs_y2 / (scale_y2 + 1e-9);
         max_rel = fmax(max_rel, fmax(mrel_y, mrel_y2));
         if (rep == 0) {

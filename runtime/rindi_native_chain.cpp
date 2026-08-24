@@ -362,6 +362,36 @@ static bool split_nibbles(const std::vector<uint8_t>& raw, size_t rows,
 bool RindiNativeChain::compile_layer(int layer_idx, const std::string& package_path,
                                      const SafeTensorsLoader& loader) {
     if (!ane_ctx_ || layer_idx < 0) return false;
+    // macOS 27 backend: load the exported CoreAI tail bundle instead of
+    // rebuilding legacy MIL (whose bundles no longer pass bundle verification).
+    if (std::getenv("RINDI_TAIL_COREAI")) {
+        const char* dir = std::getenv("RINDI_COREAI_BUNDLES");
+        std::string base = dir ? dir
+            : std::string(std::getenv("HOME") ? std::getenv("HOME") : ".")
+              + "/.rindi/aimodels";
+        char p[1024];
+        auto try_load = [&](const char* suffix) -> void* {
+            std::snprintf(p, sizeof(p),
+                          "%s/qwen38_27b_tail_L%d_%s_int4_g32_tm_s32.aimodel",
+                          base.c_str(), layer_idx, suffix);
+            void* h = rindi_ane_load(p, 1);
+            if (!h)
+                std::fprintf(stderr, "[CoreAI] %s: %s\n", p, rindi_ane_last_error());
+            else
+                std::fprintf(stderr, "[CoreAI] L%d loaded (%s)\n", layer_idx, suffix);
+            return h;
+        };
+        void* h = try_load("ip1");
+        if (!h) h = try_load("ip0");
+        if (!h) return false;
+        LayerEntry e;
+        e.coreai_model = h;
+        e.input_channels = hidden_dim_;      // refined on first eval below
+        e.projection_channels = 0;
+        layers_.resize(layer_idx + 1);
+        layers_[layer_idx] = std::move(e);
+        return true;
+    }
     const size_t H = hidden_dim_;
     const std::string layer = "layers." + std::to_string(layer_idx) + ".";
     const bool is_attention = loader.has_tensor(layer + "self_attn.o_proj.weight");
@@ -688,6 +718,80 @@ bool RindiNativeChain::evaluate_tail(int layer_idx, const uint16_t* core,
     return true;
 }
 
+bool RindiNativeChain::evaluate_tail_batch_coreai(int layer_idx, const uint16_t* core,
+                                                  size_t core_dim, const uint16_t* residual,
+                                                  size_t lanes, std::vector<uint16_t>& output,
+                                                  std::vector<uint16_t>* next_projection) {
+    auto& e = layers_[layer_idx];
+    const size_t C = core_dim;
+    const size_t H = hidden_dim_;
+    // Stage token-major input [lanes x (C+H)]: row s = core[:,s] ++ residual[:,s].
+    coreai_xin_.resize(lanes * (C + H));
+    for (size_t c = 0; c < C; ++c) {
+        const uint16_t* src = core + c * lanes;
+        for (size_t s = 0; s < lanes; ++s) coreai_xin_[s * (C + H) + c] = src[s];
+    }
+    for (size_t c = 0; c < H; ++c) {
+        const uint16_t* src = residual + c * lanes;
+        for (size_t s = 0; s < lanes; ++s) coreai_xin_[s * (C + H) + C + c] = src[s];
+    }
+    if (std::getenv("RINDI_DEBUG_COREAI_STAGING")) {
+        std::fprintf(stderr, "[CoreAI-staging] xin[0..3]=%04x %04x %04x %04x "
+                             "xin[C..C+3]=%04x %04x %04x %04x\n",
+                     coreai_xin_[0], coreai_xin_[1], coreai_xin_[2], coreai_xin_[3],
+                     coreai_xin_[C], coreai_xin_[C + 1], coreai_xin_[C + 2],
+                     coreai_xin_[C + 3]);
+    }
+
+    // Discover output width on first call: y [H] plus y2 [P] when folded.
+    if (e.projection_channels == 0 && e.coreai_proj_queried == false) {
+        long total = rindi_ane_run(e.coreai_model, coreai_xin_.data(),
+                                   (long)lanes, (long)(C + H), nullptr, 0);
+        if (total <= 0) {
+            std::fprintf(stderr, "[CoreAI] L%d query failed: %s\n",
+                         layer_idx, rindi_ane_last_error());
+            return false;
+        }
+        e.projection_channels = (size_t)total / lanes - H;   // P (0 if none)
+        e.coreai_proj_queried = true;
+        if (next_projection && e.projection_channels == 0) return false;
+    }
+
+    const size_t P = e.projection_channels;
+    coreai_out_.assign(lanes * (H + P), 0xBEEF);
+    long written = rindi_ane_run(e.coreai_model, coreai_xin_.data(),
+                                 (long)lanes, (long)(C + H),
+                                 coreai_out_.data(), (long)coreai_out_.size());
+    if (std::getenv("RINDI_DUMP_COREAI_OUT")) {
+        char pf[96]; std::snprintf(pf, sizeof(pf), "/tmp/coreai_out_L%d.bin", layer_idx);
+        FILE* df = fopen(pf, "wb");
+        if (df) { fwrite(coreai_out_.data(), 2, coreai_out_.size(), df); fclose(df); }
+    }
+    if (written < 0) {
+        std::fprintf(stderr, "[CoreAI] L%d run failed: %s\n",
+                     layer_idx, rindi_ane_last_error());
+        return false;
+    }
+
+    // De-interleave back to channel-major. The shim concatenates whole
+    // tensors: y block [lanes*H] first, then y2 block [lanes*P]; each block
+    // is row-major (token-major) [lane][channel].
+    output.resize(H * lanes);
+    for (size_t c = 0; c < H; ++c) {
+        uint16_t* dst = output.data() + c * lanes;
+        for (size_t s = 0; s < lanes; ++s) dst[s] = coreai_out_[s * H + c];
+    }
+    if (next_projection && P > 0) {
+        next_projection->resize(P * lanes);
+        const uint16_t* y2 = coreai_out_.data() + lanes * H;
+        for (size_t c = 0; c < P; ++c) {
+            uint16_t* dst = next_projection->data() + c * lanes;
+            for (size_t s = 0; s < lanes; ++s) dst[s] = y2[s * P + c];
+        }
+    }
+    return true;
+}
+
 bool RindiNativeChain::evaluate_tail_batch(int layer_idx, const uint16_t* core,
                                            size_t core_dim, const uint16_t* residual,
                                            size_t lanes,
@@ -696,6 +800,9 @@ bool RindiNativeChain::evaluate_tail_batch(int layer_idx, const uint16_t* core,
     if (layer_idx < 0 || layer_idx >= static_cast<int>(layers_.size()) ||
         !core || !residual || lanes == 0 || lanes > seq_len_) return false;
     auto& e = layers_[layer_idx];
+    if (e.coreai_model)
+        return evaluate_tail_batch_coreai(layer_idx, core, core_dim, residual,
+                                          lanes, output, next_projection);
     if (!e.model || !e.req_a_to_b || e.input_channels != core_dim + hidden_dim_) return false;
 
     const bool compare_metal_tail = std::getenv("RINDI_COMPARE_METAL_TAIL") != nullptr;

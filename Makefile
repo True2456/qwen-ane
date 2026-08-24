@@ -164,11 +164,11 @@ $(RUNTIME_DIR)/rindi_server.o: $(RUNTIME_DIR)/rindi_server.cpp $(RUNTIME_DIR)/ri
 $(RUNTIME_DIR)/libmetal_engine.dylib: $(RUNTIME_DIR)/metal_engine.o
 	$(CC) -dynamiclib -O3 $^ $(FRAMEWORKS) -o $@
 
-$(RUNTIME_DIR)/librindi_native.dylib: $(RUNTIME_DIR)/ane_c_bridge.o $(RUNTIME_DIR)/metal_engine.o $(RUNTIME_DIR)/rindi_native_chain.o $(RUNTIME_DIR)/rindi_ane_projection.o $(RUNTIME_DIR)/rindi_gdn_state.o $(RUNTIME_DIR)/rindi_gdn_layer.o $(RUNTIME_DIR)/rindi_gdn_conv.o $(RUNTIME_DIR)/rindi_gdn_recurrence.o $(RUNTIME_DIR)/rindi_attention.o $(RUNTIME_DIR)/rindi_mtp.o $(RUNTIME_DIR)/bpe_tokenizer.o $(RUNTIME_DIR)/rindi_engine.o $(RUNTIME_DIR)/rindi_c_api.o
-	$(CXX) -dynamiclib -O3 $^ $(FRAMEWORKS) -o $@
+$(RUNTIME_DIR)/librindi_native.dylib: $(RUNTIME_DIR)/ane_c_bridge.o $(RUNTIME_DIR)/metal_engine.o $(RUNTIME_DIR)/rindi_native_chain.o $(RUNTIME_DIR)/rindi_ane_projection.o $(RUNTIME_DIR)/rindi_gdn_state.o $(RUNTIME_DIR)/rindi_gdn_layer.o $(RUNTIME_DIR)/rindi_gdn_conv.o $(RUNTIME_DIR)/rindi_gdn_recurrence.o $(RUNTIME_DIR)/rindi_attention.o $(RUNTIME_DIR)/rindi_mtp.o $(RUNTIME_DIR)/bpe_tokenizer.o $(RUNTIME_DIR)/rindi_engine.o $(RUNTIME_DIR)/rindi_c_api.o runtime/librindi_ane_swift.dylib
+	$(CXX) -dynamiclib -O3 $^ $(FRAMEWORKS) -Lruntime -lrindi_ane_swift -o $@
 
-$(RUNTIME_DIR)/rindi-server: $(OBJS) $(RUNTIME_DIR)/rindi_server.o
-	$(CXX) -O3 $^ $(FRAMEWORKS) -o $@
+$(RUNTIME_DIR)/rindi-server: $(OBJS) $(RUNTIME_DIR)/rindi_server.o runtime/librindi_ane_swift.dylib
+	$(CXX) -O3 $^ $(FRAMEWORKS) -Lruntime -lrindi_ane_swift -o $@
 
 clean:
 	rm -f $(RUNTIME_DIR)/*.o $(TARGETS)
