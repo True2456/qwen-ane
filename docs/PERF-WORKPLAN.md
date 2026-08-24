@@ -743,3 +743,46 @@ NEXT STEPS:
 3. Decision gate: if CoreAI ANE throughput >= our numbers with int4 weights,
    migrate prefill (then eval full-inference) onto CoreAI; keep rindi
    scheduler/MTP/APC on top.
+
+## P17 - SME2 DIRECT COMPUTE (game-changer, measured live on this machine)
+joshmorgan1000/ane: bare-metal ARM SME2 bytecode interpreter in C++/asm.
+127 opcodes incl dense_fp32/dense_fused_i8, rms_norm, silu, rope, softmax,
+causal_mask, elementwise - most of our layer graph natively.
+
+CONCURRENT THROUGHPUT MATRIX (this M5 Max, macOS 27 beta, int8):
+| config                    | TOPS |
+|---------------------------|------|
+| GPU alone (Metal int8)    | 40.3 |
+| SME alone                 | 6.4  |
+| **GPU + SME**             | **46.8** <- zero mutual interference |
+| GPU + SME + CBLAS         | 45.4 |
+| BNNS alone                | 3.1  (SME is 2x Apple's own path) |
+
+KEY FACTS:
+- SME2 fully present on M5 Max (FEAT_SME2p1, I8I32/F16F32/B16F32).
+- GPU and SME are INDEPENDENT silicon - combined throughput adds.
+- SME beats BNNS 2x; BNNS drags GPU down when paired (-4.5), SME does not.
+- Library builds clean here; 30/31 + 26/27 + 37/37 op tests pass.
+- M5 note: SMLALL path ~5.3x faster than SMOPA (under investigation upstream).
+- Interpreter already ships rope/softmax/rms/silu/gelu/causal_mask.
+
+WHY THIS REFRAMES EVERYTHING: our 27-era blockers (verifyBundleAtPath,
+poisoned specializations, int4 rejection) are all artifacts of the BUNDLE
+verification boundary. SME2 needs none of it: plain aligned pointers,
+int8 weights stay int8 through compute, native C++ integration into
+rindi_engine directly. GPU+SME concurrent scheduling gives two independent
+compute engines for prefill.
+
+PROJECTED PREFILL MATH (S=512 chunks):
+- tail FLOPs/pass ~= 316 GFLOP x 64 layers = 20.2 TFLOP
+- GPU(40)+SME(6) split at even 50% efficiency -> ~0.8-1.6 s/chunk
+- => compute ceiling far above memory wall; prefill bound by weight
+  streaming (~39GB fp16 or ~20GB int8 per pass @ ~800GB/s ~= 25-50ms... 
+  actually per-pass weight streaming is the REAL floor to model carefully).
+
+NEXT STEPS:
+1. Benchmark dense_fused_i8 at production shapes via working CMake target.
+2. Split prefill matmuls GPU/SME; measure combined vs GPU-only.
+3. Add conv1d/recurrence bytecodes for GDN fusion (or keep those stages).
+4. Decode: test SME int8 GEMV vs Metal int4 GEMV (same DRAM wall, but
+   frees GPU for KV/attention overlap).
