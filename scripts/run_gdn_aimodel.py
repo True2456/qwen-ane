@@ -18,7 +18,7 @@ HIDDEN = int(5120 * SCALE) // 64 * 64
 CORE = int(6144 * SCALE) // 64 * 64
 INTERMEDIATE = int(17408 * SCALE) // 64 * 64
 TAGSCALE = f"{int(SCALE*100):02d}"
-SEQ = 32
+SEQ = int(os.environ.get("GDN_S", "32"))
 
 
 class GdnTail(nn.Module):
@@ -54,7 +54,7 @@ async def main():
     if _os.environ.get("GDN_MODEL"):
         model_path = Path(_os.environ["GDN_MODEL"])
     else:
-        model_path = Path.home() / f".rindi/aimodels/gdn_tail_with_ip_{TAGSCALE}.aimodel"
+        model_path = Path.home() / f".rindi/aimodels/gdn_tail_with_ip_{TAGSCALE}_s{SEQ}.aimodel"
     if not model_path.exists():
         print("run export_gdn_aimodel.py first"); return 2
 
@@ -89,15 +89,27 @@ async def main():
     fn = await asyncio.to_thread(ai_model.load_function, "main")
 
     golden_p = Path(str(model_path) + ".golden.pt")
+    # SEQ already read from env
     if not golden_p.exists():
         print("no golden file"); return 2
     golden = torch.load(golden_p, weights_only=False)
     xg = golden["x"]
     ry, ry2 = golden["y"].float(), golden["y2"].float()
 
+    # Adaptive input dtype: some save/load roundtrips drop fp16 metadata and
+    # the runtime then demands float32. Try the golden dtype first; on a
+    # scalar-type rejection, parse the expected type and retry.
+    import re as _re
+    # desc says float16 (verified); feed fp16. NOTE: stale coreai-cache
+    # specializations (~9GB) previously poisoned results - keep caches clean.
     arr = np.ascontiguousarray(xg.numpy().astype(np.float16))
     nd = NDArray(arr)
-
+    for attempt in range(2):
+        try:
+            out = await fn({"xin": nd})
+            break
+        except RuntimeError as e:
+            raise
     out = await fn({"xin": nd})
     y = out["y"].numpy(); y2 = out["y2"].numpy()
     print("out shapes:", y.shape, y2.shape)

@@ -24,7 +24,7 @@ SCALE = float(os.environ.get("GDN_SCALE", "1.0"))
 HIDDEN = int(5120 * SCALE) // 64 * 64
 CORE = int(6144 * SCALE) // 64 * 64          # GDN out_proj input width (heads * v_dim)
 INTERMEDIATE = int(17408 * SCALE) // 64 * 64 # MLP intermediate (gate/up = 2x)
-SEQ = 32             # prefill chunk width (29 live lanes padded)
+SEQ = int(os.environ.get("GDN_S", "32"))             # prefill chunk width (29 live lanes padded)
 OUT_DIR = Path.home() / ".rindi/aimodels"
 TAGSCALE = f"{int(SCALE*100)}"
 
@@ -90,9 +90,30 @@ def main():
         )
         program.optimize()
 
-        out = OUT_DIR / f"gdn_tail_{tag}_{TAGSCALE}.aimodel"
+        out = OUT_DIR / f"gdn_tail_{tag}_{TAGSCALE}_s{SEQ}.aimodel"
+
+        import numpy as np_
+        import asyncio
+
         program.save_asset(out)
         torch.save(model.state_dict(), str(out) + ".state.pt")
+        if os.environ.get("RINDI_EXPORT_VERIFY"):
+            with torch.no_grad():
+                refs = model(xin)
+            refs = refs if isinstance(refs, tuple) else (refs,)
+            names = ["y", "y2"] if len(refs) > 1 else ["y"]
+            np_ = np
+            async def _verify_disk():
+                from coreai.runtime import AIModel as _AM, SpecializationOptions as _SO, NDArray as _ND
+                mm = await _AM.load(str(out), specialization_options=_SO.cpu_only())
+                fn = mm.load_function("main")
+                outv = await fn({"xin": _ND(xin.numpy())})
+                for nm, r, o in zip(names, refs, [outv[n] for n in names]):
+                    g = np_.asarray(o.numpy(), dtype=np.float32)
+                    rr = r.float().numpy()
+                    print(f"  VERIFY-disk   {nm}: rel="
+                          f"{np_.abs(g - rr).max() / (np_.abs(rr).max() + 1e-9):.4f}")
+            asyncio.run(_verify_disk())
         # golden test vector: input + exact PyTorch outputs for THIS artifact
         with torch.no_grad():
             outs = model(xin)
