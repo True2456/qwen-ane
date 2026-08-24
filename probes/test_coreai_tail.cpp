@@ -51,10 +51,15 @@ int main(int argc, char** argv) {
         std::string(home) + "/.rindi/aimodels/gdn_tail_with_ip_100_s32.aimodel";
     int preferANE = argc > 2 ? atoi(argv[2]) : 1;
 
-    auto x  = load_f16("/tmp/golden_x.f16");
-    auto yr = load_f16("/tmp/golden_y.f16");
-    auto y2r= load_f16("/tmp/golden_y2.f16");
+    // shape args: rows cols [default old channel-major golden]
+    long ROWS = argc > 3 ? atol(argv[3]) : 11264;
+    long COLS = argc > 4 ? atol(argv[4]) : 32;
+    std::string base = argc > 5 ? argv[5] : "/tmp/golden";
+    auto x  = load_f16((base + "_x.f16").c_str());
+    auto yr = load_f16((base + "_y.f16").c_str());
+    auto y2r= load_f16((base + "_y2.f16").c_str());
     const size_t OUT_TOTAL = yr.size() + y2r.size();
+    printf("[probe] input [%ld,%ld] out=%zu elems\n", ROWS, COLS, OUT_TOTAL);
 
     printf("[probe] bundle: %s  preferANE=%d\n", bundle.c_str(), preferANE);
     void* h = rindi_ane_load(bundle.c_str(), preferANE);
@@ -65,7 +70,7 @@ int main(int argc, char** argv) {
     printf("[probe] loaded OK\n");
 
     // dry run to learn output count
-    long written = rindi_ane_run(h, x.data(), 11264, 32, nullptr, 0);
+    long written = rindi_ane_run(h, x.data(), ROWS, COLS, nullptr, 0);
     if (written != (long)OUT_TOTAL) {
         fprintf(stderr, "[probe] output count mismatch: got %ld want %zu\n",
                 written, OUT_TOTAL);
@@ -75,7 +80,7 @@ int main(int argc, char** argv) {
     // correctness: 5 runs, all must match golden
     double max_rel = 0.0;
     for (int rep = 0; rep < 5; ++rep) {
-        long n = rindi_ane_run(h, x.data(), 11264, 32, out.data(), (long)out.size());
+        long n = rindi_ane_run(h, x.data(), ROWS, COLS, out.data(), (long)out.size());
         if (n < 0) { fprintf(stderr, "[probe] RUN FAILED: %s\n", rindi_ane_last_error()); return 2; }
         double mabs_y = 0, mabs_y2 = 0, scale_y = 0, scale_y2 = 0;
         for (size_t i = 0; i < yr.size(); ++i) {
@@ -107,11 +112,11 @@ int main(int argc, char** argv) {
 
     // benchmark
     using clk = std::chrono::steady_clock;
-    for (int w = 0; w < 20; ++w) rindi_ane_run(h, x.data(), 11264, 32, out.data(), (long)out.size());
+    for (int w = 0; w < 20; ++w) rindi_ane_run(h, x.data(), ROWS, COLS, out.data(), (long)out.size());
     const int N = 300;
     auto t0 = clk::now();
     for (int i = 0; i < N; ++i)
-        rindi_ane_run(h, x.data(), 11264, 32, out.data(), (long)out.size());
+        rindi_ane_run(h, x.data(), ROWS, COLS, out.data(), (long)out.size());
     double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count() / N;
     // tail GEMM flops per chunk (S=32): out_proj + gate/up + down + ip_proj
     double flops = 2.0 * (6144 * 5120 + 5120 * 2 * 17408 + 17408 * 5120 + 5120 * 2048) * 32;

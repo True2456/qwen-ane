@@ -78,7 +78,10 @@ public func rindi_ane_load(_ path: UnsafePointer<CChar>, _ preferANE: Int32) -> 
             let url = URL(fileURLWithPath: String(cString: p.assumingMemoryBound(to: CChar.self)))
             let kind: ComputeUnitKind = preferANE != 0 ? .neuralEngine : .cpu
             let opts = SpecializationOptions(preferredComputeUnitKind: kind)
-            let model = try await AIModel(contentsOf: url, options: opts)
+            // Persistent on-disk cache: JIT ANE specialization happens once per
+            // bundle, subsequent loads mmap the cached compiled unit.
+            let model = try await AIModel.specialize(contentsOf: url,
+                options: opts, cache: .default, cachePolicy: .persistent)
             guard let f = try await model.loadFunction(named: "main") else {
                 throw NSError(domain: "rindi", code: 1,
                     userInfo: [NSLocalizedDescriptionKey:
