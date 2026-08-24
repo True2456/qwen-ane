@@ -797,3 +797,28 @@ NEXT STEPS:
 3. Add conv1d/recurrence bytecodes for GDN fusion (or keep those stages).
 4. Decode: test SME int8 GEMV vs Metal int4 GEMV (same DRAM wall, but
    frees GPU for KV/attention overlap).
+
+## P18 - MISSION REFOCUS: ANE-first (SME2/GPU are enhancements, not the goal)
+STRATEGIC CORRECTION: rindi's reason to exist is NATIVE ANE INFERENCE -
+MLX already covers GPU; llama.cpp covers CPU. SME2/GPU/SME threads are
+enhancements layered on top of a working ANE engine, never replacements.
+
+CURRENT STATE:
+- macOS 26.4: production-ready (prefill 54-71 tok/s, decode 4.27,
+  MTP_EXACT PASS, APC). Keep as release config.
+- macOS 27 beta 5: single blocker class identified -
+  (a) bundles w/ weight blobs fail verifyBundleAtPath (Exclave verifier)
+  (b) full-size official-serializer artifacts diverge post-reload (rel~2)
+      while in-process + sub-0.25-scale pass everywhere => bisectable bug.
+
+P18 PLAN (ANE-first on 27):
+1. Prefix-stage disk-load bisection at full dims: export out_proj ->
+   +norm -> +swiglu -> ... as separate .aimodels, find FIRST op whose
+   reloaded output diverges. Use CoreAI Debugger app tensor tracing.
+2. Reformulate the culprit op in PyTorch (equivalent math) and retest.
+3. Try bf16 export variant.
+4. Feedback Assistant report w/ minimal repro (0.25-scale FAILS while
+   0.125 passes - strong repro material).
+5. Ship gate: full-size correct on ANE -> port P14 K-chunk structure ->
+   race vs 26.4 baseline -> migrate server when >=1.5x.
+FALLBACK: 26.4 remains shippable; nothing lost.
