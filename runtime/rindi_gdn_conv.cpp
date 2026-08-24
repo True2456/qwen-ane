@@ -30,7 +30,7 @@ bool RindiGdnConv::compile(ANEContext* ctx, const SafeTensorsLoader& loader,
     std::vector<uint16_t> weights;
     if (!loader.get_tensor_fp16(weight_name, weights) || weights.size() != channels_ * 4) return false;
     const std::string mil = "program(1.3)\n" + std::string(kBuildInfo) + "\n{\n"
-        "  func main<ios18>(tensor<fp16, [1, " + std::to_string(channels_) + ", 1, " + std::to_string(width_) + "]> x) {\n"
+        "  func main<ios26>(tensor<fp16, [1, " + std::to_string(channels_) + ", 1, " + std::to_string(width_) + "]> x) {\n"
         "    tensor<fp16, [" + std::to_string(channels_) + ", 1, 1, 4]> w = const()[name=string(\"w\"), val=tensor<fp16, [" + std::to_string(channels_) + ", 1, 1, 4]>(BLOBFILE(path=string(\"@model_path/weights/conv.bin\"), offset=uint64(64)))];\n"
         "    tensor<int32, [2]> st = const()[name=string(\"st\"), val=tensor<int32, [2]>([1,1])];\n"
         "    tensor<int32, [2]> dl = const()[name=string(\"dl\"), val=tensor<int32, [2]>([1,1])];\n"

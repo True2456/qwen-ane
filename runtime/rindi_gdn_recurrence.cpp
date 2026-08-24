@@ -55,7 +55,7 @@ bool RindiGdnRecurrence::compile_prepared(ANEContext* ctx, size_t heads,
     const void* data[] = {sum.data(), repeat.data()};
     const size_t sizes[] = {sum.size() * 2, repeat.size() * 2};
     std::string mil = "program(1.3)\n" + std::string(kBuildInfo) +
-        "\n{\n  func main<ios18>(tensor<fp16, [1, " +
+        "\n{\n  func main<ios26>(tensor<fp16, [1, " +
         std::to_string(input_channels_) + ", 1, " + std::to_string(width_) +
         "]> x) {\n";
     mil += "    string pt = const()[name=string(\"pt\"), val=string(\"valid\")];\n";
@@ -137,7 +137,7 @@ bool RindiGdnRecurrence::compile(ANEContext* ctx, size_t heads, size_t key_dim,
 
     // Prepared-input recurrence: state, decay, key, query, values, beta.
     const size_t H=heads_, D=key_dim_, V=value_dim_, HK=hidden_keys_, W=width_;
-    std::string mil = "program(1.3)\n" + std::string(kBuildInfo) + "\n{\n  func main<ios18>(tensor<fp16, [1, " + std::to_string(input_channels_) + ", 1, " + std::to_string(W) + "]> x) {\n";
+    std::string mil = "program(1.3)\n" + std::string(kBuildInfo) + "\n{\n  func main<ios26>(tensor<fp16, [1, " + std::to_string(input_channels_) + ", 1, " + std::to_string(W) + "]> x) {\n";
     mil += "    string pt = const()[name=string(\"pt\"), val=string(\"valid\")];\n";
     mil += "    tensor<int32, [2]> st = const()[name=string(\"st\"), val=tensor<int32, [2]>([1,1])];\n";
     mil += "    tensor<int32, [4]> pd = const()[name=string(\"pd\"), val=tensor<int32, [4]>([0,0,0,0])];\n";

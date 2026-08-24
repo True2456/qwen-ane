@@ -19,7 +19,7 @@ constexpr const char* kBuildInfo =
 std::string make_mil(size_t input_dim, size_t output_dim, size_t width,
                      const std::string& tag) {
     return "program(1.3)\n" + std::string(kBuildInfo) + "\n{\n"
-        "  func main<ios18>(tensor<fp16, [1, " + std::to_string(input_dim) +
+        "  func main<ios26>(tensor<fp16, [1, " + std::to_string(input_dim) +
         ", 1, " + std::to_string(width) + "]> x) {\n"
         "    string pt = const()[name=string(\"pt\"), val=string(\"valid\")];\n"
         "    tensor<int32, [2]> st = const()[name=string(\"st\"), val=tensor<int32, [2]>([1,1])];\n"
@@ -38,7 +38,7 @@ std::string make_mil(size_t input_dim, size_t output_dim, size_t width,
 std::string make_int4_mil(size_t input_dim, size_t output_dim, size_t width,
                           const std::string& tag) {
     return "program(1.3)\n" + std::string(kBuildInfo) + "\n{\n"
-        "  func main<ios18>(tensor<fp16, [1, " + std::to_string(input_dim) +
+        "  func main<ios26>(tensor<fp16, [1, " + std::to_string(input_dim) +
         ", 1, " + std::to_string(width) + "]> x) {\n"
         "    string pt = const()[name=string(\"pt\"), val=string(\"valid\")];\n"
         "    tensor<int32, [2]> st = const()[name=string(\"st\"), val=tensor<int32, [2]>([1,1])];\n"
