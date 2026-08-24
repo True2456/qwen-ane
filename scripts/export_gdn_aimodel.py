@@ -19,11 +19,14 @@ import numpy as np
 import torch
 from torch import nn
 
-HIDDEN = 5120
-CORE = 6144          # GDN out_proj input width (heads * v_dim)
-INTERMEDIATE = 17408 # MLP intermediate (gate/up = 2x)
+import os
+SCALE = float(os.environ.get("GDN_SCALE", "1.0"))
+HIDDEN = int(5120 * SCALE) // 64 * 64
+CORE = int(6144 * SCALE) // 64 * 64          # GDN out_proj input width (heads * v_dim)
+INTERMEDIATE = int(17408 * SCALE) // 64 * 64 # MLP intermediate (gate/up = 2x)
 SEQ = 32             # prefill chunk width (29 live lanes padded)
 OUT_DIR = Path.home() / ".rindi/aimodels"
+TAGSCALE = f"{int(SCALE*100)}"
 
 
 class GdnTail(nn.Module):
@@ -69,8 +72,8 @@ def main():
 
     for has_next in (True, False):
         tag = "with_ip" if has_next else "final"
-        model = GdnTail(has_next).eval()
-        xin = torch.randn(CORE + HIDDEN, SEQ)
+        model = GdnTail(has_next).eval().half()
+        xin = torch.randn(CORE + HIDDEN, SEQ).half()
 
         exported = torch.export.export(model, args=(xin,))
         exported = exported.run_decompositions(get_decomp_table())
@@ -87,8 +90,14 @@ def main():
         )
         program.optimize()
 
-        out = OUT_DIR / f"gdn_tail_{tag}.aimodel"
+        out = OUT_DIR / f"gdn_tail_{tag}_{TAGSCALE}.aimodel"
         program.save_asset(out)
+        torch.save(model.state_dict(), str(out) + ".state.pt")
+        # golden test vector: input + exact PyTorch outputs for THIS artifact
+        with torch.no_grad():
+            outs = model(xin)
+        golden = {"x": xin} | {n: o for n, o in zip(out_names, outs)}
+        torch.save(golden, str(out) + ".golden.pt")
         size_mb = sum(f.stat().st_size for f in out.rglob("*") if f.is_file()) / 1e6
         print(f"saved {out} ({size_mb:.1f} MB, fp16)")
 
