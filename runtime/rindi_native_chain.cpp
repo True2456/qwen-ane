@@ -188,7 +188,7 @@ std::string build_tail_mil(size_t hidden, size_t core, size_t intermediate,
     const size_t input_core = core;
     std::ostringstream s;
     s << "program(1.3)\n" << kBuildInfo << "\n{\n"
-      << "  func main<ios18>(tensor<fp16, [1, " << (input_core + hidden)
+      << "  func main<ios26>(tensor<fp16, [1, " << (input_core + hidden)
       << ", 1, " << seq << "]> xin) {\n"
       << "    string pt = const()[name=string(\"pt\"), val=string(\"valid\")];\n"
       << "    tensor<int32, [2]> st = const()[name=string(\"st\"), val=tensor<int32, [2]>([1,1])];\n"

@@ -95,6 +95,19 @@ ANERequest* ane_request_create(
 );
 
 /**
+ * Create an evaluation request binding N input IOSurfaces (arg order maps
+ * to the MIL function's parameter order).
+ */
+ANERequest* ane_request_create_nin(
+    ANEContext* ctx,
+    ANEModel* model,
+    IOSurfaceRef* input_surfaces,
+    size_t input_count,
+    IOSurfaceRef output_surface,
+    int procedure_index
+);
+
+/**
  * Create an evaluation request binding TWO input IOSurfaces (arg order maps
  * to the MIL function's first two parameters) and one output.
  */

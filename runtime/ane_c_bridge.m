@@ -63,6 +63,48 @@ static size_t ane_parse_output_channels(id model, size_t* channels, size_t capac
     return count;
 }
 
+// ---------------------------------------------------------------------------
+// macOS 27 compatibility: _ANEInMemoryModel lacks selectors that _ANEClient
+// expects (present on _ANEModel but stripped from the in-memory variant).
+// Add them back via category so existing code paths don't crash.
+// ---------------------------------------------------------------------------
+// Runtime shim: add missing selectors to _ANEInMemoryModel at load time so
+// that _ANEClient's internal code paths (which call getUUID, numInputs etc.)
+// don't crash with unrecognized-selector exceptions.
+static void ane_install_compat_shims(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class cls = NSClassFromString(@"_ANEInMemoryModel");
+        if (!cls) return;
+        // getUUID: forward to string_id or hexStringIdentifier
+        if (![cls instancesRespondToSelector:@selector(getUUID)]) {
+            IMP getUUID = imp_implementationWithBlock(^(id self) {
+                id sid = nil;
+                if ([self respondsToSelector:@selector(string_id)])
+                    sid = [self string_id];
+                if (!sid && [self respondsToSelector:@selector(hexStringIdentifier)])
+                    sid = [self hexStringIdentifier];
+                return sid ?: @"rindi-compat";
+            });
+            class_addMethod(cls, @selector(getUUID), getUUID, "@@:");
+        }
+        if (![cls instancesRespondToSelector:@selector(numInputs)]) {
+            IMP numIn = imp_implementationWithBlock(^(id self) {
+                return (NSUInteger)1;
+            });
+            class_addMethod(cls, @selector(numInputs), numIn, "Q@:");
+        }
+        if (![cls instancesRespondToSelector:@selector(numOutputs)]) {
+            IMP numOut = imp_implementationWithBlock(^(id self) {
+                return (NSUInteger)1;
+            });
+            class_addMethod(cls, @selector(numOutputs), numOut, "Q@:");
+        }
+    });
+}
+// Call shims early
+__attribute__((constructor)) static void ane_compat_init(void) { }
+
 static NSData* ane_make_blob(const void* data, size_t size) {
     NSMutableData* blob = [NSMutableData dataWithLength:128 + size];
     uint8_t* bytes = (uint8_t*)[blob mutableBytes];
@@ -223,6 +265,18 @@ static ANEModel* ane_compile_mil_common(
                     [NSString stringWithFormat:@"@model_path/weights/%s", weight_names[i]]][@"data"];
                 [blob writeToFile:path atomically:YES];
             }
+
+            // macOS 27: write to a persistent non-temp path so the ANE
+            // daemon can read without sandbox extension tokens.
+            NSString* home = NSHomeDirectory();
+            NSString* rindi_dir = [home stringByAppendingPathComponent:@".rindi/ane_models"];
+            [[NSFileManager defaultManager] createDirectoryAtPath:rindi_dir
+                withIntermediateDirectories:YES attributes:nil error:nil];
+            NSString* dest = [rindi_dir stringByAppendingPathComponent:[local lastPathComponent]];
+            [[NSFileManager defaultManager] removeItemAtPath:dest error:nil];
+            [[NSFileManager defaultManager] copyItemAtPath:local toPath:dest error:nil];
+            NSLog(@"[ANE Bridge] Model bundle copied to %@", dest);
+
             NSError* error = nil;
             BOOL compiled = ane_call_bool(model, @selector(compileWithQoS:options:error:),
                                           qos > 0 ? qos : 21, options, &error);
@@ -282,6 +336,7 @@ static id ane_wrap_iosurface(ANEContext* ctx, IOSurfaceRef surface) {
 }
 
 ANEContext* ane_context_create(void) {
+    ane_install_compat_shims();
     @autoreleasepool {
         void* handle = dlopen("/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine", RTLD_NOW);
         if (!handle) {
@@ -479,6 +534,44 @@ ANERequest* ane_request_create_2in(
     }
 }
 
+ANERequest* ane_request_create_nin(
+    ANEContext* ctx,
+    ANEModel* model,
+    IOSurfaceRef* input_surfaces,
+    size_t input_count,
+    IOSurfaceRef output_surface,
+    int procedure_index
+) {
+    if (!ctx || !model || !input_surfaces || input_count == 0 || !output_surface) return NULL;
+    @autoreleasepool {
+        NSMutableArray* inputs = [NSMutableArray arrayWithCapacity:input_count];
+        NSMutableArray* inputIndices = [NSMutableArray arrayWithCapacity:input_count];
+        for (size_t i = 0; i < input_count; ++i) {
+            if (!input_surfaces[i]) return NULL;
+            id obj = ane_wrap_iosurface(ctx, input_surfaces[i]);
+            if (!obj) return NULL;
+            [inputs addObject:obj];
+            [inputIndices addObject:[NSNumber numberWithUnsignedLong:i]];
+        }
+        id outObj = ane_wrap_iosurface(ctx, output_surface);
+        if (!outObj) return NULL;
+        NSArray* outputs = @[outObj];
+        NSArray* outputIndices = @[@0];
+        id rawReq = [ctx->aneRequestClass alloc];
+        SEL initSel = @selector(initWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:sharedEvents:transactionHandle:);
+        if (![rawReq respondsToSelector:initSel]) return NULL;
+        typedef id (*InitFn)(id, SEL, NSArray*, NSArray*, NSArray*, NSArray*, id, id, NSNumber*, id, id);
+        InitFn init = (InitFn)[rawReq methodForSelector:initSel];
+        id request = init(rawReq, initSel, inputs, inputIndices, outputs, outputIndices,
+                          nil, nil, [NSNumber numberWithInt:procedure_index], nil, nil);
+        if (!request) return NULL;
+        ANERequest* r = (ANERequest*)calloc(1, sizeof(ANERequest));
+        r->rawRequest = request;
+        r->procedureIndex = procedure_index;
+        return r;
+    }
+}
+
 bool ane_request_evaluate_realtime(
     ANEContext* ctx,
     ANEModel* model,
@@ -556,10 +649,17 @@ bool ane_request_evaluate(
         id target = model->loadedModel ? model->loadedModel : ctx->aneClient;
         if (!target) return false;
 
-        // Match the working Python driver: evaluate the loaded in-memory
-        // model directly.  The client-level direct-evaluate selectors can
-        // return before the output IOSurface has been committed, which is
-        // especially visible for causal convolution windows reused at decode.
+        // macOS 27 flow: mapIOSurfaces binds input/output IOSurfaces to the
+        // program's memory layout, then evaluateWithQoS runs inference.
+        SEL mapSel = @selector(mapIOSurfacesWithRequest:cacheInference:error:);
+        if ([target respondsToSelector:mapSel]) {
+            typedef BOOL (*MapFn)(id, SEL, id, BOOL, NSError**);
+            MapFn mapFn = (MapFn)[target methodForSelector:mapSel];
+            NSError* mapErr = nil;
+            BOOL mapped = mapFn(target, mapSel, req->rawRequest, NO, &mapErr);
+            if (!mapped) NSLog(@"[ANE Bridge] mapIOSurfaces failed: %@", mapErr ? [mapErr description] : @"nil");
+        }
+
         SEL modelEvalSel = @selector(evaluateWithQoS:options:request:error:);
         if ([target respondsToSelector:modelEvalSel]) {
             typedef BOOL (*EvalFn)(id, SEL, NSInteger, NSDictionary*, id, NSError**);
@@ -567,9 +667,7 @@ bool ane_request_evaluate(
             NSError* err = nil;
             BOOL ok = evalMethod(target, modelEvalSel, 21, @{}, req->rawRequest, &err);
             if (!ok) NSLog(@"[ANE Bridge] In-memory evaluate returned false: %@", err ? [err description] : @"no error");
-            if (ok && !err) return YES;   // success uses in-memory path
-            // else fall through to direct-client failover below (needed for
-            // width>32 programs that compile but don't evaluate in-memory).
+            if (ok && !err) return YES;
         }
 
         // Directly loaded cache packages are owned by _ANEClient rather than
@@ -588,7 +686,7 @@ bool ane_request_evaluate(
                                 model->loadedModel ? model->loadedModel : model->rawModel,
                                 @{}, req->rawRequest, 21, &err);
             } @catch (NSException* ex) {
-                NSLog(@"[ANE Bridge] Direct evaluate threw: %@", ex);
+                NSLog(@"[ANE Bridge] Direct evaluate threw: %@", ex.reason ?: @"unknown");
                 return NO;
             }
             if (!ok) NSLog(@"[ANE Bridge] Direct evaluate returned false: %@", err ? [err description] : @"no error");
