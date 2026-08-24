@@ -79,10 +79,15 @@ async def main():
     import os as _os
     spec = None
     _cu = _os.environ.get("GDN_CU", "ane").lower()
+    spec = None
     if _cu == "gpu":
-        spec = SpecializationOptions.from_preferred_compute_unit_kind(ComputeUnitKind.gpu)
+        spec = SpecializationOptions.from_preferred_compute_unit_kind(
+            [k for k in ComputeUnitKind.available_kinds() if str(k) == "GPU"][0])
     elif _cu == "cpu":
         spec = SpecializationOptions.cpu_only()
+    else:
+        spec = SpecializationOptions.from_preferred_compute_unit_kind(
+            [k for k in ComputeUnitKind.available_kinds() if str(k) == "Neural Engine"][0])
     ai_model = await AIModel.load(str(model_path), specialization_options=spec)
     print(f"  loaded+specialized in {time.perf_counter()-t0:.2f} s")
 
