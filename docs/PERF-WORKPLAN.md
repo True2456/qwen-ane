@@ -698,7 +698,34 @@ Metal decode path, tokenizer/safetensors loading. Integration shape: thin
 custom runner (low-level API, N-state generalization of Apple's
 CoreAISequentialEngine.swift) driven by rindi, or rindi calling a Swift shim.
 
-REQUIREMENTS/GOTCHAS (from community verification):
+P15a FIELD RESULTS (macOS 27 beta 5, live testing):
+- PRIVATE pipeline: fp16 blob-free programs WORK (11.67 TFLOPS proven,
+  test_ane_prefill_mm); ANY bundle containing weight BLOBFILE constants fails
+  verifyBundleAtPath - including pure-fp16 tails. The verifier kills
+  hand-rolled blob injection, not the hardware.
+- OFFICIAL CoreAI runtime: quickstart-class graphs run on CPU/GPU/Neural
+  Engine correctly (NE rel=7.7e-4!). Full-size GDN tail: IN-PROCESS
+  conversion executes correctly (rel 0.017); SAVE_ASSET->reload across
+  processes diverges deterministically (rel 2.0, bit-stable) at scales
+  >=~0.25 - serialization/lowering defect to report to Apple.
+- POISONED CACHE: ~/Library/Caches/coreai-cache served stale failed
+  specializations (9.3GB found+cleared). ALWAYS clear when debugging.
+- BREAKTHROUGH: full-size GDN tail executes NUMERICALLY CORRECT on Neural
+  Engine (rel 0.005) using K-chunked graph (KC<=1536 partial matmuls +
+  adds) - user's insistence validated; ANE-only path is REAL.
+
+P16 TARGET ARCHITECTURE (ANE-native, no fallback):
+- Dynamic weight-SURFACE programs (pattern: test_ane_prefill_mm /
+  xproc roundtrip): weights dequantized int4->fp16 into IOSurfaces at
+  load (~39.6GB resident, fits 128GB); activations stream per chunk.
+- Large prefill chunks S>=128 (spatial size drives ANE efficiency;
+  measured 5.3->11.7 TFLOPS scaling S=128->2048).
+- Projected: tails at ~8-10 TFLOPS effective -> prefill ~120-160 tok/s;
+  stretch with int4-coreai-opt later.
+- NEXT: (1) multi-weight-surface fused tail probe (pack o/gu/dn/ip
+  surfaces, slice per matrix in-graph); (2) engine integration behind
+  RINDI_PREFILL_ANE_DYNAMIC; (3) GDN conv/recurrence fusion.
+
 - Runtime needs macOS 27 (.macOS("27.0") package floor); export/AOT OK on
   26.4 with Xcode 27 beta via DEVELOPER_DIR (no sudo move needed).
 - High-level CoreAILM assumes standard archs (single KV) - custom runner

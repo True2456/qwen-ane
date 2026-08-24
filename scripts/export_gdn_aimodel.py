@@ -70,7 +70,8 @@ def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(42)
 
-    for has_next in (True, False):
+    only_first = os.environ.get("RINDI_SINGLE_ASSET") == "1"
+    for has_next in ((True,) if only_first else (True, False)):
         tag = "with_ip" if has_next else "final"
         model = GdnTail(has_next).eval().half()
         xin = torch.randn(CORE + HIDDEN, SEQ).half()
