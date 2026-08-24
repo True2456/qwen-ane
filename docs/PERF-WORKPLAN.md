@@ -780,6 +780,17 @@ PROJECTED PREFILL MATH (S=512 chunks):
   streaming (~39GB fp16 or ~20GB int8 per pass @ ~800GB/s ~= 25-50ms... 
   actually per-pass weight streaming is the REAL floor to model carefully).
 
+P17a MEASURED (live, this machine):
+- Interpreter runs clean here once warmed (first-op crash without warmup -
+  SME state must be initialized by an earlier dispatch before heavy ops).
+- dense_fp32 bytecode SINGLE-THREAD: only ~0.25 TFLOPS at production shapes
+  (512x5120x34816) - the fp32 FMOPA path is not the fast one.
+- THE FAST PATH: multi-threaded SMOPA int8 - measured 6.38 TOPS SME-alone
+  in the concurrent matrix above (6 threads), vs BNNS 3.1.
+=> INTEGRATION RECIPE: threadpool over M-dim (split batch/chunk across
+   threads), each thread dispatches dense_fused_i8 bytecodes; combine with
+   GPU stream concurrently (GPU unaffected by CPU SME load). Projected
+   combined prefill compute: GPU ~40 + SME ~6 = 46 TOPS-class.
 NEXT STEPS:
 1. Benchmark dense_fused_i8 at production shapes via working CMake target.
 2. Split prefill matmuls GPU/SME; measure combined vs GPU-only.
