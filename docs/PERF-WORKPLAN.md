@@ -847,3 +847,45 @@ STATUS SUMMARY:
   SME2 available as secondary compute engine
 - ACTION: file Feedback Assistant with repro; retest each weekly beta;
   production stays on 26.4 until fixed
+
+## P20 — BREAKTHROUGH: Official CoreAI runtime works on macOS 27b5 (2026-08-24)
+
+**The ANE is NOT broken on 27. Our private-API bundle format was the problem.**
+
+### Evidence chain
+1. Minimal single `nn.Linear` via coreai-torch → TorchConverter → `.aimodel`:
+   loads + runs under `SpecializationOptions(preferredComputeUnitKind: .neuralEngine)`.
+2. **Full-size GDN tail (with_ip, S=32)** via official runtime (Python):
+   CPU rel=0.0162 / 5.49ms; **ANE rel=0.0043 / 4.12ms**. Three compute units give
+   three distinct numerics+timings ⇒ real per-backend execution (no GPU fallback).
+   - cpu: y.sum=-162.6367, gpu: -159.0740, ane: -162.9115
+3. `xcrun coreai-build compile --preferred-compute neural-engine` AOT-compiles
+   all h13–h17 variants (delegates fall back to MPSGraph at AOT; runtime JITs to
+   ANE in ~0.7s at load).
+4. **C++ integration**: `runtime/rindi_ane_swift.swift` C-ABI shim over CoreAI
+   (`AIModel(contentsOf:)` + `loadFunction("main")` + `run(inputs:[NDArray])`),
+   driven from `probes/test_coreai_tail.cpp`: rel_err(y)=0.00427 == Python,
+   NUMERICALLY CORRECT ×5 reps, 4.16 ms/chunk → 7689 tok/s per tail @S=32.
+
+### Why our old path failed on 27
+- Hand-written MIL text bundles fail `_ANEInMemoryModelDescriptor`
+  verification (Code=10). macOS 27 consumes MLIR bytecode (`.mlirb`) produced by
+  coreai-torch; legacy MIL no longer verifies.
+- Sandbox-extension theory was a red herring; non-temp paths didn't help.
+- `ANERegionFormationPass` crash affects only full transformer exports
+  (RoPE/KV-indexing patterns) — clean matmul graphs pass everywhere.
+
+### Integration notes
+- Bundle format: `metadata.json + main.mlirb + main.hash`. Input descriptor
+  reveals storageKind ioSurface → zero-copy path exists (`AsyncValue(unsafeBuffer:)`)
+  for later.
+- Swift interface at SDK SubFrameworks/CoreAIDelegates+CoreAIRuntime.swiftmodule.
+- Build: `make test-coreai-tail`; run:
+  `DYLD_LIBRARY_PATH=runtime /tmp/rindi-test-coreai-tail <bundle> <preferANE>`.
+- Error metric gotcha: compare global-normalized max err, not per-element rel.
+
+### Next steps (P21)
+1. INT4 palettization via coreai-opt → smaller/faster bundles.
+2. Wire shim into rindi_engine as ANE backend for tail projections.
+3. IOSurface zero-copy I/O (skip NDArray copies).
+4. Benchmark end-to-end prefill vs 26.4 private-API numbers (54–71 tok/s).

@@ -30,9 +30,11 @@ TARGETS = \
 	$(RUNTIME_DIR)/libmetal_engine.dylib \
 	$(RUNTIME_DIR)/librindi_native.dylib \
 	$(RUNTIME_DIR)/rindi-server \
-	bin/ane-as
+	bin/ane-as \
+	runtime/librindi_ane_swift.dylib \
+	test-coreai-tail
 
-.PHONY: all clean test-ane-as test-cpp-safetensors test-ane-bridge test-ane-projection test-ane-int4-projection test-gdn-state test-gdn-conv test-gdn-recurrence test-gdn-layer test-attention test-metal-attention test-mtp test-engine-sampling test-prefill-mm test-native-generate test-ane-multi-output test-ane-artifact-load
+.PHONY: all clean test-ane-as test-cpp-safetensors test-ane-bridge test-ane-projection test-ane-int4-projection test-gdn-state test-gdn-conv test-gdn-recurrence test-gdn-layer test-attention test-metal-attention test-mtp test-engine-sampling test-prefill-mm test-native-generate test-ane-multi-output test-ane-artifact-load test-coreai-tail
 
 all: $(TARGETS)
 
@@ -170,3 +172,9 @@ $(RUNTIME_DIR)/rindi-server: $(OBJS) $(RUNTIME_DIR)/rindi_server.o
 
 clean:
 	rm -f $(RUNTIME_DIR)/*.o $(TARGETS)
+
+runtime/librindi_ane_swift.dylib: runtime/rindi_ane_swift.swift
+	swiftc -c -parse-as-library -emit-library -O -o $@ $<
+
+test-coreai-tail: probes/test_coreai_tail.cpp runtime/librindi_ane_swift.dylib
+	$(CXX) $(CXXFLAGS) $< -Lruntime -lrindi_ane_swift -o /tmp/rindi-test-coreai-tail
