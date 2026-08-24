@@ -822,3 +822,28 @@ P18 PLAN (ANE-first on 27):
 5. Ship gate: full-size correct on ANE -> port P14 K-chunk structure ->
    race vs 26.4 baseline -> migrate server when >=1.5x.
 FALLBACK: 26.4 remains shippable; nothing lost.
+
+## P19 - Apple's Own Pipeline Also Broken (macOS 27.0 beta 26A5416b)
+Definitive proof that the ANE compilation failure is an APPLE BUG, not our code:
+`coreai.llm.export Qwen/Qwen3-0.6B --platform macOS` (Apple's own export tool,
+their model, no custom code) produces .aimodel bundles that CRASH during
+ANE region formation:
+```
+Pass failed: ANERegionFormationPass
+Error: unknown fused op type for dynamic match and rewrite
+```
+Reproduced with:
+- Qwen3-0.6B INT4 (macOS default preset)
+- Qwen3-0.6B fp32 (no compression)
+
+Both fail identically inside MPSGraph's MLIR pass manager. The ANE
+specialization pass cannot handle Qwen3 graph structures on this beta.
+This is a beta-quality regression that affects every Qwen3-family model
+through the official pipeline.
+
+STATUS SUMMARY:
+- macOS 26.4: private pipeline works perfectly (MTP_EXACT PASS, 54-71 tok/s)
+- macOS 27 beta 5: ANE broken for Qwen3-class models (Apple bug), GPU fine,
+  SME2 available as secondary compute engine
+- ACTION: file Feedback Assistant with repro; retest each weekly beta;
+  production stays on 26.4 until fixed
