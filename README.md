@@ -30,28 +30,31 @@ safetensors file containing `lm_head.weight`.
 
 ## Native server quick start
 
-Build the server, then point it at an exported `.rindi` model package:
+The installed `rindi` launcher builds an out-of-date server automatically and
+starts the measured configuration: headless, CoreAI ANE prefill at width 128,
+batched Metal attention, Metal decode tails, INT4 target head, MTP disabled,
+and loopback port 2456.
 
 ```bash
-make -j8 runtime/rindi-server
-
-RINDI_HEADLESS=1 \
-RINDI_DISABLE_MTP=1 \
-RINDI_ENABLE_METAL_TAIL=1 \
-RINDI_PREFILL_BATCH_ATTENTION=1 \
-RINDI_ANE_WIDTH=128 \
-runtime/rindi-server \
-  --model "$HOME/.lmstudio/models/Qwen/Qwen3.8-27B.rindi" \
-  --host 127.0.0.1 \
-  --port 2456
+rindi --model "$HOME/.lmstudio/models/Qwen/Qwen3.8-27B.rindi"
 ```
 
-`RINDI_TAIL_COREAI=1` and the deterministic Qwen fast-prefill path are enabled
-by the native server. The explicit flags above select the measured width-128
-ANE prefill and optimized lane-1 Metal decode configuration. Add
-`RINDI_INT4_LM_HEAD=1` to replace the 2.37 GiB BF16 target vocabulary head with
-the approximately 698 MiB groupwise-INT4 head. This quantizes the target head,
-not every remaining decode operation.
+The INT4 option replaces the 2.37 GiB BF16 target vocabulary head with the
+approximately 698 MiB groupwise-INT4 head. This quantizes the target head, not
+every remaining decode operation. Launcher overrides are explicit so setting a
+presence-based engine variable to `0` cannot accidentally leave it enabled:
+
+| override | effect |
+|---|---|
+| `RINDI_ANE_WIDTH=32 rindi` | use width-32 ANE prefill bundles |
+| `RINDI_USE_BF16_LM_HEAD=1 rindi` | use the BF16 target vocabulary head |
+| `RINDI_ENABLE_MTP=1 rindi` | enable speculative MTP |
+| `RINDI_TUI=1 rindi` | show the terminal UI instead of headless mode |
+| `RINDI_HOST=0.0.0.0 RINDI_PORT=1239 rindi` | change the default listener |
+| `RINDI_DISABLE_PREFILL_BATCH_ATTENTION=1 rindi` | disable batched prefill attention for an A/B |
+
+The deterministic Qwen fast-prefill path is also enabled by default inside the
+engine. Use `RINDI_DISABLE_QWEN_PREFILL_FAST=1 rindi` for its scalar rollback.
 
 Verify the API before connecting a client:
 

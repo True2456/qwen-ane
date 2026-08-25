@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # rindi - Apple Silicon Standalone Native C++ ANE + Metal GPU Inference Server
 
+set -euo pipefail
+
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
   DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
@@ -10,11 +12,63 @@ while [ -h "$SOURCE" ]; do
 done
 ROOT_DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 
-# Ensure native server binary is compiled
-if [ ! -f "$ROOT_DIR/runtime/rindi-server" ]; then
-  echo "[Rindi] Compiling native Apple Silicon ANE + Metal GPU server..."
-  make -C "$ROOT_DIR" || exit 1
+# Keep the installed command on the measured native configuration. These
+# launcher-only controls provide explicit ways to opt out of presence-based
+# engine flags:
+#   RINDI_TUI=1                         show the terminal UI
+#   RINDI_USE_BF16_LM_HEAD=1            use the BF16 target head
+#   RINDI_ENABLE_MTP=1                  enable speculative MTP
+#   RINDI_DISABLE_PREFILL_BATCH_ATTENTION=1
+is_truthy() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if is_truthy "${RINDI_TUI:-}"; then
+  unset RINDI_HEADLESS
+else
+  export RINDI_HEADLESS=1
 fi
 
-# Launch Native C++ Inference Server
-exec "$ROOT_DIR/runtime/rindi-server" "$@"
+if is_truthy "${RINDI_USE_BF16_LM_HEAD:-}"; then
+  unset RINDI_INT4_LM_HEAD
+else
+  export RINDI_INT4_LM_HEAD=1
+fi
+
+if is_truthy "${RINDI_ENABLE_MTP:-}"; then
+  unset RINDI_DISABLE_MTP
+else
+  export RINDI_DISABLE_MTP=1
+fi
+
+export RINDI_TAIL_COREAI=1
+export RINDI_ENABLE_METAL_TAIL=1
+if is_truthy "${RINDI_DISABLE_PREFILL_BATCH_ATTENTION:-}"; then
+  unset RINDI_PREFILL_BATCH_ATTENTION
+else
+  export RINDI_PREFILL_BATCH_ATTENTION=1
+fi
+export RINDI_ANE_WIDTH="${RINDI_ANE_WIDTH:-128}"
+
+# Always ask make for the target. The dependency check is effectively free
+# when current and prevents ~/.local/bin/rindi from launching a stale binary.
+make -s -C "$ROOT_DIR" runtime/rindi-server
+
+if ! is_truthy "${RINDI_LAUNCH_QUIET:-}"; then
+  head_mode=bf16
+  mtp_mode=enabled
+  ui_mode=tui
+  [[ -n ${RINDI_INT4_LM_HEAD:-} ]] && head_mode=int4
+  [[ -n ${RINDI_DISABLE_MTP:-} ]] && mtp_mode=disabled
+  [[ -n ${RINDI_HEADLESS:-} ]] && ui_mode=headless
+  echo "[Rindi] native: ANE width=${RINDI_ANE_WIDTH}, ${head_mode} head, MTP ${mtp_mode}, ${ui_mode}"
+fi
+
+# User CLI arguments come last, so --host/--port supplied by the caller win.
+exec "$ROOT_DIR/runtime/rindi-server" \
+  --host "${RINDI_HOST:-127.0.0.1}" \
+  --port "${RINDI_PORT:-2456}" \
+  "$@"

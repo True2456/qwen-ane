@@ -922,9 +922,9 @@ int main(int argc, char* argv[]) {
             std::cout << "Rindi Apple Silicon Standalone Native C++ ANE + Metal GPU Inference Server\n"
                       << "Usage: rindi [options]\n\n"
                       << "Options:\n"
-                      << "  --port <port>       Port to listen on (default: 2456)\n"
-                      << "  --host <host>       Host IP to bind to (default: 0.0.0.0)\n"
-                      << "  --model <path>      Path to 27B model (default: /Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi)\n"
+                      << "  --port <port>       Port to listen on (current: " << config.port << ")\n"
+                      << "  --host <host>       Host IP to bind to (current: " << config.host << ")\n"
+                      << "  --model <path>      Path to 27B model (current: " << model_path << ")\n"
                       << "  --mode <mode>       Engine mode: silent or turbo (default: silent)\n"
                       << "  --help, -h          Show this help message\n";
             return 0;
