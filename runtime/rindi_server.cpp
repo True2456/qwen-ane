@@ -14,6 +14,7 @@
 #include <cstring>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <csignal>
@@ -30,6 +31,7 @@
 static std::atomic<bool> g_running{true};
 static RindiTUI* g_tui = nullptr;
 static RindiEngine* g_engine = nullptr;
+static std::mutex g_engine_mutex;
 
 void signal_handler(int signum) {
     if (g_tui) {
@@ -176,6 +178,27 @@ static std::string extract_json_field(const std::string& json, const std::string
     }
 }
 
+static std::string normalize_message_content(const std::string& raw) {
+    if (raw.empty()) return "";
+    if (raw.front() != '[') return raw;
+    std::string result;
+    size_t pos = 0;
+    while (pos < raw.size()) {
+        size_t obj_start = raw.find('{', pos);
+        if (obj_start == std::string::npos) break;
+        size_t obj_end = raw.find('}', obj_start);
+        if (obj_end == std::string::npos) break;
+        std::string elem = raw.substr(obj_start, obj_end - obj_start + 1);
+        std::string text = extract_json_field(elem, "text");
+        if (!text.empty()) {
+            if (!result.empty()) result += "\n";
+            result += text;
+        }
+        pos = obj_end + 1;
+    }
+    return result.empty() ? raw : result;
+}
+
 static std::vector<ChatMessage> parse_messages(const std::string& json_body) {
     std::vector<ChatMessage> messages;
     std::string messages_arr = extract_json_field(json_body, "messages");
@@ -210,7 +233,7 @@ static std::vector<ChatMessage> parse_messages(const std::string& json_body) {
 
         ChatMessage msg;
         msg.role = extract_json_field(obj_str, "role");
-        msg.content = extract_json_field(obj_str, "content");
+        msg.content = normalize_message_content(extract_json_field(obj_str, "content"));
         msg.tool_call_id = extract_json_field(obj_str, "tool_call_id");
         msg.name = extract_json_field(obj_str, "name");
 
@@ -310,7 +333,7 @@ static void parse_qwen_tool_calls(const std::string& text,
         const size_t b0 = body.find_first_not_of(" \t\r\n");
         const size_t b1 = body.find_last_not_of(" \t\r\n");
         bool parsed = false;
-        if (b0 != std::string::npos && b1 != std::string::npos && b1 > b0) {
+        if (b0 != std::string::npos && b1 != std::string::npos && b1 >= b0) {
             body = body.substr(b0, b1 - b0 + 1);
             if (!body.empty() && body.front() == '{') {
                 const std::string name = extract_json_field(body, "name");
@@ -322,6 +345,59 @@ static void parse_qwen_tool_calls(const std::string& text,
                     tc.arguments_json = args.empty() ? "{}" : args;
                     calls_out.push_back(std::move(tc));
                     parsed = true;
+                }
+            }
+            // XML format: <function=example_fn>\n<parameter=param_name>\nval\n</parameter>\n</function>
+            size_t fn_tag = body.find("<function=");
+            if (!parsed && fn_tag != std::string::npos) {
+                size_t fn_start = fn_tag + 10;
+                size_t fn_end = body.find('>', fn_start);
+                if (fn_end != std::string::npos) {
+                    std::string fn_name = body.substr(fn_start, fn_end - fn_start);
+                    while (!fn_name.empty() && (fn_name.back() == '"' || fn_name.back() == ' ' || fn_name.back() == '\n' || fn_name.back() == '\r')) fn_name.pop_back();
+                    while (!fn_name.empty() && (fn_name.front() == '"' || fn_name.front() == ' ' || fn_name.front() == '\n' || fn_name.front() == '\r')) fn_name.erase(fn_name.begin());
+
+                    std::string args_json = "{";
+                    size_t ppos = fn_end + 1;
+                    bool first_arg = true;
+                    while (true) {
+                        size_t ptag = body.find("<parameter=", ppos);
+                        if (ptag == std::string::npos) break;
+                        size_t pname_start = ptag + 11;
+                        size_t pname_end = body.find('>', pname_start);
+                        if (pname_end == std::string::npos) break;
+                        std::string pname = body.substr(pname_start, pname_end - pname_start);
+                        while (!pname.empty() && (pname.back() == '"' || pname.back() == ' ')) pname.pop_back();
+                        while (!pname.empty() && (pname.front() == '"' || pname.front() == ' ')) pname.erase(pname.begin());
+
+                        size_t pend = body.find("</parameter>", pname_end);
+                        std::string pval = (pend != std::string::npos)
+                            ? body.substr(pname_end + 1, pend - (pname_end + 1))
+                            : body.substr(pname_end + 1);
+
+                        while (!pval.empty() && (pval.back() == '\n' || pval.back() == '\r' || pval.back() == ' ' || pval.back() == '\t')) pval.pop_back();
+                        while (!pval.empty() && (pval.front() == '\n' || pval.front() == '\r' || pval.front() == ' ' || pval.front() == '\t')) pval.erase(pval.begin());
+
+                        if (!first_arg) args_json += ",";
+                        args_json += "\"" + json_escape(pname) + "\":";
+                        if (!pval.empty() && (pval.front() == '{' || pval.front() == '[' || pval == "true" || pval == "false" || pval == "null" || (pval.front() >= '0' && pval.front() <= '9'))) {
+                            args_json += pval;
+                        } else {
+                            args_json += "\"" + json_escape(pval) + "\"";
+                        }
+                        first_arg = false;
+                        ppos = (pend != std::string::npos) ? pend + 12 : body.size();
+                    }
+                    args_json += "}";
+
+                    if (!fn_name.empty()) {
+                        ParsedToolCall tc;
+                        tc.id = "call_" + std::to_string(++call_counter);
+                        tc.name = fn_name;
+                        tc.arguments_json = args_json;
+                        calls_out.push_back(std::move(tc));
+                        parsed = true;
+                    }
                 }
             }
         }
@@ -343,53 +419,49 @@ static void parse_qwen_tool_calls(const std::string& text,
 class ThinkSplitter {
 public:
     using EmitFn = std::function<void(const std::string&)>;
-    ThinkSplitter(EmitFn reasoning_cb, EmitFn content_cb)
-        : reasoning_cb_(std::move(reasoning_cb)), content_cb_(std::move(content_cb)) {}
+    ThinkSplitter(EmitFn reasoning_cb, EmitFn content_cb, bool enable_thinking = true)
+        : reasoning_cb_(std::move(reasoning_cb)), content_cb_(std::move(content_cb)),
+          mode_(enable_thinking ? Mode::kReasoning : Mode::kContent) {}
 
     void feed(const std::string& delta) {
         pending_ += delta;
-        if (mode_ == Mode::kDetect) {
-            // Wait until pending can no longer be a '<think>' prefix.
-            static const std::string kOpen = "<think>";
-            if (pending_.compare(0, pending_.size(), kOpen, 0, pending_.size()) == 0 &&
-                pending_.size() < kOpen.size()) {
-                return;  // still ambiguous
-            }
-            if (pending_.compare(0, kOpen.size(), kOpen) == 0) {
-                mode_ = Mode::kReasoning;
-                pending_ = pending_.substr(kOpen.size());
-            } else {
+        if (mode_ == Mode::kReasoning) {
+            // In reasoning mode: check for closing tag '</think>'
+            static const std::string kClose = "</think>";
+            const size_t close = pending_.find(kClose);
+            if (close != std::string::npos) {
+                emit_reasoning(pending_.substr(0, close));
+                pending_ = pending_.substr(close + kClose.size());
+                // Trim leading newlines immediately following </think>
+                while (!pending_.empty() && (pending_.front() == '\n' || pending_.front() == '\r')) {
+                    pending_.erase(pending_.begin());
+                }
                 mode_ = Mode::kContent;
+                if (!pending_.empty()) {
+                    emit_clean(pending_, true);
+                    pending_.clear();
+                }
+                return;
             }
-        }
-        if (mode_ == Mode::kContent) {
-            emit_clean(pending_, true);
-            pending_.clear();
+            // Safely hold back up to kClose.size() - 1 chars in case a partial '</think' is straddling chunks
+            const size_t safe = (pending_.size() >= kClose.size())
+                ? pending_.size() - (kClose.size() - 1) : 0;
+            if (safe > 0) {
+                emit_reasoning(pending_.substr(0, safe));
+                pending_ = pending_.substr(safe);
+            }
             return;
         }
-        // Reasoning mode: hold back a possible partial '</think>' suffix.
-        static const std::string kClose = "</think>";
-        const size_t close = pending_.find(kClose);
-        if (close != std::string::npos) {
-            emit_reasoning(pending_.substr(0, close));
-            pending_ = pending_.substr(close + kClose.size());
-            mode_ = Mode::kContent;
-            emit_clean(pending_, true);
-            pending_.clear();
-            return;
-        }
-        const size_t safe = pending_.size() > kClose.size() - 1
-            ? pending_.size() - (kClose.size() - 1) : 0;
-        if (safe > 0) {
-            emit_reasoning(pending_.substr(0, safe));
-            pending_ = pending_.substr(safe);
-        }
+
+        // Mode::kContent:
+        emit_clean(pending_, true);
+        pending_.clear();
     }
 
     void finish() {
         if (pending_.empty()) return;
         if (mode_ == Mode::kReasoning) emit_reasoning(pending_);
-        else emit_clean(pending_, true);  // kContent or an unconsumed '<' prefix
+        else emit_clean(pending_, true);
         pending_.clear();
     }
 
@@ -397,21 +469,35 @@ public:
     const std::string& reasoning_accum() const { return reasoning_accum_; }
 
 private:
-    enum class Mode { kDetect, kReasoning, kContent };
+    enum class Mode { kReasoning, kContent };
 
     void emit_reasoning(const std::string& s) {
         if (s.empty()) return;
-        reasoning_accum_ += s;
-        if (reasoning_cb_) reasoning_cb_(s);
-    }
-    void emit_clean(const std::string& s, bool to_stream) {
-        if (s.empty()) return;
-        // Strip any stray think markers from content.
         std::string clean;
         clean.reserve(s.size());
         for (size_t i = 0; i < s.size();) {
             if (s.compare(i, 7, "<think>") == 0) { i += 7; continue; }
             if (s.compare(i, 8, "</think>") == 0) { i += 8; continue; }
+            if (s.compare(i, 10, "<|im_end|>") == 0) { i += 10; continue; }
+            if (s.compare(i, 12, "<|im_start|>") == 0) { i += 12; continue; }
+            if (s.compare(i, 13, "<|endoftext|>") == 0) { i += 13; continue; }
+            clean += s[i++];
+        }
+        if (clean.empty()) return;
+        reasoning_accum_ += clean;
+        if (reasoning_cb_) reasoning_cb_(clean);
+    }
+    void emit_clean(const std::string& s, bool to_stream) {
+        if (s.empty()) return;
+        // Strip any stray think markers and stop tokens from content.
+        std::string clean;
+        clean.reserve(s.size());
+        for (size_t i = 0; i < s.size();) {
+            if (s.compare(i, 7, "<think>") == 0) { i += 7; continue; }
+            if (s.compare(i, 8, "</think>") == 0) { i += 8; continue; }
+            if (s.compare(i, 10, "<|im_end|>") == 0) { i += 10; continue; }
+            if (s.compare(i, 12, "<|im_start|>") == 0) { i += 12; continue; }
+            if (s.compare(i, 13, "<|endoftext|>") == 0) { i += 13; continue; }
             clean += s[i++];
         }
         if (clean.empty()) return;
@@ -421,7 +507,7 @@ private:
 
     EmitFn reasoning_cb_;
     EmitFn content_cb_;
-    Mode mode_{Mode::kDetect};
+    Mode mode_{Mode::kReasoning};
     std::string pending_;
     std::string content_accum_;
     std::string reasoning_accum_;
@@ -518,10 +604,14 @@ void handle_client(int client_fd, RindiEngine* engine) {
     // 2. Handle GET /v1/models or GET /models
     if (req.find("GET /v1/models") != std::string::npos || req.find("GET /models") != std::string::npos) {
         if (g_tui) g_tui->log("GET /v1/models - returned model list", "HTTP");
+        const size_t context = engine ? engine->context_length() : 128 * 1024;
+        const std::string suffix = "\",\"object\":\"model\",\"created\":1787300000,"
+                                   "\"owned_by\":\"rindi\",\"context_window\":" +
+                                   std::to_string(context) +
+                                   ",\"max_output_tokens\":8192}";
         std::string body = "{\"object\":\"list\",\"data\":["
-                           "{\"id\":\"Qwen3.8-27B\",\"object\":\"model\",\"created\":1787300000,\"owned_by\":\"rindi\"},"
-                           "{\"id\":\"rindi\",\"object\":\"model\",\"created\":1787300000,\"owned_by\":\"rindi\"}"
-                           "]}";
+                           "{\"id\":\"Qwen3.8-27B" + suffix + ","
+                           "{\"id\":\"rindi" + suffix + "]}";
         send_json_response(client_fd, 200, "OK", body);
         close(client_fd);
         return;
@@ -646,9 +736,12 @@ void handle_client(int client_fd, RindiEngine* engine) {
                     full_content += text;
                     if (full_content.find("<tool_call>") == std::string::npos)
                         emit_sse("\"content\":\"" + json_escape(text) + "\"");
-                });
+                },
+                enable_thinking);
 
             if (engine) {
+                std::lock_guard<std::mutex> lock(g_engine_mutex);
+                if (g_tui) g_tui->log("Prefilling " + std::to_string(formatted_msgs.size()) + " messages on 64 ANE layers...", "ENGINE");
                 auto stream_token_cb = [&](const std::string& token_chunk) {
                     if (token_chunk.empty()) return;
                     ++token_count;
@@ -656,6 +749,7 @@ void handle_client(int client_fd, RindiEngine* engine) {
                         got_first_token = true;
                         t_first_token = std::chrono::high_resolution_clock::now();
                         ttft_ms = std::chrono::duration<double, std::milli>(t_first_token - t0).count();
+                        if (g_tui) g_tui->log("Prefill complete (TTFT: " + std::to_string((int)ttft_ms) + "ms). Streaming tokens...", "ENGINE");
                     }
                     splitter.feed(token_chunk);
                     if (g_tui) g_tui->record_request_chunk(1);
@@ -689,8 +783,9 @@ void handle_client(int client_fd, RindiEngine* engine) {
             // 5. DONE marker
             std::string done_marker = "data: [DONE]\n\n";
             write(client_fd, done_marker.c_str(), done_marker.size());
-            
-            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+
+            shutdown(client_fd, SHUT_WR);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
             close(client_fd);
 
             const GenerationStats& sstats = (engine && engine->is_ready())
@@ -719,6 +814,7 @@ void handle_client(int client_fd, RindiEngine* engine) {
             // Non-streaming completion response over the real model.
             std::string gen_output;
             if (engine) {
+                std::lock_guard<std::mutex> lock(g_engine_mutex);
                 gen_output = engine->chat_completion(formatted_msgs, tools_json,
                                                      requested_max_tokens,
                                                      requested_temperature, nullptr,
@@ -734,7 +830,8 @@ void handle_client(int client_fd, RindiEngine* engine) {
             // Split the real reasoning/content and extract tool calls.
             ThinkSplitter offline(
                 [](const std::string&) {},
-                [](const std::string&) {});
+                [](const std::string&) {},
+                enable_thinking);
             offline.feed(gen_output);
             offline.finish();
             std::string clean_content;
@@ -796,7 +893,8 @@ void handle_client(int client_fd, RindiEngine* engine) {
     close(client_fd);
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char* argv[]) {
+    setenv("RINDI_TAIL_COREAI", "1", 0);
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
@@ -859,10 +957,18 @@ int main(int argc, char** argv) {
 
         sockaddr_in address{};
         address.sin_family = AF_INET;
-        address.sin_addr.s_addr = INADDR_ANY;
+        if (config.host == "0.0.0.0" || config.host.empty()) {
+            address.sin_addr.s_addr = htonl(INADDR_ANY);
+        } else if (inet_pton(AF_INET, config.host.c_str(),
+                             &address.sin_addr) != 1) {
+            g_tui->log("Invalid IPv4 bind address: " + config.host, "ERROR");
+            close(server_fd);
+            server_fd = -1;
+        }
         address.sin_port = htons(config.port);
 
-        if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) >= 0) {
+        if (server_fd >= 0 &&
+            bind(server_fd, (struct sockaddr*)&address, sizeof(address)) >= 0) {
             if (listen(server_fd, 128) >= 0) {
                 socket_ok = true;
                 g_tui->log("HTTP Server listening on " + config.host + ":" + std::to_string(config.port), "HTTP");
@@ -904,7 +1010,8 @@ int main(int argc, char** argv) {
     auto chat_dispatch = [](const std::string& prompt, std::function<void(const std::string& token)> stream_cb) -> RindiTUI::ChatTurnStats {
         RindiTUI::ChatTurnStats stats;
         if (g_engine) {
-            g_engine->generate(prompt, 128, 0.7f, stream_cb);
+            std::vector<std::pair<std::string, std::string>> msgs = {{"user", prompt}};
+            g_engine->chat_completion(msgs, "", 128, 0.7f, stream_cb, false);
             const GenerationStats& s = g_engine->get_last_stats();
             stats.prompt_tokens = s.prompt_tokens;
             stats.generated_tokens = s.generated_tokens;

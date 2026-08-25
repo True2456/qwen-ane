@@ -4,8 +4,9 @@
 int main() {
     RindiEngine engine("/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi");
     if (!engine.is_ready()) return 2;
-    const std::string text = engine.generate("Explain what ANE and GPU are in 2 sentences.", 8, 0.0f);
-    std::printf("NATIVE_GENERATE=%s bytes=%zu text=%s\n",
+    const std::string prompt = "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n";
+    const std::string text = engine.generate(prompt, 32, 0.7f);
+    std::printf("NATIVE_GENERATE=%s bytes=%zu\n--- OUTPUT ---\n%s\n--------------\n",
                 text.empty() ? "FAIL" : "PASS", text.size(), text.c_str());
     return text.empty() ? 1 : 0;
 }

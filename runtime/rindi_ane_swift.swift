@@ -58,13 +58,20 @@ final class RindiSlot: @unchecked Sendable {
 private func runSync<T>(_ body: @escaping @Sendable () async throws -> T) throws -> T {
     let sem = DispatchSemaphore(value: 0)
     let slot = RindiSlot()
-    Task.detached {
-        do { slot.result = .success(try await body()) }
-        catch { slot.result = .failure(error) }
+    Task {
+        do {
+            let res = try await body()
+            slot.result = .success(res)
+        } catch {
+            slot.result = .failure(error)
+        }
         sem.signal()
     }
     sem.wait()
-    switch slot.result! {
+    guard let r = slot.result else {
+        throw NSError(domain: "rindi", code: 99, userInfo: [NSLocalizedDescriptionKey: "Task failed to set result"])
+    }
+    switch r {
     case .success(let v): return v as! T
     case .failure(let e): throw e
     }
@@ -72,33 +79,33 @@ private func runSync<T>(_ body: @escaping @Sendable () async throws -> T) throws
 
 @_cdecl("rindi_ane_load")
 public func rindi_ane_load(_ path: UnsafePointer<CChar>, _ preferANE: Int32) -> UnsafeMutableRawPointer? {
-    do {
-        return try runSync {
-            let p = UnsafeRawPointer(path)
-            let url = URL(fileURLWithPath: String(cString: p.assumingMemoryBound(to: CChar.self)))
-            let kind: ComputeUnitKind = preferANE != 0 ? .neuralEngine : .cpu
-            let opts = SpecializationOptions(preferredComputeUnitKind: kind)
-            // Persistent on-disk cache: JIT ANE specialization happens once per
-            // bundle, subsequent loads mmap the cached compiled unit.
-            let model = try await AIModel.specialize(contentsOf: url,
-                options: opts, cache: .default, cachePolicy: .persistent)
-            guard let f = try await model.loadFunction(named: "main") else {
-                throw NSError(domain: "rindi", code: 1,
-                    userInfo: [NSLocalizedDescriptionKey:
-                        "function 'main' not found; have \(model.functionNames)"])
+    let pathString = String(cString: path)
+    let url = URL(fileURLWithPath: pathString)
+    return autoreleasepool {
+        do {
+            return try runSync {
+                let kind: ComputeUnitKind = preferANE != 0 ? .neuralEngine : .cpu
+                let opts = SpecializationOptions(preferredComputeUnitKind: kind)
+                let model = try await AIModel.specialize(contentsOf: url,
+                    options: opts, cache: .default, cachePolicy: .persistent)
+                guard let f = try await model.loadFunction(named: "main") else {
+                    throw NSError(domain: "rindi", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "function 'main' not found; have \(model.functionNames)"])
+                }
+                let desc = f.descriptor
+                guard let inName = desc.inputNames.first else {
+                    throw NSError(domain: "rindi", code: 2,
+                        userInfo: [NSLocalizedDescriptionKey: "function has no inputs"])
+                }
+                let box = RindiBox(fn: f, inputName: inName,
+                                   outputNames: Array(desc.outputNames))
+                return Unmanaged.passRetained(box).toOpaque()
             }
-            let desc = f.descriptor
-            guard let inName = desc.inputNames.first else {
-                throw NSError(domain: "rindi", code: 2,
-                    userInfo: [NSLocalizedDescriptionKey: "function has no inputs"])
-            }
-            let box = RindiBox(fn: f, inputName: inName,
-                               outputNames: Array(desc.outputNames))
-            return Unmanaged.passRetained(box).toOpaque()
+        } catch {
+            RindiErr.set("load: \(error)")
+            return nil
         }
-    } catch {
-        RindiErr.set("load: \(error)")
-        return nil
     }
 }
 
@@ -117,26 +124,13 @@ public func rindi_ane_run(_ h: UnsafeMutableRawPointer,
     var ndIn = NDArray(shape: [rows, cols], scalarType: .float16,
                        strides: [cols, 1])
         do {
-            var bad = 0
             try ndIn.mutableRawView().withUnsafeMutableBytes { dst, shapeSpan, strideSpan in
                 memcpy(dst, UnsafeRawPointer(xin), inCount * 2)
-                let src = UnsafeRawPointer(xin).assumingMemoryBound(to: UInt16.self)
-                let dstp = dst.assumingMemoryBound(to: UInt16.self)
-                for i in 0..<(min(inCount, 4096)) {
-                    if src[i] != dstp[i] { bad += 1 }
-                }
-                if getenv("RINDI_SHIM_HASH") != nil {
-                    var hsh: UInt64 = 1469598103934665603
-                    let p = UnsafeRawPointer(xin).assumingMemoryBound(to: UInt8.self)
-                    for i in 0..<(inCount * 2) { hsh ^= UInt64(p[i]); hsh = hsh &* 1099511628211 }
-                    FileHandle.standardError.write(Data("[shim-in] count=\(inCount) fnv=\(hsh) x0=\(String(src[0], radix:16)) x1=\(String(src[1], radix:16))\n".utf8))
-                }
             }
-            if bad > 0 { RindiErr.set("input writeback mismatch: \(bad)/4096") ; return -3 }
         } catch let e {
-        RindiErr.set("input view: \(e)")
-        return -1
-    }
+            RindiErr.set("input view: \(e)")
+            return -1
+        }
     do {
         let total: Int = try runSync {
             var ndCopy = ndIn

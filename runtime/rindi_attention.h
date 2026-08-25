@@ -53,6 +53,9 @@ public:
                          const uint16_t* vraw, size_t lanes,
                          std::vector<uint16_t>& attended);
     void reset();
+    // Reserve enough lazy KV/scratch capacity for one request so geometric
+    // growth never lands in the latency-sensitive decode loop.
+    bool reserve_context(size_t rows);
     void set_position(size_t pos) { position_ = pos; }
     size_t position() const { return position_; }
     bool ready() const { return ready_; }
@@ -70,7 +73,13 @@ public:
                     const std::vector<uint16_t>& values) {
         const size_t row = std::min(from_pos, position_);
         const size_t n = keys.size();
-        if (row * rindi_attn::kKV + n > keys_.size()) return;
+        if (values.size() != n) return;
+        const size_t required_rows =
+            (row * rindi_attn::kKV + n + rindi_attn::kKV - 1) /
+            rindi_attn::kKV;
+        if (!ensure_host_capacity(required_rows)) return;
+        if ((metal_k_cache_ || metal_v_cache_) &&
+            !ensure_metal_resources(required_rows)) return;
         std::memcpy(keys_.data() + row * rindi_attn::kKV, keys.data(), n * sizeof(uint16_t));
         std::memcpy(values_.data() + row * rindi_attn::kKV, values.data(), n * sizeof(uint16_t));
         if (metal_k_cache_ && n) {
@@ -85,7 +94,8 @@ public:
 
 private:
     void reset_metal_state();
-    bool ensure_metal_resources();
+    bool ensure_host_capacity(size_t required_rows);
+    bool ensure_metal_resources(size_t required_rows);
     void prepare_qkv(const uint16_t* qraw, const uint16_t* kraw,
                      const uint16_t* vraw, size_t rope_pos,
                      float* q, float* k, float* v);
@@ -116,6 +126,7 @@ private:
     MetalContext* metal_ctx_{nullptr};
     MetalBufferHandle metal_k_cache_{nullptr};
     MetalBufferHandle metal_v_cache_{nullptr};
+    size_t host_capacity_{0}, metal_capacity_{0};
     size_t context_{0}, position_{0}, width_{32};
     bool ready_{false};
 };

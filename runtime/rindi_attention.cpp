@@ -59,6 +59,7 @@ struct AttentionWorkspace {
     MetalBufferHandle probs{nullptr};  // [32 * kHQ * cap] fp32
     MetalBufferHandle out{nullptr};    // [32 * kQ] fp16
     size_t cap{0};
+    size_t lanes{0};
 };
 AttentionWorkspace& workspace() {
     static AttentionWorkspace ws;
@@ -85,7 +86,7 @@ bool RindiAttention::compile_prefixed(ANEContext* ctx, const SafeTensorsLoader& 
                                       const std::string& p,
                                       size_t context, size_t width,
                                       ProjectionMode mode) {
-    if (!ctx || context == 0) return false;
+    if ((!ctx && !std::getenv("RINDI_TAIL_COREAI")) || context == 0) return false;
     width_ = std::max<size_t>(32, width); context_ = context;
     proj_mode_ = mode;
     auto load_proj = [&](RindiAneProjection& proj, const std::string& name) {
@@ -111,8 +112,10 @@ bool RindiAttention::compile_prefixed(ANEContext* ctx, const SafeTensorsLoader& 
         !loader.get_tensor_fp16(p+"q_norm.weight", q_norm_) ||
         !loader.get_tensor_fp16(p+"k_norm.weight", k_norm_) ||
         q_norm_.size() != 256 || k_norm_.size() != 256) return false;
-    keys_.assign(context_ * kKV, 0);
-    values_.assign(context_ * kKV, 0);
+    keys_.clear();
+    values_.clear();
+    host_capacity_ = 0;
+    metal_capacity_ = 0;
     position_ = 0;
     if (!load_proj(o_proj_, p+"o_proj.weight")) return false;
     ready_ = true; return true;
@@ -133,48 +136,125 @@ bool RindiAttention::project(const uint16_t* hidden, size_t lanes,
         v.assign(fused.begin() + (QG + K) * lanes, fused.end());
         return true;
     }
-    return q_proj_.evaluate(hidden, lanes, q) &&
-           k_proj_.evaluate(hidden, lanes, k) &&
-           v_proj_.evaluate(hidden, lanes, v);
+    const size_t projection_width = std::min({q_proj_.width(),
+                                              k_proj_.width(),
+                                              v_proj_.width()});
+    if (lanes <= projection_width) {
+        return q_proj_.evaluate(hidden, lanes, q) &&
+               k_proj_.evaluate(hidden, lanes, k) &&
+               v_proj_.evaluate(hidden, lanes, v);
+    }
+
+    // The native scheduler may run 128 prompt lanes while each quantized
+    // projection owns 32-lane Metal staging buffers.  Split and stitch here;
+    // otherwise evaluate() rejects the width and silently sends the entire
+    // q/k/v projection through its scalar host fallback.
+    if (projection_width == 0 || q_proj_.input_dim() != k_proj_.input_dim() ||
+        q_proj_.input_dim() != v_proj_.input_dim()) return false;
+    const size_t input_dim = q_proj_.input_dim();
+    q.assign(q_proj_.output_dim() * lanes, 0);
+    k.assign(k_proj_.output_dim() * lanes, 0);
+    v.assign(v_proj_.output_dim() * lanes, 0);
+    std::vector<uint16_t> chunk_input;
+    std::vector<uint16_t> chunk_q, chunk_k, chunk_v;
+    for (size_t first = 0; first < lanes; first += projection_width) {
+        const size_t count = std::min(projection_width, lanes - first);
+        chunk_input.resize(input_dim * count);
+        for (size_t c = 0; c < input_dim; ++c)
+            std::memcpy(chunk_input.data() + c * count,
+                        hidden + c * lanes + first,
+                        count * sizeof(uint16_t));
+        if (!q_proj_.evaluate(chunk_input.data(), count, chunk_q) ||
+            !k_proj_.evaluate(chunk_input.data(), count, chunk_k) ||
+            !v_proj_.evaluate(chunk_input.data(), count, chunk_v)) return false;
+        auto stitch = [&](const std::vector<uint16_t>& src,
+                          std::vector<uint16_t>& dst, size_t rows) {
+            if (src.size() != rows * count) return false;
+            for (size_t r = 0; r < rows; ++r)
+                std::memcpy(dst.data() + r * lanes + first,
+                            src.data() + r * count,
+                            count * sizeof(uint16_t));
+            return true;
+        };
+        if (!stitch(chunk_q, q, q_proj_.output_dim()) ||
+            !stitch(chunk_k, k, k_proj_.output_dim()) ||
+            !stitch(chunk_v, v, v_proj_.output_dim())) return false;
+    }
+    return true;
 }
 
 void RindiAttention::reset_metal_state() {
-    if (!metal_ctx_) return;
-    if (metal_k_cache_) {
-        std::memset(metal_buffer_get_contents(metal_k_cache_), 0,
-                    context_ * kKV * sizeof(uint16_t));
-    }
-    if (metal_v_cache_) {
-        std::memset(metal_buffer_get_contents(metal_v_cache_), 0,
-                    context_ * kKV * sizeof(uint16_t));
-    }
+    // position_ is the causal visibility boundary. Old rows are unreachable
+    // after reset and are overwritten before becoming visible again, so
+    // clearing a potentially 128K KV allocation here is unnecessary.
 }
 
 void RindiAttention::reset() {
-    std::fill(keys_.begin(), keys_.end(), 0);
-    std::fill(values_.begin(), values_.end(), 0);
     position_ = 0;
     reset_metal_state();
 }
 
-bool RindiAttention::ensure_metal_resources() {
+bool RindiAttention::reserve_context(size_t rows) {
+    rows = std::min(rows, context_);
+    if (!ensure_host_capacity(rows)) return false;
+    return metal_attention_disabled() || ensure_metal_resources(rows);
+}
+
+bool RindiAttention::ensure_host_capacity(size_t required_rows) {
+    if (required_rows > context_) return false;
+    if (required_rows <= host_capacity_) return true;
+    size_t target = std::max<size_t>(256, host_capacity_ ? host_capacity_ : 256);
+    while (target < required_rows && target < context_)
+        target = std::min(context_, target * 2);
+    try {
+        keys_.resize(target * kKV);
+        values_.resize(target * kKV);
+    } catch (...) {
+        return false;
+    }
+    host_capacity_ = target;
+    return true;
+}
+
+bool RindiAttention::ensure_metal_resources(size_t required_rows) {
     if (metal_attention_disabled()) return false;
+    if (required_rows > context_ || !ensure_host_capacity(required_rows))
+        return false;
     if (!metal_ctx_) {
         metal_ctx_ = shared_attention_metal_context();
         if (!metal_ctx_) return false;
     }
-    if (!metal_k_cache_) {
-        metal_k_cache_ = metal_buffer_create(metal_ctx_, context_ * kKV * sizeof(uint16_t));
-        metal_v_cache_ = metal_buffer_create(metal_ctx_, context_ * kKV * sizeof(uint16_t));
-        if (!metal_k_cache_ || !metal_v_cache_) return false;
-        std::memset(metal_buffer_get_contents(metal_k_cache_), 0,
-                    context_ * kKV * sizeof(uint16_t));
-        std::memset(metal_buffer_get_contents(metal_v_cache_), 0,
-                    context_ * kKV * sizeof(uint16_t));
+    if (metal_capacity_ < required_rows) {
+        size_t target = std::max<size_t>(256, metal_capacity_ ? metal_capacity_ : 256);
+        while (target < required_rows && target < context_)
+            target = std::min(context_, target * 2);
+        MetalBufferHandle new_k = metal_buffer_create(
+            metal_ctx_, target * kKV * sizeof(uint16_t));
+        MetalBufferHandle new_v = metal_buffer_create(
+            metal_ctx_, target * kKV * sizeof(uint16_t));
+        if (!new_k || !new_v) {
+            if (new_k) metal_buffer_release(new_k);
+            if (new_v) metal_buffer_release(new_v);
+            return false;
+        }
+        const size_t live_elems = std::min(position_, host_capacity_) * kKV;
+        if (live_elems) {
+            std::memcpy(metal_buffer_get_contents(new_k), keys_.data(),
+                        live_elems * sizeof(uint16_t));
+            std::memcpy(metal_buffer_get_contents(new_v), values_.data(),
+                        live_elems * sizeof(uint16_t));
+        }
+        if (metal_k_cache_) metal_buffer_release(metal_k_cache_);
+        if (metal_v_cache_) metal_buffer_release(metal_v_cache_);
+        metal_k_cache_ = new_k;
+        metal_v_cache_ = new_v;
+        metal_capacity_ = target;
     }
     auto& ws = workspace();
-    if (ws.cap < context_) {
-        // Grow to the largest configured context across layers.
+    if (ws.cap < required_rows || ws.lanes < width_) {
+        size_t target = std::max<size_t>(256, ws.cap ? ws.cap : 256);
+        while (target < required_rows && target < context_)
+            target = std::min(context_, target * 2);
         auto grow = [&](MetalBufferHandle& buf, size_t bytes) {
             if (buf) metal_buffer_release(buf);
             buf = metal_buffer_create(metal_ctx_, bytes);
@@ -184,10 +264,11 @@ bool RindiAttention::ensure_metal_resources() {
         // wider under RINDI_ANE_WIDTH), not a literal.
         const size_t ws_lanes = width_;
         if (!grow(ws.q, ws_lanes * kQ * sizeof(uint16_t))) return false;
-        if (!grow(ws.scores, ws_lanes * kHQ * context_ * sizeof(float))) return false;
-        if (!grow(ws.probs, ws_lanes * kHQ * context_ * sizeof(float))) return false;
+        if (!grow(ws.scores, ws_lanes * kHQ * target * sizeof(float))) return false;
+        if (!grow(ws.probs, ws_lanes * kHQ * target * sizeof(float))) return false;
         if (!grow(ws.out, ws_lanes * kQ * sizeof(uint16_t))) return false;
-        ws.cap = context_;
+        ws.cap = target;
+        ws.lanes = ws_lanes;
     }
     return true;
 }
@@ -279,7 +360,8 @@ bool RindiAttention::core_batch_impl(const uint16_t* qraw, const uint16_t* kraw,
     q_f_.resize(kQ); k_f_.resize(kKV); v_f_.resize(kKV);
     float* q = q_f_.data(); float* k = k_f_.data(); float* v = v_f_.data();
 
-    const bool use_metal = ensure_metal_resources();
+    if (!ensure_host_capacity(position_ + lanes)) return false;
+    const bool use_metal = ensure_metal_resources(position_ + lanes);
     auto& ws = workspace();
 
     if (use_metal) {

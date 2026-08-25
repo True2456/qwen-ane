@@ -37,6 +37,11 @@ public:
     int think_start_id() const { return think_start_id_; }
     int think_end_id() const { return think_end_id_; }
 
+    bool is_stop_token(int id) const {
+        return id == eos_id_ || id == im_end_id_ || id == 151645 || id == 151643 ||
+               id == 248046 || id == 248044;
+    }
+
     size_t vocab_size() const { return vocab_.size(); }
 
 private:

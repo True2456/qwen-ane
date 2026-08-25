@@ -58,11 +58,20 @@ int main(int argc, char** argv) {
     long ROWS = argc > 3 ? atol(argv[3]) : 11264;
     long COLS = argc > 4 ? atol(argv[4]) : 32;
     std::string base = argc > 5 ? argv[5] : "/tmp/golden";
-    auto x  = load_f16((base + "_x.f16").c_str());
-    auto yr = load_f16((base + "_y.f16").c_str());
-    auto y2r= load_f16((base + "_y2.f16").c_str());
-    const size_t OUT_TOTAL = yr.size() + y2r.size();
-    printf("[probe] input [%ld,%ld] out=%zu elems\n", ROWS, COLS, OUT_TOTAL);
+    const bool bench_only = base == "-";
+    std::vector<uint16_t> x, yr, y2r;
+    if (bench_only) {
+        // Zero is a valid deterministic input and avoids needing a width-specific
+        // golden just to compare CoreAI dispatch/compute throughput.
+        x.assign((size_t)ROWS * COLS, 0);
+    } else {
+        x = load_f16((base + "_x.f16").c_str());
+        yr = load_f16((base + "_y.f16").c_str());
+        y2r = load_f16((base + "_y2.f16").c_str());
+    }
+    const size_t expected_out = yr.size() + y2r.size();
+    printf("[probe] input [%ld,%ld]%s\n", ROWS, COLS,
+           bench_only ? " benchmark-only" : " with golden");
 
     printf("[probe] bundle: %s  preferANE=%d\n", bundle.c_str(), preferANE);
     if (getenv("RINDI_TEST_LEGACY_CTX")) {
@@ -78,15 +87,19 @@ int main(int argc, char** argv) {
 
     // dry run to learn output count
     long written = rindi_ane_run(h, x.data(), ROWS, COLS, nullptr, 0);
-    if (written != (long)OUT_TOTAL) {
+    if (!bench_only && written != (long)expected_out) {
         fprintf(stderr, "[probe] output count mismatch: got %ld want %zu\n",
-                written, OUT_TOTAL);
+                written, expected_out);
     }
-    std::vector<uint16_t> out(written > 0 ? (size_t)written : OUT_TOTAL);
+    if (written <= 0) {
+        fprintf(stderr, "[probe] dry run failed: %s\n", rindi_ane_last_error());
+        return 2;
+    }
+    std::vector<uint16_t> out((size_t)written);
 
     // correctness: 5 runs, all must match golden
     double max_rel = 0.0;
-    for (int rep = 0; rep < 5; ++rep) {
+    for (int rep = 0; rep < (bench_only ? 0 : 5); ++rep) {
         long n = rindi_ane_run(h, x.data(), ROWS, COLS, out.data(), (long)out.size());
         if (n < 0) { fprintf(stderr, "[probe] RUN FAILED: %s\n", rindi_ane_last_error()); return 2; }
         double mabs_y = 0, mabs_y2 = 0, scale_y = 0, scale_y2 = 0;
@@ -114,9 +127,10 @@ int main(int argc, char** argv) {
             printf("[probe] rel_err(y)=%.5f rel_err(y2)=%.5f\n", mrel_y, mrel_y2);
         }
     }
-    bool ok = max_rel < 0.05;
-    printf("[probe] %s (max_rel=%.5f over 5 reps)\n", ok ? "NUMERICALLY CORRECT" : "MISMATCH",
-           max_rel);
+    bool ok = bench_only || max_rel < 0.05;
+    if (!bench_only)
+        printf("[probe] %s (max_rel=%.5f over 5 reps)\n",
+               ok ? "NUMERICALLY CORRECT" : "MISMATCH", max_rel);
 
     // benchmark
     using clk = std::chrono::steady_clock;
@@ -126,11 +140,14 @@ int main(int argc, char** argv) {
     for (int i = 0; i < N; ++i)
         rindi_ane_run(h, x.data(), ROWS, COLS, out.data(), (long)out.size());
     double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count() / N;
-    // tail GEMM flops per chunk (S=32): out_proj + gate/up + down + ip_proj
-    double flops = 2.0 * (6144 * 5120 + 5120 * 2 * 17408 + 17408 * 5120 + 5120 * 2048) * 32;
+    // Real-tail bundles are token-major [S,11264]; legacy bundles are
+    // channel-major [11264,S]. Infer S so bundle widths compare correctly.
+    const long S = COLS == 11264 ? ROWS : COLS;
+    double flops = 2.0 * (6144 * 5120 + 5120 * 2 * 17408 +
+                          17408 * 5120 + 5120 * 2048) * S;
     printf("[probe] %.3f ms/chunk  -> %.1f TFLOPS (tail GEMMs)\n",
            ms, flops / ms / 1e9);
-    printf("[probe] tokens/sec at S=32: %.0f\n", 32.0 / ms * 1000.0);
+    printf("[probe] tokens/sec at S=%ld: %.0f\n", S, S / ms * 1000.0);
 
     rindi_ane_free(h);
     return ok ? 0 : 3;

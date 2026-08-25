@@ -9,6 +9,33 @@ tools/ane serve --ane-chain --ane-lm-head --dense-bits 4
 
 Answers on `http://127.0.0.1:1239/v1` (OpenAI-compatible).
 
+## Native C++ ANE + Metal server
+
+The optimized native scheduler exposes an OpenAI-compatible endpoint for Pi
+and other chat-completions clients. Its default KV capacity is 131,072 tokens;
+host KV, Metal KV, and attention scratch grow lazily to the capacity required
+by each request. `RINDI_CONTEXT_LENGTH` may override the capacity in the range
+256..262144.
+
+```bash
+RINDI_HEADLESS=1 \
+RINDI_INT4_LM_HEAD=1 \
+RINDI_DISABLE_MTP=1 \
+RINDI_TAIL_COREAI=1 \
+RINDI_ENABLE_METAL_TAIL=1 \
+RINDI_PREFILL_BATCH_ATTENTION=1 \
+RINDI_ANE_WIDTH=128 \
+runtime/rindi-server --host 127.0.0.1 --port 2456
+
+pi --provider rindi --model Qwen3.8-27B --thinking off
+```
+
+`GET /v1/models` reports the engine's real `context_window`, and generation is
+clamped so prompt plus output cannot overrun the KV capacity. The current exact
+prefix-state cache remains limited to prompts of at most 8,192 tokens to avoid
+duplicating many GiB of KV state; this does not limit normal inference context.
+The `--host` option is honored, so the command above listens only on loopback.
+
 ## Framework-free pure ANE backend
 
 `tools/pure_ane.py` is a second backend, independent of the hybrid server. It

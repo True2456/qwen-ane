@@ -484,9 +484,9 @@ std::string RindiTUI::render_dashboard() {
              (unsigned long long)metrics_.total_prompt_tokens.load());
     if (metrics_.last_prefill_tps.load() > 0.0) {
         double ptps = std::min(metrics_.last_prefill_tps.load(), 2850.0);
-        snprintf(perf2_r, sizeof(perf2_r), "Prefill:    %.1f tok/s [Metal GPU]", ptps);
+        snprintf(perf2_r, sizeof(perf2_r), "Prefill:    %.1f tok/s [64L ANE]", ptps);
     } else {
-        snprintf(perf2_r, sizeof(perf2_r), "Prefill:    -- tok/s [Metal GPU]");
+        snprintf(perf2_r, sizeof(perf2_r), "Prefill:    -- tok/s [64L ANE]");
     }
 
     snprintf(perf3_l, sizeof(perf3_l), "Gen Toks:     %llu",

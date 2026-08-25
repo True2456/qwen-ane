@@ -557,6 +557,32 @@ std::string BPETokenizer::apply_chat_template(
         }
     }
 
+    std::string tool_instructions;
+    if (!tools_json.empty() && tools_json != "[]") {
+        tool_instructions = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n" +
+            tools_json + "\n</tools>\n\n"
+            "If you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+            "<tool_call>\n"
+            "<function=example_function_name>\n"
+            "<parameter=example_parameter_1>\n"
+            "value_1\n"
+            "</parameter>\n"
+            "<parameter=example_parameter_2>\n"
+            "This is the value for the second parameter\n"
+            "that can span\n"
+            "multiple lines\n"
+            "</parameter>\n"
+            "</function>\n"
+            "</tool_call>\n\n"
+            "<IMPORTANT>\n"
+            "Reminder:\n"
+            "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
+            "- Required parameters MUST be specified\n"
+            "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n"
+            "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n"
+            "</IMPORTANT>";
+    }
+
     if (has_system) {
         for (const auto& msg : messages) {
             if (msg.first != "system") break;
@@ -566,26 +592,43 @@ std::string BPETokenizer::apply_chat_template(
                     system_content.back() == '\r' || system_content.back() == '\t')) {
                 system_content.pop_back();
             }
-            if (!reasoning_instruction.empty()) {
-                out += "<|im_start|>system\n" + reasoning_instruction + "\n\n" +
-                       system_content + "<|im_end|>\n";
+            std::string header = reasoning_instruction;
+            if (!tool_instructions.empty()) {
+                header = header.empty() ? tool_instructions : header + "\n\n" + tool_instructions;
+            }
+            if (!header.empty() && !system_content.empty()) {
+                out += "<|im_start|>system\n" + header + "\n\n" + system_content + "<|im_end|>\n";
+            } else if (!header.empty()) {
+                out += "<|im_start|>system\n" + header + "<|im_end|>\n";
             } else if (!system_content.empty()) {
                 out += "<|im_start|>system\n" + system_content + "<|im_end|>\n";
             }
             break;
         }
-    } else if (!reasoning_instruction.empty()) {
-        out += "<|im_start|>system\n" + reasoning_instruction + "<|im_end|>\n";
+    } else {
+        std::string header = reasoning_instruction;
+        if (!tool_instructions.empty()) {
+            header = header.empty() ? tool_instructions : header + "\n\n" + tool_instructions;
+        }
+        if (!header.empty()) {
+            out += "<|im_start|>system\n" + header + "<|im_end|>\n";
+        }
     }
 
     for (const auto& msg : messages) {
         if (msg.first == "system") continue;
-        out += "<|im_start|>" + msg.first + "\n" + msg.second + "<|im_end|>\n";
+        if (msg.first == "tool") {
+            out += "<|im_start|>user\n<tool_response>\n" + msg.second + "\n</tool_response><|im_end|>\n";
+        } else {
+            out += "<|im_start|>" + msg.first + "\n" + msg.second + "<|im_end|>\n";
+        }
     }
 
     out += "<|im_start|>assistant\n";
     if (enable_thinking) {
         out += "<think>\n";
+    } else {
+        out += "<think>\n\n</think>\n\n";
     }
     return out;
 }

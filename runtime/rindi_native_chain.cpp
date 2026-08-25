@@ -16,6 +16,46 @@
 
 namespace {
 
+// Cache-tiled fp16 layout conversion used by the CoreAI tail ABI. A naive
+// channel-outer loop touches one word from a different cache line for every
+// token at wide prefill widths. Keeping a small channel x token tile hot
+// avoids that amplification while preserving the exact element mapping.
+void channels_to_tokens(const uint16_t* src, size_t channels, size_t lanes,
+                        uint16_t* dst, size_t token_stride,
+                        size_t channel_offset = 0) {
+    constexpr size_t kChannelTile = 32;
+    constexpr size_t kLaneTile = 16;
+    for (size_t s0 = 0; s0 < lanes; s0 += kLaneTile) {
+        const size_t sn = std::min(kLaneTile, lanes - s0);
+        for (size_t c0 = 0; c0 < channels; c0 += kChannelTile) {
+            const size_t cn = std::min(kChannelTile, channels - c0);
+            for (size_t s = 0; s < sn; ++s) {
+                uint16_t* row = dst + (s0 + s) * token_stride +
+                                channel_offset + c0;
+                for (size_t c = 0; c < cn; ++c)
+                    row[c] = src[(c0 + c) * lanes + s0 + s];
+            }
+        }
+    }
+}
+
+void tokens_to_channels(const uint16_t* src, size_t token_stride,
+                        size_t channels, size_t lanes, uint16_t* dst) {
+    constexpr size_t kChannelTile = 32;
+    constexpr size_t kLaneTile = 16;
+    for (size_t s0 = 0; s0 < lanes; s0 += kLaneTile) {
+        const size_t sn = std::min(kLaneTile, lanes - s0);
+        for (size_t c0 = 0; c0 < channels; c0 += kChannelTile) {
+            const size_t cn = std::min(kChannelTile, channels - c0);
+            for (size_t s = 0; s < sn; ++s) {
+                const uint16_t* row = src + (s0 + s) * token_stride + c0;
+                for (size_t c = 0; c < cn; ++c)
+                    dst[(c0 + c) * lanes + s0 + s] = row[c];
+            }
+        }
+    }
+}
+
 size_t logical_columns(const TensorInfo* info) {
     if (!info || info->shape.size() < 2) return 0;
     const size_t packed = static_cast<size_t>(info->shape[1]);
@@ -265,9 +305,18 @@ RindiNativeChain::RindiNativeChain(size_t hidden_dim, size_t seq_len)
       metal_ctx_(nullptr),
       surf_a_(nullptr),
       surf_b_(nullptr),
-      last_eval_ms_(0.0) {
+      last_eval_ms_(0.0),
+      coreai_min_lanes_([]() {
+          size_t v = 16;
+          if (const char* e = std::getenv("RINDI_COREAI_MIN_LANES"))
+              v = static_cast<size_t>(std::atoi(e));
+          return v;
+      }()) {
 
-    ane_ctx_ = ane_context_create();
+    // macOS 27 CoreAI mode: do NOT create the legacy ANE client. Its XPC
+    // setup races with the CoreAI runtime's own ANEClient initialization
+    // (class_addMethodsBulk on two threads) and corrupts the ObjC heap.
+    ane_ctx_ = std::getenv("RINDI_TAIL_COREAI") ? nullptr : ane_context_create();
     metal_ctx_ = metal_context_create();
     
     // Allocate 2 ping-pong IOSurface buffers
@@ -361,7 +410,8 @@ static bool split_nibbles(const std::vector<uint8_t>& raw, size_t rows,
 
 bool RindiNativeChain::compile_layer(int layer_idx, const std::string& package_path,
                                      const SafeTensorsLoader& loader) {
-    if (!ane_ctx_ || layer_idx < 0) return false;
+    if (layer_idx < 0) return false;
+    if (!ane_ctx_ && !std::getenv("RINDI_TAIL_COREAI")) return false;
     // macOS 27 backend: load the exported CoreAI tail bundle instead of
     // rebuilding legacy MIL (whose bundles no longer pass bundle verification).
     if (std::getenv("RINDI_TAIL_COREAI")) {
@@ -372,20 +422,32 @@ bool RindiNativeChain::compile_layer(int layer_idx, const std::string& package_p
         char p[1024];
         auto try_load = [&](const char* suffix) -> void* {
             std::snprintf(p, sizeof(p),
-                          "%s/qwen38_27b_tail_L%d_%s_int4_g32_tm_s32.aimodel",
-                          base.c_str(), layer_idx, suffix);
+                          "%s/qwen38_27b_tail_L%d_%s_int4_g32_tm_s%zu.aimodel",
+                          base.c_str(), layer_idx, suffix, seq_len_);
             void* h = rindi_ane_load(p, 1);
             if (!h)
                 std::fprintf(stderr, "[CoreAI] %s: %s\n", p, rindi_ane_last_error());
             else
-                std::fprintf(stderr, "[CoreAI] L%d loaded (%s)\n", layer_idx, suffix);
+                std::fprintf(stderr, "[CoreAI] L%d loaded (%s, width=%zu)\n",
+                             layer_idx, suffix, seq_len_);
             return h;
         };
-        void* h = try_load("ip1");
-        if (!h) h = try_load("ip0");
-        if (!h) return false;
+        std::fprintf(stderr, "[CoreAI] loading L%d...\n", layer_idx);
+        {
+            // Idempotent: prewarm may have loaded this layer already.
+            if (layer_idx < static_cast<int>(layers_.size()) &&
+                layers_[layer_idx].coreai_model)
+                return true;
+        }
+        void* h = (layer_idx < 63) ? try_load("ip1") : try_load("ip0");
+        if (!h) h = (layer_idx < 63) ? try_load("ip0") : try_load("ip1");
         LayerEntry e;
-        e.coreai_model = h;
+        if (!h) {
+            std::fprintf(stderr, "[CoreAI] L%d not available on ANE -> fallback to Metal GPU tail\n", layer_idx);
+            e.coreai_model = nullptr;
+        } else {
+            e.coreai_model = h;
+        }
         e.input_channels = hidden_dim_;      // refined on first eval below
         e.projection_channels = 0;
         layers_.resize(layer_idx + 1);
@@ -570,16 +632,61 @@ bool RindiNativeChain::compile_layer(int layer_idx, const std::string& package_p
 
 bool RindiNativeChain::compile_metal_tails(const SafeTensorsLoader& loader,
                                            const std::string& package_path) {
-    if (!std::getenv("RINDI_ENABLE_METAL_TAIL") ||
+    if ((!std::getenv("RINDI_ENABLE_METAL_TAIL") &&
+         !std::getenv("RINDI_SME2_DOWN") &&
+         !std::getenv("RINDI_SME2_DOWN_SPLIT")) ||
         std::getenv("RINDI_DISABLE_METAL_TAIL")) return false;
     bool all_ready = true;
     for (size_t layer = 0; layer < layers_.size(); ++layer) {
-        auto& entry = layers_[layer];
-        if (!entry.model || !entry.core_dim ||
-            !compile_metal_tail(static_cast<int>(layer), loader, package_path,
-                                entry.core_dim,
-                                entry.intermediate, entry.projection_channels,
-                                entry.attention)) all_ready = false;
+        const std::string prefix = "layers." + std::to_string(layer) + ".";
+        const bool attention = loader.has_tensor(prefix + "self_attn.o_proj.weight");
+        const std::string core_name = prefix +
+            (attention ? "self_attn.o_proj.weight" : "linear_attn.out_proj.weight");
+        const TensorInfo* core_info = loader.get_tensor_info(core_name);
+        const TensorInfo* gate_info = loader.get_tensor_info(prefix + "mlp.gate_proj.weight");
+        if (!core_info || !gate_info || core_info->shape.size() < 2 ||
+            gate_info->shape.size() < 2) {
+            all_ready = false;
+            continue;
+        }
+
+        const size_t core_dim = logical_columns(core_info);
+        const size_t intermediate = static_cast<size_t>(gate_info->shape[0]);
+        size_t next_projection = 0;
+        if (layer + 1 < layers_.size()) {
+            const std::string next = "layers." + std::to_string(layer + 1) + ".";
+            const char* gdn_names[] = {
+                "linear_attn.in_proj_qkv.weight", "linear_attn.in_proj_z.weight",
+                "linear_attn.in_proj_b.weight", "linear_attn.in_proj_a.weight"
+            };
+            const char* attention_names[] = {
+                "self_attn.q_proj.weight", "self_attn.k_proj.weight",
+                "self_attn.v_proj.weight"
+            };
+            const bool next_is_gdn =
+                loader.has_tensor(next + "linear_attn.in_proj_qkv.weight");
+            const char* const* names = next_is_gdn ? gdn_names : attention_names;
+            const size_t count = next_is_gdn ? 4 : 3;
+            bool shapes_ready = true;
+            for (size_t i = 0; i < count; ++i) {
+                const TensorInfo* info = loader.get_tensor_info(next + names[i]);
+                if (!info || info->shape.empty()) {
+                    shapes_ready = false;
+                    break;
+                }
+                next_projection += static_cast<size_t>(info->shape[0]);
+            }
+            if (!shapes_ready) {
+                all_ready = false;
+                continue;
+            }
+        }
+
+        if (!compile_metal_tail(static_cast<int>(layer), loader, package_path,
+                                core_dim, intermediate, next_projection,
+                                attention)) {
+            all_ready = false;
+        }
     }
     return all_ready;
 }
@@ -673,7 +780,17 @@ bool RindiNativeChain::compile_metal_tail(int layer_idx,
     tail->intermediate = intermediate;
     tail->next_projection = next_projection;
     tail->ready = true;
-    layers_[layer_idx].metal_tail = std::move(tail);
+    auto& entry = layers_[layer_idx];
+    entry.metal_tail = std::move(tail);
+    // The safetensors shapes above are the authoritative CoreAI output ABI.
+    // Do not discover it by executing every ANE program once at the start of
+    // the first prompt: that doubled all 64 tail calls in the cold TTFT
+    // window (especially costly for the wide bundles).
+    entry.core_dim = core_dim;
+    entry.intermediate = intermediate;
+    entry.projection_channels = next_projection;
+    entry.coreai_proj_queried = true;
+    entry.attention = attention;
     metal_tail_ready_ = true;
     return true;
 }
@@ -725,16 +842,19 @@ bool RindiNativeChain::evaluate_tail_batch_coreai(int layer_idx, const uint16_t*
     auto& e = layers_[layer_idx];
     const size_t C = core_dim;
     const size_t H = hidden_dim_;
-    // Stage token-major input [lanes x (C+H)]: row s = core[:,s] ++ residual[:,s].
-    coreai_xin_.resize(lanes * (C + H));
-    for (size_t c = 0; c < C; ++c) {
-        const uint16_t* src = core + c * lanes;
-        for (size_t s = 0; s < lanes; ++s) coreai_xin_[s * (C + H) + c] = src[s];
-    }
-    for (size_t c = 0; c < H; ++c) {
-        const uint16_t* src = residual + c * lanes;
-        for (size_t s = 0; s < lanes; ++s) coreai_xin_[s * (C + H) + C + c] = src[s];
-    }
+    // Bundles are exported at static width seq_len_. The tail graph has
+    // no cross-token mixing (per-row RMSNorm, elementwise SwiGLU), so any
+    // lane count zero-pads to the static width and every live lane computes
+    // identically - one bundle serves prefill AND decode widths.
+    const size_t W = seq_len_;
+    if (lanes > W) return false;
+    const size_t input_stride = C + H;
+    coreai_xin_.resize(W * input_stride);
+    channels_to_tokens(core, C, lanes, coreai_xin_.data(), input_stride);
+    channels_to_tokens(residual, H, lanes, coreai_xin_.data(), input_stride, C);
+    if (lanes < W)
+        std::memset(coreai_xin_.data() + lanes * input_stride, 0,
+                    (W - lanes) * input_stride * sizeof(uint16_t));
     if (std::getenv("RINDI_DEBUG_COREAI_STAGING")) {
         std::fprintf(stderr, "[CoreAI-staging] xin[0..3]=%04x %04x %04x %04x "
                              "xin[C..C+3]=%04x %04x %04x %04x\n",
@@ -744,23 +864,26 @@ bool RindiNativeChain::evaluate_tail_batch_coreai(int layer_idx, const uint16_t*
     }
 
     // Discover output width on first call: y [H] plus y2 [P] when folded.
+    if (std::getenv("RINDI_DEBUG_COREAI_EVAL"))
+        std::fprintf(stderr, "[CoreAI-eval] layer=%d lanes=%zu W=%zu C=%zu\n",
+                     layer_idx, lanes, W, C);
     if (e.projection_channels == 0 && e.coreai_proj_queried == false) {
         long total = rindi_ane_run(e.coreai_model, coreai_xin_.data(),
-                                   (long)lanes, (long)(C + H), nullptr, 0);
+                                   (long)W, (long)(C + H), nullptr, 0);
         if (total <= 0) {
             std::fprintf(stderr, "[CoreAI] L%d query failed: %s\n",
                          layer_idx, rindi_ane_last_error());
             return false;
         }
-        e.projection_channels = (size_t)total / lanes - H;   // P (0 if none)
+        e.projection_channels = (size_t)total / W - H;   // P (0 if none)
         e.coreai_proj_queried = true;
         if (next_projection && e.projection_channels == 0) return false;
     }
 
     const size_t P = e.projection_channels;
-    coreai_out_.assign(lanes * (H + P), 0xBEEF);
+    coreai_out_.resize(W * (H + P));
     long written = rindi_ane_run(e.coreai_model, coreai_xin_.data(),
-                                 (long)lanes, (long)(C + H),
+                                 (long)W, (long)(C + H),
                                  coreai_out_.data(), (long)coreai_out_.size());
     if (std::getenv("RINDI_DUMP_COREAI_OUT")) {
         char pf[96]; std::snprintf(pf, sizeof(pf), "/tmp/coreai_out_L%d.bin", layer_idx);
@@ -777,17 +900,11 @@ bool RindiNativeChain::evaluate_tail_batch_coreai(int layer_idx, const uint16_t*
     // tensors: y block [lanes*H] first, then y2 block [lanes*P]; each block
     // is row-major (token-major) [lane][channel].
     output.resize(H * lanes);
-    for (size_t c = 0; c < H; ++c) {
-        uint16_t* dst = output.data() + c * lanes;
-        for (size_t s = 0; s < lanes; ++s) dst[s] = coreai_out_[s * H + c];
-    }
+    tokens_to_channels(coreai_out_.data(), H, H, lanes, output.data());
     if (next_projection && P > 0) {
         next_projection->resize(P * lanes);
-        const uint16_t* y2 = coreai_out_.data() + lanes * H;
-        for (size_t c = 0; c < P; ++c) {
-            uint16_t* dst = next_projection->data() + c * lanes;
-            for (size_t s = 0; s < lanes; ++s) dst[s] = y2[s * P + c];
-        }
+        const uint16_t* y2 = coreai_out_.data() + W * H;
+        tokens_to_channels(y2, P, P, lanes, next_projection->data());
     }
     return true;
 }
@@ -800,10 +917,27 @@ bool RindiNativeChain::evaluate_tail_batch(int layer_idx, const uint16_t* core,
     if (layer_idx < 0 || layer_idx >= static_cast<int>(layers_.size()) ||
         !core || !residual || lanes == 0 || lanes > seq_len_) return false;
     auto& e = layers_[layer_idx];
-    if (e.coreai_model)
+    // Hybrid routing: wide lanes = prefill chunks -> CoreAI/ANE (fixed daemon
+    // cost amortized across the bundle width). Narrow
+    // lanes = decode/MTP-verify -> Metal tails (sub-ms, no daemon hop).
+    if (e.coreai_model && (lanes >= coreai_min_lanes_ || !metal_tail_ready_ || !e.metal_tail || !e.metal_tail->ready))
         return evaluate_tail_batch_coreai(layer_idx, core, core_dim, residual,
                                           lanes, output, next_projection);
-    if (!e.model || !e.req_a_to_b || e.input_channels != core_dim + hidden_dim_) return false;
+    if (!e.model || !e.req_a_to_b || e.input_channels != core_dim + hidden_dim_) {
+        // No legacy ANE model (CoreAI-only init or macOS 27): Metal tail or fail.
+        if ((metal_tail_ready_ && e.metal_tail && e.metal_tail->ready &&
+             std::getenv("RINDI_TAIL_COREAI")) ||
+            (metal_tail_ready_ && e.metal_tail && e.metal_tail->ready &&
+             std::getenv("RINDI_ENABLE_METAL_TAIL"))) {
+            std::vector<uint16_t> next_scratch;
+            const bool ok = evaluate_tail_batch_metal(
+                layer_idx, core, core_dim, residual, lanes, output,
+                next_projection ? &next_scratch : nullptr);
+            if (ok && next_projection) *next_projection = std::move(next_scratch);
+            return ok;
+        }
+        return false;
+    }
 
     const bool compare_metal_tail = std::getenv("RINDI_COMPARE_METAL_TAIL") != nullptr;
     std::vector<uint16_t> metal_output;
@@ -968,7 +1102,7 @@ bool RindiNativeChain::evaluate_tail_batch_metal(
     //     17 ms/layer goes: cpu staging copies, encoder setup, submit+exec.
     struct TailProf {
         std::chrono::high_resolution_clock::time_point t0;
-        double in_ms = 0, enc_ms = 0, gpu_ms = 0, out_ms = 0;
+        double in_ms = 0, enc_ms = 0, gpu_ms = 0, sme_split_ms = 0, out_ms = 0;
     };
     static thread_local TailProf tp;
     static thread_local int tp_n = 0;
@@ -1012,8 +1146,48 @@ bool RindiNativeChain::evaluate_tail_batch_metal(
     metal_dispatch_swiglu_channel_fp16(metal_ctx_, cmd, metal_tail_ff_,
                                        metal_tail_activation_,
                                        static_cast<int>(t.intermediate), static_cast<int>(lanes));
-    if (!t.down_proj->metal_dispatch(metal_ctx_, cmd, metal_tail_activation_,
-                                     metal_tail_core_, lanes)) {
+    const char* sme2_split = std::getenv("RINDI_SME2_DOWN_SPLIT");
+    const bool use_sme2_down = lanes == 1 &&
+        (std::getenv("RINDI_SME2_DOWN") || sme2_split) &&
+        t.down_proj->sme2_rowwise_ready();
+    if (use_sme2_down) {
+        // Gate/up and SwiGLU must finish before the CPU can consume the shared
+        // activation buffer. The second command buffer consumes SME2's down
+        // output. This synchronization is exactly what the end-to-end A/B is
+        // intended to price; the default all-Metal path remains one command.
+        const auto split_start = tp_now();
+        metal_command_buffer_commit(cmd);
+        metal_command_buffer_wait(cmd);
+        const auto* activation = static_cast<const uint16_t*>(
+            metal_buffer_get_contents(metal_tail_activation_));
+        auto* down_output = static_cast<uint16_t*>(
+            metal_buffer_get_contents(metal_tail_core_));
+        if (sme2_split) {
+            const long requested = std::strtol(sme2_split, nullptr, 10);
+            const size_t percent = static_cast<size_t>(
+                std::max<long>(1, std::min<long>(99, requested)));
+            size_t gpu_rows = t.down_proj->output_dim() * percent / 100;
+            gpu_rows = std::max<size_t>(32, (gpu_rows / 32) * 32);
+            gpu_rows = std::min(t.down_proj->output_dim() - 32, gpu_rows);
+            MetalCommandBufferHandle down_cmd = metal_command_buffer_create(metal_ctx_);
+            if (!down_cmd || !t.down_proj->metal_dispatch_rowwise_range(
+                    metal_ctx_, down_cmd, metal_tail_activation_, metal_tail_core_,
+                    0, gpu_rows)) return false;
+            metal_command_buffer_commit(down_cmd);
+            const bool sme_ok = t.down_proj->sme2_evaluate_rowwise_range(
+                activation, down_output, gpu_rows,
+                t.down_proj->output_dim() - gpu_rows);
+            metal_command_buffer_wait(down_cmd);
+            if (!sme_ok) return false;
+        } else if (!t.down_proj->sme2_evaluate_rowwise(
+                       activation, down_output)) {
+            return false;
+        }
+        if (tp_on) tp.sme_split_ms += tp_ms(split_start, tp_now());
+        cmd = metal_command_buffer_create(metal_ctx_);
+        if (!cmd) return false;
+    } else if (!t.down_proj->metal_dispatch(metal_ctx_, cmd, metal_tail_activation_,
+                                            metal_tail_core_, lanes)) {
         metal_command_buffer_commit(cmd);
         metal_command_buffer_wait(cmd);
         return false;
@@ -1056,6 +1230,7 @@ bool RindiNativeChain::evaluate_tail_batch_metal(
             std::cerr << "[TailProf] n=" << tp_n
                       << " in=" << tp.in_ms
                       << " enc=" << tp.enc_ms
+                      << " sme_split=" << tp.sme_split_ms
                       << " submit+exec+out=" << tp.gpu_ms
                       << std::endl;
             tp = TailProf{}; tp_n = 0;

@@ -143,6 +143,7 @@ private:
                                     std::vector<uint16_t>* next_projection);
     std::vector<uint16_t> coreai_xin_;      // token-major staging
     std::vector<uint16_t> coreai_out_;      // concatenated outputs staging
+    size_t coreai_min_lanes_{16};           // lanes below this -> Metal tail
 };
 
 #endif // RINDI_NATIVE_CHAIN_H

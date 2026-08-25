@@ -35,13 +35,15 @@ class RealTail(nn.Module):
     """Token-major fused tail with real weights. Optionally folds the NEXT
     layer's input projection: y2 = W_next @ rmsnorm(y)*il_{L+1}, matching the
     engine's fused-tail ABI (outputs y [S,H] and y2 [S,P])."""
-    def __init__(self, o_w, gu_w, dn_w, norm_w, ip_w=None, il_w=None):
+    def __init__(self, o_w, g_w, u_w, dn_w, norm_w, ip_w=None, il_w=None):
         super().__init__()
         self.o_proj = nn.Linear(C, H, bias=False)
         self.o_proj.weight.data = o_w
         self.post_norm = nn.Parameter(norm_w.clone())
-        self.gate_up = nn.Linear(H, 2 * I, bias=False)
-        self.gate_up.weight.data = gu_w
+        self.gate_proj = nn.Linear(H, I, bias=False)
+        self.gate_proj.weight.data = g_w
+        self.up_proj = nn.Linear(H, I, bias=False)
+        self.up_proj.weight.data = u_w
         self.down = nn.Linear(I, H, bias=False)
         self.down.weight.data = dn_w
         self.has_ip = ip_w is not None
@@ -55,8 +57,8 @@ class RealTail(nn.Module):
         h = res + self.o_proj(core)
         # pure-fp16 graph: any fp32 cast op splits ANE regions (24ms regression)
         n = h / torch.sqrt((h * h).mean(-1, keepdim=True) + 1e-6) * self.post_norm
-        g0, u0 = self.gate_up(n).chunk(2, dim=-1)
-        y = h + self.down(torch.nn.functional.silu(g0) * u0)
+        y = h + self.down(torch.nn.functional.silu(self.gate_proj(n)) *
+                          self.up_proj(n))
         if not self.has_ip:
             return y
         # folded next-layer input path: rmsnorm(y)*il_{L+1} then in-projection
@@ -107,9 +109,9 @@ def main():
         print(f"[layer {layer}] folds L{nxt} {'GDN' if gdn else 'attn'} "
               f"in-projection P={ip_w.shape[0]}")
 
-    model = RealTail(o_w.half(), torch.cat([gate, up]).half(), dn.half(),
-                     norm.half(), None if ip_w is None else ip_w.half(),
-                     None if il_w is None else il_w.half()).eval()
+    model = RealTail(o_w.half(), gate.half(), up.half(), dn.half(),
+                     (1.0 + norm).half(), None if ip_w is None else ip_w.half(),
+                     None if il_w is None else (1.0 + il_w).half()).eval()
     xin = torch.randn(S, C + H).half()
     with torch.no_grad():
         ref_pair = model(xin)
@@ -193,7 +195,10 @@ def main():
             print(f"[{name}] rel(y)={e1:.5f}  {ms:.2f} ms/chunk "
                   f"-> {flops/(ms/1e3):.1f} TFLOPS, {S/ms*1000:.0f} tok/s")
 
-    asyncio.run(bench())
+    if os.environ.get("GDN_SKIP_BENCH", "0") == "1":
+        print("runtime benchmark skipped (GDN_SKIP_BENCH=1)")
+    else:
+        asyncio.run(bench())
 
 
 if __name__ == "__main__":

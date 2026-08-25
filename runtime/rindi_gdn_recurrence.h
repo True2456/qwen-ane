@@ -22,6 +22,10 @@ public:
                    const uint16_t* query, const uint16_t* value,
                    const uint16_t* beta, size_t lanes,
                    std::vector<uint16_t>& output);
+    bool step_batch_raw(const uint16_t* activated, const uint16_t* a,
+                        const uint16_t* b, const uint16_t* a_log,
+                        const uint16_t* dt_bias, size_t lanes,
+                        std::vector<uint16_t>& output);
     void reset();
     // Byte-exact capture/rollback of the recurrent state (one shared store
     // for the Metal and ANE execution paths).
@@ -48,6 +52,11 @@ private:
     MetalBufferHandle metal_value_{nullptr};
     MetalBufferHandle metal_beta_{nullptr};
     MetalBufferHandle metal_output_{nullptr};
+    MetalBufferHandle metal_activated_{nullptr};
+    MetalBufferHandle metal_a_{nullptr};
+    MetalBufferHandle metal_b_{nullptr};
+    MetalBufferHandle metal_a_log_{nullptr};
+    MetalBufferHandle metal_dt_bias_{nullptr};
 };
 
 #endif

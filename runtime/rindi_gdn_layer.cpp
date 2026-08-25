@@ -1,11 +1,67 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "rindi_gdn_layer.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 
 namespace {
+struct GdnGateMetal {
+    MetalContext* ctx{nullptr};
+    MetalBufferHandle core{nullptr};
+    MetalBufferHandle z{nullptr};
+    MetalBufferHandle weight{nullptr};
+    MetalBufferHandle output{nullptr};
+    size_t capacity{0};
+};
+
+GdnGateMetal& shared_gdn_gate_metal() {
+    static GdnGateMetal state;
+    return state;
+}
+
+bool gate_core_metal(const std::vector<uint16_t>& core,
+                     const std::vector<uint16_t>& z,
+                     const std::vector<uint16_t>& weight,
+                     size_t lanes, std::vector<uint16_t>& output) {
+    constexpr size_t HK = 48 * 128;
+    if (core.size() != HK * lanes || z.size() != core.size() ||
+        weight.size() != 128) return false;
+    GdnGateMetal& m = shared_gdn_gate_metal();
+    if (!m.ctx) m.ctx = metal_context_create();
+    if (!m.ctx) return false;
+    if (m.capacity < core.size()) {
+        if (m.core) metal_buffer_release(m.core);
+        if (m.z) metal_buffer_release(m.z);
+        if (m.output) metal_buffer_release(m.output);
+        m.core = metal_buffer_create(m.ctx, core.size() * sizeof(uint16_t));
+        m.z = metal_buffer_create(m.ctx, core.size() * sizeof(uint16_t));
+        m.output = metal_buffer_create(m.ctx, core.size() * sizeof(uint16_t));
+        m.capacity = (m.core && m.z && m.output) ? core.size() : 0;
+    }
+    if (!m.weight)
+        m.weight = metal_buffer_create(m.ctx, weight.size() * sizeof(uint16_t));
+    if (!m.capacity || !m.weight) return false;
+    std::memcpy(metal_buffer_get_contents(m.core), core.data(),
+                core.size() * sizeof(uint16_t));
+    std::memcpy(metal_buffer_get_contents(m.z), z.data(),
+                z.size() * sizeof(uint16_t));
+    std::memcpy(metal_buffer_get_contents(m.weight), weight.data(),
+                weight.size() * sizeof(uint16_t));
+    MetalCommandBufferHandle cmd = metal_command_buffer_create(m.ctx);
+    if (!cmd) return false;
+    metal_dispatch_gdn_gate_core(m.ctx, cmd, m.core, m.z, m.weight, m.output,
+                                 static_cast<int>(lanes));
+    metal_command_buffer_commit(cmd);
+    metal_command_buffer_wait(cmd);
+    output.resize(core.size());
+    std::memcpy(output.data(), metal_buffer_get_contents(m.output),
+                output.size() * sizeof(uint16_t));
+    return true;
+}
+
 float half_to_float(uint16_t bits) {
     const uint32_t sign = (static_cast<uint32_t>(bits) & 0x8000u) << 16;
     const uint32_t exp = (bits >> 10) & 0x1fu;
@@ -39,7 +95,8 @@ float stable_softplus(float x) {
 
 bool RindiGdnLayer::compile(ANEContext* ctx, const SafeTensorsLoader& loader,
                             int layer, size_t width) {
-    if (!ctx || layer < 0) return false;
+    if (layer < 0) return false;
+    if (!ctx && !std::getenv("RINDI_TAIL_COREAI")) return false;
     const std::string prefix = "layers." + std::to_string(layer) + ".linear_attn.";
     const std::array<std::string, 4> names = {
         prefix + "in_proj_qkv.weight",
@@ -64,7 +121,8 @@ bool RindiGdnLayer::compile(ANEContext* ctx, const SafeTensorsLoader& loader,
 
 bool RindiGdnLayer::compile_core(ANEContext* ctx, const SafeTensorsLoader& loader,
                                   int layer, size_t width) {
-    if (!ctx || layer < 0) return false;
+    if (layer < 0) return false;
+    if (!ctx && !std::getenv("RINDI_TAIL_COREAI")) return false;
     const std::string prefix = "layers." + std::to_string(layer) + ".linear_attn.";
     const std::array<std::string, 4> names = {
         prefix + "in_proj_qkv.weight",
@@ -140,6 +198,9 @@ bool RindiGdnLayer::gate_core_batch(const std::vector<uint16_t>& core,
     constexpr size_t H = 48, D = 128, C = H * D;
     if (lanes == 0 || core.size() != C * lanes || z.size() != C * lanes ||
         gdn_norm_.size() != D) return false;
+    if (lanes > 1 && (std::getenv("RINDI_GDN_METAL_GATE") ||
+                      std::getenv("RINDI_QWEN_PREFILL_FAST")) &&
+        gate_core_metal(core, z, gdn_norm_, lanes, gated)) return true;
     gated.resize(C * lanes);
     for (size_t h = 0; h < H; ++h) {
         for (size_t lane = 0; lane < lanes; ++lane) {
@@ -164,11 +225,46 @@ bool RindiGdnLayer::gate_core_batch(const std::vector<uint16_t>& core,
 
 bool RindiGdnLayer::project(const uint16_t* hidden, size_t lanes,
                             RindiGdnProjectionOutput& output) {
-    if (!ready_ || !hidden) return false;
-    return projections_[0].evaluate(hidden, lanes, output.qkv) &&
-           projections_[1].evaluate(hidden, lanes, output.z) &&
-           projections_[2].evaluate(hidden, lanes, output.beta) &&
-           projections_[3].evaluate(hidden, lanes, output.a);
+    if (!ready_ || !hidden || lanes == 0) return false;
+    const size_t projection_width = projections_[0].width();
+    if (lanes <= projection_width) {
+        return projections_[0].evaluate(hidden, lanes, output.qkv) &&
+               projections_[1].evaluate(hidden, lanes, output.z) &&
+               projections_[2].evaluate(hidden, lanes, output.beta) &&
+               projections_[3].evaluate(hidden, lanes, output.a);
+    }
+
+    // The first transformer layer has no folded previous-tail projection.
+    // Its groupwise Metal projections retain the proven <=32-lane exact path,
+    // so split a wide prefill chunk here and stitch channel-major results.
+    // Later layers consume the projection folded into their CoreAI tail.
+    std::array<std::vector<uint16_t>*, 4> destinations = {
+        &output.qkv, &output.z, &output.beta, &output.a
+    };
+    for (size_t i = 0; i < projections_.size(); ++i)
+        destinations[i]->assign(projections_[i].output_dim() * lanes, 0);
+
+    std::vector<uint16_t> chunk_input;
+    std::vector<uint16_t> chunk_output;
+    for (size_t offset = 0; offset < lanes; offset += projection_width) {
+        const size_t chunk_lanes = std::min(projection_width, lanes - offset);
+        chunk_input.resize(5120 * chunk_lanes);
+        for (size_t c = 0; c < 5120; ++c)
+            std::memcpy(chunk_input.data() + c * chunk_lanes,
+                        hidden + c * lanes + offset,
+                        chunk_lanes * sizeof(uint16_t));
+        for (size_t i = 0; i < projections_.size(); ++i) {
+            if (!projections_[i].evaluate(chunk_input.data(), chunk_lanes,
+                                          chunk_output)) return false;
+            const size_t rows = projections_[i].output_dim();
+            if (chunk_output.size() != rows * chunk_lanes) return false;
+            for (size_t r = 0; r < rows; ++r)
+                std::memcpy(destinations[i]->data() + r * lanes + offset,
+                            chunk_output.data() + r * chunk_lanes,
+                            chunk_lanes * sizeof(uint16_t));
+        }
+    }
+    return true;
 }
 
 bool RindiGdnLayer::step(const uint16_t* hidden, size_t lanes,
@@ -251,14 +347,35 @@ bool RindiGdnLayer::core_from_projected_view(const RindiGdnProjectionView& p,
                                              size_t lanes,
                                              std::vector<uint16_t>& core,
                                              std::vector<uint16_t>& z) {
-    if (!ready_ || lanes == 0 || lanes > width_) return false;
+    if (!ready_ || lanes == 0 || lanes > width_) {
+        std::fprintf(stderr, "[GdnCore] reject: ready=%d lanes=%zu width=%zu\n",
+                     ready_, lanes, width_);
+        return false;
+    }
     constexpr size_t H = 48, D = 128, V = 128, HK = H * D, W = 160;
     constexpr size_t C = HK + 2 * H;
-    if (!conv_.evaluate(p.qkv, lanes, activated_scratch_)) return false;
+    const bool profile = std::getenv("RINDI_GDN_PROFILE") != nullptr;
+    const auto profile_start = std::chrono::high_resolution_clock::now();
+    if (!conv_.evaluate(p.qkv, lanes, activated_scratch_)) {
+        std::fprintf(stderr, "[GdnCore] conv evaluate failed\n");
+        return false;
+    }
+    const auto conv_end = std::chrono::high_resolution_clock::now();
     const std::vector<uint16_t>& activated = activated_scratch_;
     // z carries in_proj_z's HK channels per lane; the packed-surface count
     // C includes the value/beta channel groups and must not size it.
     z.assign(p.z, p.z + HK * lanes);
+
+    // Wide-prefill fast path: normalize Q/K, form decay/beta, and advance the
+    // recurrent state in one Metal command buffer. Decode deliberately keeps
+    // the existing lane-1 path so this feature cannot change decode behavior.
+    if (lanes > 1 && (std::getenv("RINDI_GDN_METAL_PREP") ||
+                      std::getenv("RINDI_QWEN_PREFILL_FAST"))) {
+        const bool ok = recurrence_.step_batch_raw(
+            activated.data(), p.a, p.beta, a_log_.data(), dt_bias_.data(),
+            lanes, core);
+        if (ok && core.size() == H * V * lanes) return true;
+    }
 
     // The packed [C, W] surface is only consumed by the legacy per-lane ANE
     // fallback below; building it for the batch path was pure waste.
@@ -314,6 +431,7 @@ bool RindiGdnLayer::core_from_projected_view(const RindiGdnProjectionView& p,
             }
         }
     }
+    const auto prepare_end = std::chrono::high_resolution_clock::now();
 
     // Always take the Metal batched recurrence, lanes == 1 included: base
     // decoding and speculative verification must execute the IDENTICAL
@@ -321,10 +439,35 @@ bool RindiGdnLayer::core_from_projected_view(const RindiGdnProjectionView& p,
     // logits and speculative output stops being exact. The legacy ANE
     // single-step path remains reachable only via RINDI_DISABLE_METAL_RECURRENCE.
     if (!std::getenv("RINDI_DISABLE_METAL_RECURRENCE")) {
-        if (recurrence_.step_batch(decay_batch, key_batch,
-                                   query_batch, value_batch,
-                                   beta_batch, lanes, core) &&
-            core.size() == H * V * lanes) {
+        const bool recurrence_ok = recurrence_.step_batch(
+            decay_batch, key_batch, query_batch, value_batch,
+            beta_batch, lanes, core) && core.size() == H * V * lanes;
+        const auto recurrence_end = std::chrono::high_resolution_clock::now();
+        if (profile) {
+            struct ProfileTotals {
+                double conv_ms{0.0};
+                double prepare_ms{0.0};
+                double recurrence_ms{0.0};
+                size_t calls{0};
+            };
+            static thread_local ProfileTotals totals;
+            const auto elapsed = [](const auto& begin, const auto& end) {
+                return std::chrono::duration<double, std::milli>(end - begin).count();
+            };
+            totals.conv_ms += elapsed(profile_start, conv_end);
+            totals.prepare_ms += elapsed(conv_end, prepare_end);
+            totals.recurrence_ms += elapsed(prepare_end, recurrence_end);
+            if (++totals.calls == 48) {
+                std::fprintf(stderr,
+                    "[GdnProfile] calls=%zu conv_ms=%.3f prepare_ms=%.3f "
+                    "recurrence_ms=%.3f total_ms=%.3f\n",
+                    totals.calls, totals.conv_ms, totals.prepare_ms,
+                    totals.recurrence_ms,
+                    totals.conv_ms + totals.prepare_ms + totals.recurrence_ms);
+                totals = ProfileTotals{};
+            }
+        }
+        if (recurrence_ok) {
             return true;
         }
     }

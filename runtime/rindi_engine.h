@@ -59,6 +59,7 @@ public:
 
     bool is_ready() const { return ready_; }
     const std::string& get_model_name() const { return model_name_; }
+    size_t context_length() const { return context_length_; }
 
     // Full real generation over 27B weights
     std::string generate(
@@ -79,6 +80,13 @@ public:
         const std::string& reasoning_effort = "xhigh"
     );
 
+    // Teacher-forced average negative log-likelihood over tokenizer tokens.
+    // This is a read-only evaluation entry point: it resets sequence state,
+    // prefills causally in the configured lane width, and scores token t+1
+    // from token t's hidden state through the selected production LM head.
+    bool score_text(const std::string& text, size_t max_tokens,
+                    double& average_nll, size_t& scored_tokens);
+
     double get_last_eval_ms() const { return last_eval_ms_; }
     const GenerationStats& get_last_stats() const { return last_stats_; }
 
@@ -89,6 +97,7 @@ private:
 
     size_t hidden_dim_{5120};
     size_t ane_width_{32};   // ANE program lane width (RINDI_ANE_WIDTH)
+    size_t context_length_{128 * 1024};
     size_t num_layers_{64};
 
     BPETokenizer tokenizer_;
@@ -117,8 +126,8 @@ private:
     MtpBlock mtp_;
     bool mtp_ready_{false};
     int mtp_depth_{2};
-    // int4 copy of lm_head used ONLY for draft-token argmax (4x less weight
-    // traffic per drafted token than the BF16 head).
+    // Groupwise INT4 copy of lm_head. MTP always uses it for draft-token
+    // argmax; RINDI_INT4_LM_HEAD also promotes it to the target decode head.
     RindiAneProjection lm_head_draft_;
     bool lm_head_draft_ready_{false};
 
@@ -138,11 +147,13 @@ private:
 
     bool init_model();
     bool init_gpu_lm_head();
+    bool init_int4_lm_head();
     bool init_scheduler();
     bool init_mtp();
 
     // Greedy lm-head argmax over an already-normalized hidden vector.
     int argmax_token(const std::vector<uint16_t>& logits_input);
+    int int4_argmax_token(const std::vector<uint16_t>& logits_input);
     // Greedy argmax on the GPU BF16 head (falls back to CPU scan).
     // Shared by base decode AND speculation so near-tie rounding
     // decisions are identical on both paths.
@@ -207,7 +218,8 @@ private:
                        std::vector<uint16_t>& output);
     bool forward_prompt_batch(const std::vector<uint16_t>& input,
                               size_t lanes,
-                              std::vector<uint16_t>& output);
+                              std::vector<uint16_t>& output,
+                              bool allow_fast_projection_batch = false);
     bool apply_rms_norm(const std::vector<uint16_t>& input,
                         const std::vector<uint16_t>& weight,
                         std::vector<uint16_t>& output) const;

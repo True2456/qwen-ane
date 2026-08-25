@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "rindi_gdn_recurrence.h"
 #include "metal_engine.h"
+#include <iostream>
 #include <IOSurface/IOSurface.h>
 #include <algorithm>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -34,6 +36,11 @@ RindiGdnRecurrence::~RindiGdnRecurrence() {
     if (metal_value_) metal_buffer_release(metal_value_);
     if (metal_beta_) metal_buffer_release(metal_beta_);
     if (metal_output_) metal_buffer_release(metal_output_);
+    if (metal_activated_) metal_buffer_release(metal_activated_);
+    if (metal_a_) metal_buffer_release(metal_a_);
+    if (metal_b_) metal_buffer_release(metal_b_);
+    if (metal_a_log_) metal_buffer_release(metal_a_log_);
+    if (metal_dt_bias_) metal_buffer_release(metal_dt_bias_);
     if (request_) ane_request_release(request_);
     if (model_) ane_model_release(model_);
     if (input_surface_) CFRelease(input_surface_);
@@ -79,6 +86,29 @@ bool RindiGdnRecurrence::compile_prepared(ANEContext* ctx, size_t heads,
     mil += "    tensor<fp16, [1," + std::to_string(HK) + ",1," + std::to_string(V) + "]> sq = mul(x=s2, y=qq)[name=string(\"sq\")];\n";
     mil += "    tensor<fp16, [1," + std::to_string(H) + ",1," + std::to_string(V) + "]> y = conv(dilations=dl, groups=gh, pad=pd, pad_type=pt, strides=st, weight=gsum, x=sq)[name=string(\"y\")];\n  } -> (y, s2);\n}\n";
     model_ = ane_model_compile_mil(ctx_, mil.c_str(), names, data, sizes, 2, 0, 21);
+    if (!model_ && !std::getenv("RINDI_REQUIRE_ANE_RECURRENCE")) {
+        // macOS 27: legacy MIL fails verification. The batched Metal
+        // recurrence (step_batch) covers every lane count including decode,
+        // so allocate standalone Metal state and run without the ANE graph.
+        // The legacy step() path is unavailable in this mode.
+        metal_ctx_ = shared_recurrence_metal_context();
+        if (!metal_ctx_) return false;
+        metal_state_ = metal_buffer_create(metal_ctx_,
+            hidden_keys_ * value_dim_ * sizeof(uint16_t));
+        metal_decay_ = metal_buffer_create(metal_ctx_, heads_ * width_ * sizeof(uint16_t));
+        metal_key_ = metal_buffer_create(metal_ctx_, hidden_keys_ * width_ * sizeof(uint16_t));
+        metal_query_ = metal_buffer_create(metal_ctx_, hidden_keys_ * width_ * sizeof(uint16_t));
+        metal_value_ = metal_buffer_create(metal_ctx_, heads_ * value_dim_ * width_ * sizeof(uint16_t));
+        metal_beta_ = metal_buffer_create(metal_ctx_, heads_ * width_ * sizeof(uint16_t));
+        metal_output_ = metal_buffer_create(metal_ctx_, heads_ * value_dim_ * width_ * sizeof(uint16_t));
+        if (!metal_state_ || !metal_decay_ || !metal_key_ || !metal_query_ ||
+            !metal_value_ || !metal_beta_ || !metal_output_) return false;
+        std::memset(metal_buffer_get_contents(metal_state_), 0,
+                    hidden_keys_ * value_dim_ * sizeof(uint16_t));
+        std::cerr << "[RindiGDN] recurrence: Metal-only mode (no ANE graph)"
+                  << std::endl;
+        return true;
+    }
     if (!model_) return false;
     input_surface_ = metal_create_iosurface(input_channels_ * width_ * 2);
     output_surface_ = metal_create_iosurface(heads_ * value_dim_ * 2);
@@ -116,7 +146,8 @@ bool RindiGdnRecurrence::compile_prepared(ANEContext* ctx, size_t heads,
 
 bool RindiGdnRecurrence::compile(ANEContext* ctx, size_t heads, size_t key_dim,
                                  size_t value_dim, size_t width) {
-    if (!ctx || heads == 0 || key_dim == 0 || value_dim == 0 || width < value_dim + 5) return false;
+    if (heads == 0 || key_dim == 0 || value_dim == 0 || width < value_dim + 5) return false;
+    if (!ctx && !std::getenv("RINDI_TAIL_COREAI")) return false;
     return compile_prepared(ctx, heads, key_dim, value_dim, width);
     ctx_ = ctx; heads_ = heads; key_dim_ = key_dim; value_dim_ = value_dim;
     hidden_keys_ = heads_ * key_dim_; input_channels_ = hidden_keys_ + 2 * heads_; width_ = width;
@@ -216,7 +247,12 @@ bool RindiGdnRecurrence::compile(ANEContext* ctx, size_t heads, size_t key_dim,
 }
 
 void RindiGdnRecurrence::reset() {
-    if (!state_surface_) return;
+    if (!state_surface_) {
+        if (metal_state_)
+            std::memset(metal_buffer_get_contents(metal_state_), 0,
+                        hidden_keys_ * value_dim_ * sizeof(uint16_t));
+        return;
+    }
     std::memset(IOSurfaceGetBaseAddress(state_surface_), 0,
                 hidden_keys_ * value_dim_ * 2);
     if (metal_state_) {
@@ -251,7 +287,11 @@ bool RindiGdnRecurrence::step_batch(const uint16_t* decay, const uint16_t* key,
                                     std::vector<uint16_t>& output) {
     if (!decay || !key || !query || !value || !beta || lanes == 0 || lanes > width_ ||
         !metal_ctx_ || !metal_state_ || !metal_decay_ || !metal_key_ ||
-        !metal_query_ || !metal_value_ || !metal_beta_ || !metal_output_) return false;
+        !metal_query_ || !metal_value_ || !metal_beta_ || !metal_output_) {
+        std::fprintf(stderr, "[GdnRec] step_batch reject: lanes=%zu width=%zu ctx=%d state=%d\n",
+                     lanes, width_, metal_ctx_!=nullptr, metal_state_!=nullptr);
+        return false;
+    }
     std::memcpy(metal_buffer_get_contents(metal_decay_), decay,
                 heads_ * lanes * sizeof(uint16_t));
     std::memcpy(metal_buffer_get_contents(metal_key_), key,
@@ -264,11 +304,81 @@ bool RindiGdnRecurrence::step_batch(const uint16_t* decay, const uint16_t* key,
                 heads_ * lanes * sizeof(uint16_t));
     MetalCommandBufferHandle cmd = metal_command_buffer_create(metal_ctx_);
     if (!cmd) return false;
-    metal_dispatch_gdn_recurrence(
-        metal_ctx_, cmd, metal_state_, metal_decay_, metal_key_, metal_query_,
-        metal_value_, metal_beta_, metal_output_, static_cast<int>(heads_),
-        static_cast<int>(key_dim_), static_cast<int>(value_dim_),
-        static_cast<int>(lanes));
+    if (lanes > 1 && (std::getenv("RINDI_GDN_PARALLEL_K") ||
+                      std::getenv("RINDI_QWEN_PREFILL_FAST"))) {
+        metal_dispatch_gdn_recurrence_parallel(
+            metal_ctx_, cmd, metal_state_, metal_decay_, metal_key_, metal_query_,
+            metal_value_, metal_beta_, metal_output_, static_cast<int>(heads_),
+            static_cast<int>(key_dim_), static_cast<int>(value_dim_),
+            static_cast<int>(lanes));
+    } else {
+        metal_dispatch_gdn_recurrence(
+            metal_ctx_, cmd, metal_state_, metal_decay_, metal_key_, metal_query_,
+            metal_value_, metal_beta_, metal_output_, static_cast<int>(heads_),
+            static_cast<int>(key_dim_), static_cast<int>(value_dim_),
+            static_cast<int>(lanes));
+    }
+    metal_command_buffer_commit(cmd);
+    metal_command_buffer_wait(cmd);
+    output.resize(heads_ * value_dim_ * lanes);
+    std::memcpy(output.data(), metal_buffer_get_contents(metal_output_),
+                output.size() * sizeof(uint16_t));
+    return true;
+}
+
+bool RindiGdnRecurrence::step_batch_raw(
+    const uint16_t* activated, const uint16_t* a, const uint16_t* b,
+    const uint16_t* a_log, const uint16_t* dt_bias, size_t lanes,
+    std::vector<uint16_t>& output) {
+    constexpr size_t kActivatedChannels = 10240;
+    if (!activated || !a || !b || !a_log || !dt_bias || lanes == 0 ||
+        lanes > width_ || !metal_ctx_ || !metal_state_ || !metal_decay_ ||
+        !metal_key_ || !metal_query_ || !metal_value_ || !metal_beta_ ||
+        !metal_output_) return false;
+    if (!metal_activated_) {
+        metal_activated_ = metal_buffer_create(metal_ctx_,
+            kActivatedChannels * width_ * sizeof(uint16_t));
+        metal_a_ = metal_buffer_create(metal_ctx_, heads_ * width_ * sizeof(uint16_t));
+        metal_b_ = metal_buffer_create(metal_ctx_, heads_ * width_ * sizeof(uint16_t));
+        metal_a_log_ = metal_buffer_create(metal_ctx_, heads_ * sizeof(uint16_t));
+        metal_dt_bias_ = metal_buffer_create(metal_ctx_, heads_ * sizeof(uint16_t));
+    }
+    if (!metal_activated_ || !metal_a_ || !metal_b_ || !metal_a_log_ ||
+        !metal_dt_bias_) return false;
+    std::memcpy(metal_buffer_get_contents(metal_activated_), activated,
+                kActivatedChannels * lanes * sizeof(uint16_t));
+    std::memcpy(metal_buffer_get_contents(metal_a_), a,
+                heads_ * lanes * sizeof(uint16_t));
+    std::memcpy(metal_buffer_get_contents(metal_b_), b,
+                heads_ * lanes * sizeof(uint16_t));
+    std::memcpy(metal_buffer_get_contents(metal_a_log_), a_log,
+                heads_ * sizeof(uint16_t));
+    std::memcpy(metal_buffer_get_contents(metal_dt_bias_), dt_bias,
+                heads_ * sizeof(uint16_t));
+    MetalCommandBufferHandle cmd = metal_command_buffer_create(metal_ctx_);
+    if (!cmd) return false;
+    metal_dispatch_gdn_prepare(
+        metal_ctx_, cmd, metal_activated_, metal_a_, metal_b_, metal_a_log_,
+        metal_dt_bias_, metal_decay_, metal_key_, metal_query_, metal_value_,
+        metal_beta_, static_cast<int>(lanes));
+    // macOS 27 beta build 26A5421a exposed run-to-run drift in the simdgroup
+    // K reduction.  The column-parallel kernel below has one GPU thread own
+    // each recurrent state column and therefore a fixed K accumulation order.
+    // Keep the reduction experiment explicit until it is repeatable across
+    // driver builds.
+    if (std::getenv("RINDI_GDN_PARALLEL_K")) {
+        metal_dispatch_gdn_recurrence_parallel(
+            metal_ctx_, cmd, metal_state_, metal_decay_, metal_key_, metal_query_,
+            metal_value_, metal_beta_, metal_output_, static_cast<int>(heads_),
+            static_cast<int>(key_dim_), static_cast<int>(value_dim_),
+            static_cast<int>(lanes));
+    } else {
+        metal_dispatch_gdn_recurrence(
+            metal_ctx_, cmd, metal_state_, metal_decay_, metal_key_, metal_query_,
+            metal_value_, metal_beta_, metal_output_, static_cast<int>(heads_),
+            static_cast<int>(key_dim_), static_cast<int>(value_dim_),
+            static_cast<int>(lanes));
+    }
     metal_command_buffer_commit(cmd);
     metal_command_buffer_wait(cmd);
     output.resize(heads_ * value_dim_ * lanes);

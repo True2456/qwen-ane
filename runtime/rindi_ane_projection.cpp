@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "rindi_ane_projection.h"
 #include "metal_engine.h"
+#include "rindi_sme_engine.h"
 #include <IOSurface/IOSurface.h>
 #include <algorithm>
 #include <cmath>
@@ -85,6 +86,18 @@ MetalContext* shared_projection_metal_context() {
     return context;
 }
 
+thread_local bool g_prefill_batch_reductions = false;
+
+RindiSmeEngine& shared_projection_sme2_engine() {
+    static RindiSmeEngine engine([] {
+        const char* value = std::getenv("RINDI_SME2_WORKERS");
+        if (!value) return size_t{4};
+        const long parsed = std::strtol(value, nullptr, 10);
+        return static_cast<size_t>(std::max<long>(1, parsed));
+    }());
+    return engine;
+}
+
 std::vector<uint8_t> read_binary(const std::string& path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) return {};
@@ -97,12 +110,21 @@ std::vector<uint8_t> read_binary(const std::string& path) {
 }
 }
 
+bool RindiAneProjection::prefill_batch_reductions_enabled() {
+    return g_prefill_batch_reductions;
+}
+
+void RindiAneProjection::set_prefill_batch_reductions(bool enabled) {
+    g_prefill_batch_reductions = enabled;
+}
+
 RindiAneProjection::~RindiAneProjection() {
     if (metal_weights_) metal_buffer_release(metal_weights_);
     if (metal_scales_) metal_buffer_release(metal_scales_);
     if (metal_biases_) metal_buffer_release(metal_biases_);
     if (metal_input_) metal_buffer_release(metal_input_);
     if (metal_output_) metal_buffer_release(metal_output_);
+    if (metal_qmv_partials_) metal_buffer_release(metal_qmv_partials_);
     if (request_) ane_request_release(request_);
     if (model_) ane_model_release(model_);
     if (input_surface_) CFRelease(input_surface_);
@@ -154,7 +176,9 @@ bool RindiAneProjection::compile_chain_int4(
     metal_scales_ = metal_buffer_create(ctx, scales.size());
     metal_input_ = metal_buffer_create(ctx, input_dim * 32 * sizeof(uint16_t));
     metal_output_ = metal_buffer_create(ctx, output_dim * 32 * sizeof(uint16_t));
-    if (!metal_weights_ || !metal_scales_ || !metal_input_ || !metal_output_) return false;
+    metal_qmv_partials_ = metal_buffer_create(ctx, output_dim * 4 * sizeof(float));
+    if (!metal_weights_ || !metal_scales_ || !metal_input_ || !metal_output_ ||
+        !metal_qmv_partials_) return false;
     std::memcpy(metal_buffer_get_contents(metal_weights_), weights.data(), weights.size());
     std::memcpy(metal_buffer_get_contents(metal_scales_), scales.data(), scales.size());
     metal_packed_cols_ = packed_cols;
@@ -452,6 +476,26 @@ bool RindiAneProjection::evaluate(const uint16_t* input, size_t lanes,
     }
     if (metal_ready_ && lanes <= 32) {
         if (!metal_rowwise_) {
+            // Prompt prefill is already allowed to use batch-width-dependent
+            // reductions (and is guarded by its own quality gate).  Dispatch
+            // the channel-major groupwise GEMM here instead of issuing one
+            // command buffer and synchronization per lane.  Lane-1 decode and
+            // speculative verification keep the bit-identical GEMV below.
+            if (lanes > 1 && std::getenv("RINDI_QWEN_PREFILL_FAST") &&
+                prefill_batch_reductions_enabled()) {
+                std::memcpy(metal_buffer_get_contents(metal_input_), input,
+                            input_dim_ * lanes * sizeof(uint16_t));
+                MetalCommandBufferHandle cmd = metal_command_buffer_create(metal_ctx_);
+                if (!cmd) return false;
+                if (!metal_dispatch(metal_ctx_, cmd, metal_input_, metal_output_, lanes))
+                    return false;
+                metal_command_buffer_commit(cmd);
+                metal_command_buffer_wait(cmd);
+                output.resize(output_dim_ * lanes);
+                std::memcpy(output.data(), metal_buffer_get_contents(metal_output_),
+                            output.size() * sizeof(uint16_t));
+                return true;
+            }
             // P12 ROOT CAUSE of spec/base divergence: gemv_int4_groupwise
             // (lanes==1) and gemm_int4_groupwise (lanes>1) accumulate K in
             // different fp32 orders, so per-lane projection values depended on
@@ -514,29 +558,39 @@ bool RindiAneProjection::evaluate(const uint16_t* input, size_t lanes,
         }
     }
     if (host_ready_) {
-        if (lanes != 1) return false;
-        output.assign(output_dim_, 0);
+        if (lanes == 0) return false;
+        output.assign(output_dim_ * lanes, 0);
         if (host_groupwise_) {
             if (!host_loader_) return false;
-            for (size_t r = 0; r < output_dim_; ++r) {
-                float sum = 0.0f;
-                if (!host_loader_->dot_row_fp16(host_tensor_name_, r, input,
-                                                input_dim_, sum)) return false;
-                output[r] = float_to_fp16(sum);
+            std::vector<uint16_t> in_vec(input_dim_);
+            for (size_t lane = 0; lane < lanes; ++lane) {
+                for (size_t c = 0; c < input_dim_; ++c)
+                    in_vec[c] = input[c * lanes + lane];
+                for (size_t r = 0; r < output_dim_; ++r) {
+                    float sum = 0.0f;
+                    if (!host_loader_->dot_row_fp16(host_tensor_name_, r, in_vec.data(),
+                                                    input_dim_, sum)) return false;
+                    output[r * lanes + lane] = float_to_fp16(sum);
+                }
             }
             return true;
         }
-        for (size_t r = 0; r < output_dim_; ++r) {
-            float sum = 0.0f;
-            const uint8_t* packed = host_packed_.data() + r * input_dim_ / 2;
-            for (size_t c = 0; c < input_dim_; c += 2) {
-                const uint8_t byte = packed[c / 2];
-                const int q0 = (byte & 0x0f) < 8 ? (byte & 0x0f) : (byte & 0x0f) - 16;
-                const int q1 = ((byte >> 4) & 0x0f) < 8 ? ((byte >> 4) & 0x0f) : ((byte >> 4) & 0x0f) - 16;
-                sum += fp16_to_float(input[c]) * (q0 * host_scales_[r]);
-                sum += fp16_to_float(input[c + 1]) * (q1 * host_scales_[r]);
+        std::vector<uint16_t> in_vec(input_dim_);
+        for (size_t lane = 0; lane < lanes; ++lane) {
+            for (size_t c = 0; c < input_dim_; ++c)
+                in_vec[c] = input[c * lanes + lane];
+            for (size_t r = 0; r < output_dim_; ++r) {
+                float sum = 0.0f;
+                const uint8_t* packed = host_packed_.data() + r * input_dim_ / 2;
+                for (size_t c = 0; c < input_dim_; c += 2) {
+                    const uint8_t byte = packed[c / 2];
+                    const int q0 = (byte & 0x0f) < 8 ? (byte & 0x0f) : (byte & 0x0f) - 16;
+                    const int q1 = ((byte >> 4) & 0x0f) < 8 ? ((byte >> 4) & 0x0f) : ((byte >> 4) & 0x0f) - 16;
+                    sum += fp16_to_float(in_vec[c]) * (q0 * host_scales_[r]);
+                    sum += fp16_to_float(in_vec[c + 1]) * (q1 * host_scales_[r]);
+                }
+                output[r * lanes + lane] = float_to_fp16(sum);
             }
-            output[r] = float_to_fp16(sum);
         }
         return true;
     }
@@ -562,7 +616,23 @@ bool RindiAneProjection::metal_dispatch(
     if (!metal_ready_ || !ctx || !cmd || !input || !output || lanes == 0 || lanes > 32)
         return false;
     if (metal_rowwise_) {
-        if (lanes > 1 && input_offset == 0 && output_offset == 0 &&
+        if (lanes == 1 && !std::getenv("RINDI_METAL_QMV_LEGACY")) {
+            if (input_dim_ >= 12288 && output_dim_ <= 8192 &&
+                metal_qmv_partials_ && !std::getenv("RINDI_METAL_QMV_NO_SPLITK")) {
+                metal_dispatch_gemv_int4_rowwise_simd_splitk_offset(
+                    ctx, cmd, input, input_offset, metal_weights_, metal_scales_,
+                    metal_qmv_partials_, output, output_offset,
+                    static_cast<int>(output_dim_), static_cast<int>(input_dim_),
+                    static_cast<int>(metal_packed_cols_), 0,
+                    static_cast<int>(output_dim_), 4);
+            } else {
+                metal_dispatch_gemv_int4_rowwise_simd_offset(
+                    ctx, cmd, input, input_offset, metal_weights_, metal_scales_,
+                    output, output_offset, static_cast<int>(output_dim_),
+                    static_cast<int>(input_dim_), static_cast<int>(metal_packed_cols_),
+                    0, static_cast<int>(output_dim_));
+            }
+        } else if (lanes > 1 && input_offset == 0 && output_offset == 0 &&
                    !std::getenv("RINDI_METAL_GEMM_BATCH") &&
                    !std::getenv("RINDI_DISABLE_BATCH_GEMM")) {
             metal_dispatch_gemm_int4_rw_simd(
@@ -611,6 +681,52 @@ bool RindiAneProjection::metal_dispatch(
                 static_cast<int>(input_dim_), static_cast<int>(metal_packed_cols_),
                 static_cast<int>(metal_groups_), static_cast<int>(lanes));
         }
+    }
+    return true;
+}
+
+bool RindiAneProjection::sme2_evaluate_rowwise(const uint16_t* input,
+                                                uint16_t* output) const {
+    return sme2_evaluate_rowwise_range(input, output, 0, output_dim_);
+}
+
+bool RindiAneProjection::sme2_evaluate_rowwise_range(
+    const uint16_t* input, uint16_t* output,
+    size_t row_start, size_t row_count) const {
+    if (!input || !output || !metal_ready_ || !metal_rowwise_ ||
+        !metal_weights_ || !metal_scales_ || input_dim_ == 0 || output_dim_ == 0 ||
+        row_count == 0 || row_start + row_count > output_dim_)
+        return false;
+    auto& engine = shared_projection_sme2_engine();
+    if (!engine.is_available()) return false;
+    const auto* packed = static_cast<const uint8_t*>(
+        metal_buffer_get_contents(metal_weights_));
+    const auto* scales = static_cast<const uint16_t*>(
+        metal_buffer_get_contents(metal_scales_));
+    return packed && scales && engine.gemv_q4_rowwise_fp16(
+        input, packed + row_start * metal_packed_cols_, scales + row_start,
+        output + row_start, row_count, input_dim_);
+}
+
+bool RindiAneProjection::metal_dispatch_rowwise_range(
+    MetalContext* ctx, MetalCommandBufferHandle cmd,
+    MetalBufferHandle input, MetalBufferHandle output,
+    size_t row_start, size_t row_count) const {
+    if (!ctx || !cmd || !input || !output || !metal_ready_ || !metal_rowwise_ ||
+        row_count == 0 || row_start + row_count > output_dim_) return false;
+    if (input_dim_ >= 12288 && output_dim_ <= 8192 && metal_qmv_partials_ &&
+        !std::getenv("RINDI_METAL_QMV_NO_SPLITK")) {
+        metal_dispatch_gemv_int4_rowwise_simd_splitk_offset(
+            ctx, cmd, input, 0, metal_weights_, metal_scales_,
+            metal_qmv_partials_, output, 0, static_cast<int>(output_dim_),
+            static_cast<int>(input_dim_), static_cast<int>(metal_packed_cols_),
+            static_cast<int>(row_start), static_cast<int>(row_count), 4);
+    } else {
+        metal_dispatch_gemv_int4_rowwise_simd_offset(
+            ctx, cmd, input, 0, metal_weights_, metal_scales_, output, 0,
+            static_cast<int>(output_dim_), static_cast<int>(input_dim_),
+            static_cast<int>(metal_packed_cols_), static_cast<int>(row_start),
+            static_cast<int>(row_count));
     }
     return true;
 }

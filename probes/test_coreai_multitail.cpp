@@ -12,6 +12,8 @@
 #include <chrono>
 #include <dirent.h>
 #include <algorithm>
+#include <mach/mach.h>
+#include <mach/task_info.h>
 #include <dlfcn.h>
 
 extern "C" {
@@ -29,6 +31,7 @@ int main(int argc, char** argv) {
     int maxN = argc > 2 ? atoi(argv[2]) : 64;
     int preferANE = argc > 3 ? atoi(argv[3]) : 1;
     const long S = argc > 4 ? atol(argv[4]) : 32;
+    const long P = argc > 5 ? atol(argv[5]) : 16480;   // folded next-proj width
     if (!dir) { fprintf(stderr, "need bundle dir\n"); return 1; }
 
     // discover bundles sorted by layer id
@@ -48,7 +51,7 @@ int main(int argc, char** argv) {
 
     const long ROWS = S, COLS = 5120 + 6144;      // token-major tail input
     std::vector<uint16_t> xin(ROWS * COLS, 0x3800); // arbitrary pattern (0.5)
-    const size_t OUT = ROWS * 5120;
+    const size_t OUT = ROWS * (5120 + P);
     std::vector<uint16_t> out(OUT);
 
     // ---- load phase
@@ -72,10 +75,18 @@ int main(int argc, char** argv) {
     printf("[multi] total load: %.1f s (avg %.0f ms/bundle)\n",
            total_load / 1000.0, total_load / paths.size());
 
-    // resident memory probe
-    FILE* sf = fopen("/proc/self/statm", "r");
-    if (sf) { long rss = 0; fscanf(sf, "%ld", &rss); fclose(sf);
-              printf("[multi] RSS ~%.1f GB\n", rss * 4096 / 1e9); }
+    // resident memory probe (mach)
+    {
+        struct task_vm_info info;
+        mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+        if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                      (task_info_t)&info, &count) != KERN_SUCCESS) {
+            mach_msg_type_number_t c2 = TASK_VM_INFO_COUNT;
+            task_info(mach_task_self(), TASK_VM_INFO,
+                      (task_info_t)&info, &c2);
+        }
+        printf("[multi] resident %.2f GB\n", info.resident_size / 1e9);
+    }
 
     // ---- eval phase: one pass over all layers = one "token step" of tails
     for (int w = 0; w < 5; ++w)

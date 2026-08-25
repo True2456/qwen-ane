@@ -13,6 +13,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+static BOOL rindi_coreai_mode(void) {
+    // BOOL is C++ bool with the current SDK, so it cannot carry a -1
+    // uninitialized sentinel.  Keep the cached tri-state in an int.
+    static int mode = -1;
+    if (mode < 0) mode = getenv("RINDI_TAIL_COREAI") ? 1 : 0;
+    return mode ? YES : NO;
+}
+
 struct ANEContext {
     Class aneClientClass;
     Class aneInMemoryModelClass;
@@ -80,10 +88,12 @@ static void ane_install_compat_shims(void) {
         if (![cls instancesRespondToSelector:@selector(getUUID)]) {
             IMP getUUID = imp_implementationWithBlock(^(id self) {
                 id sid = nil;
-                if ([self respondsToSelector:@selector(string_id)])
-                    sid = [self string_id];
-                if (!sid && [self respondsToSelector:@selector(hexStringIdentifier)])
-                    sid = [self hexStringIdentifier];
+                const SEL stringID = NSSelectorFromString(@"string_id");
+                const SEL hexID = NSSelectorFromString(@"hexStringIdentifier");
+                if ([self respondsToSelector:stringID])
+                    sid = ((id (*)(id, SEL))objc_msgSend)(self, stringID);
+                if (!sid && [self respondsToSelector:hexID])
+                    sid = ((id (*)(id, SEL))objc_msgSend)(self, hexID);
                 return sid ?: @"rindi-compat";
             });
             class_addMethod(cls, @selector(getUUID), getUUID, "@@:");
@@ -136,10 +146,15 @@ ANEModel* ane_model_compile_mil(
     int instance_hint,
     int qos
 ) {
+    // NOTE: early-NULL guard removed - legacy attempts appear to initialize
+    // framework state that CoreAI specialize subsequently relies on.
     return ane_compile_mil_common(ctx, mil_text, weight_names, weight_data,
                                   weight_sizes, weight_count, instance_hint,
                                   qos, NO);
 }
+
+// macOS 27: legacy in-memory MIL compilation fails verification and its
+// failure paths corrupt the malloc heap (SIGTRAP later in ObjC/XPC setup).
 
 ANEModel* ane_model_compile_mil_env(
     ANEContext* ctx,
@@ -151,6 +166,7 @@ ANEModel* ane_model_compile_mil_env(
     int instance_hint,
     int qos
 ) {
+    if (rindi_coreai_mode()) return NULL;
     return ane_compile_mil_common(ctx, mil_text, weight_names, weight_data,
                                   weight_sizes, weight_count, instance_hint,
                                   qos, YES);

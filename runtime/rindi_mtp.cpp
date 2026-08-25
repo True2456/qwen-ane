@@ -50,7 +50,7 @@ void MtpBlock::rmsnorm16(const std::vector<uint16_t>& x,
 
 bool MtpBlock::compile(ANEContext* ane, const SafeTensorsLoader& shard,
                        size_t hidden_dim, size_t context) {
-    if (!ane || hidden_dim == 0 || !shard.has_tensor("mtp.fc.weight")) return false;
+    if ((!ane && !std::getenv("RINDI_TAIL_COREAI")) || hidden_dim == 0 || !shard.has_tensor("mtp.fc.weight")) return false;
     metal_ctx_ = shared_mtp_metal_context();
     if (!metal_ctx_) return false;
     hidden_dim_ = hidden_dim;

@@ -324,6 +324,45 @@ void metal_dispatch_gemm_int4_rowwise_offset(
     int lanes
 );
 
+/* Lane-1 MLX-style QMV: 4 simdgroups compute 32 output rows per threadgroup,
+ * splitting packed K over SIMD lanes and reusing each activation pair across
+ * eight rows. row_start/row_count permit concurrent disjoint SME2 work. */
+void metal_dispatch_gemv_int4_rowwise_simd_offset(
+    MetalContext* ctx,
+    MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle input_buf,
+    size_t input_offset,
+    MetalBufferHandle weight_buf,
+    MetalBufferHandle scale_buf,
+    MetalBufferHandle output_buf,
+    size_t output_offset,
+    int rows,
+    int logical_cols,
+    int packed_cols,
+    int row_start,
+    int row_count
+);
+
+/* Split-K lane-1 QMV for long-K/small-N projections. partial_buf must hold
+ * rows * split_k FP32 values. Reduction and FP16 scaling stay in one command. */
+void metal_dispatch_gemv_int4_rowwise_simd_splitk_offset(
+    MetalContext* ctx,
+    MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle input_buf,
+    size_t input_offset,
+    MetalBufferHandle weight_buf,
+    MetalBufferHandle scale_buf,
+    MetalBufferHandle partial_buf,
+    MetalBufferHandle output_buf,
+    size_t output_offset,
+    int rows,
+    int logical_cols,
+    int packed_cols,
+    int row_start,
+    int row_count,
+    int split_k
+);
+
 /* Tiled variant for exact ANE chain blobs (one FP16 scale per output row). */
 void metal_dispatch_gemm_int4_rowwise_tiled_offset(
     MetalContext* ctx,
@@ -414,6 +453,63 @@ void metal_dispatch_gdn_recurrence(
     int heads,
     int key_dim,
     int value_dim,
+    int lanes
+);
+
+/** Prefill recurrence with a 128-way parallel key contraction. */
+void metal_dispatch_gdn_recurrence_parallel(
+    MetalContext* ctx,
+    MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle state_buf,
+    MetalBufferHandle decay_buf,
+    MetalBufferHandle key_buf,
+    MetalBufferHandle query_buf,
+    MetalBufferHandle value_buf,
+    MetalBufferHandle beta_buf,
+    MetalBufferHandle output_buf,
+    int heads,
+    int key_dim,
+    int value_dim,
+    int lanes
+);
+
+/** Fused per-head RMSNorm and SiLU(z) gate for the Qwen GDN core. */
+void metal_dispatch_gdn_gate_core(
+    MetalContext* ctx,
+    MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle core_buf,
+    MetalBufferHandle z_buf,
+    MetalBufferHandle weight_buf,
+    MetalBufferHandle output_buf,
+    int lanes
+);
+
+/** Four-tap causal depthwise convolution plus SiLU. */
+void metal_dispatch_gdn_conv_silu(
+    MetalContext* ctx,
+    MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle current_buf,
+    MetalBufferHandle history_buf,
+    MetalBufferHandle weight_buf,
+    MetalBufferHandle output_buf,
+    int channels,
+    int lanes
+);
+
+/** Prepare normalized Q/K and gates directly into recurrence buffers. */
+void metal_dispatch_gdn_prepare(
+    MetalContext* ctx,
+    MetalCommandBufferHandle cmd_buf,
+    MetalBufferHandle activated_buf,
+    MetalBufferHandle a_buf,
+    MetalBufferHandle b_buf,
+    MetalBufferHandle a_log_buf,
+    MetalBufferHandle dt_bias_buf,
+    MetalBufferHandle decay_buf,
+    MetalBufferHandle key_buf,
+    MetalBufferHandle query_buf,
+    MetalBufferHandle value_buf,
+    MetalBufferHandle beta_buf,
     int lanes
 );
 

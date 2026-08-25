@@ -57,7 +57,25 @@ public:
                         MetalBufferHandle input, MetalBufferHandle output,
                         size_t lanes, size_t input_offset = 0,
                         size_t output_offset = 0) const;
+    // Lane-1 signed-rowwise Q4 projection through the shared SME2 backend.
+    // Deliberately explicit: model planners select it per shape after an
+    // energy/latency A/B; evaluate() and metal_dispatch() keep their behavior.
+    bool sme2_evaluate_rowwise(const uint16_t* input, uint16_t* output) const;
+    bool sme2_evaluate_rowwise_range(const uint16_t* input, uint16_t* output,
+                                     size_t row_start, size_t row_count) const;
+    bool metal_dispatch_rowwise_range(MetalContext* ctx,
+                                      MetalCommandBufferHandle cmd,
+                                      MetalBufferHandle input,
+                                      MetalBufferHandle output,
+                                      size_t row_start,
+                                      size_t row_count) const;
+    bool sme2_rowwise_ready() const { return metal_ready_ && metal_rowwise_; }
     bool metal_ready() const { return metal_ready_; }
+    // Scoped by RindiEngine around true prompt ingestion. Keeping this
+    // thread-local prevents the faster reduction order from leaking into MTP
+    // verification/rebuild batches that require lane-1-identical numerics.
+    static bool prefill_batch_reductions_enabled();
+    static void set_prefill_batch_reductions(bool enabled);
     size_t input_dim() const { return input_dim_; }
     size_t output_dim() const { return output_dim_; }
     size_t width() const { return width_; }
@@ -90,6 +108,7 @@ private:
     MetalBufferHandle metal_biases_{nullptr};
     MetalBufferHandle metal_input_{nullptr};
     MetalBufferHandle metal_output_{nullptr};
+    MetalBufferHandle metal_qmv_partials_{nullptr};
     size_t metal_packed_cols_{0};
     size_t metal_groups_{0};
 };

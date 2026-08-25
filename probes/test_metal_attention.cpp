@@ -116,11 +116,24 @@ int main(int argc, char** argv) {
     // int4 projections only.
     ANEContext* ane = ane_context_create();
     if (!ane) { std::fprintf(stderr, "FAIL ane_context_create\n"); return 2; }
-    if (!attn.compile_core(ane, loader, layer, 4096, 32)) {
+    size_t context = 4096;
+    size_t width = 32;
+    if (const char* reserve = std::getenv("RINDI_TEST_RESERVE_CONTEXT")) {
+        context = static_cast<size_t>(std::strtoull(reserve, nullptr, 10));
+        width = 128;
+    }
+    if (!attn.compile_core(ane, loader, layer, context, width)) {
         std::fprintf(stderr, "FAIL compile_core layer %d\n", layer);
         return 2;
     }
-    std::printf("layer=%d context=4096\n", layer);
+    std::printf("layer=%d context=%zu width=%zu\n", layer, context, width);
+    if (std::getenv("RINDI_TEST_RESERVE_CONTEXT")) {
+        const bool pass = attn.reserve_context(context);
+        std::printf("ATTENTION_RESERVE=%s rows=%zu width=%zu\n",
+                    pass ? "PASS" : "FAIL", context, width);
+        ane_context_destroy(ane);
+        return pass ? 0 : 1;
+    }
 
     std::mt19937 rng(0x523138u);
     const std::vector<size_t> decode_calls{1, 1, 1};

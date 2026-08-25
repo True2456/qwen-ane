@@ -38,6 +38,11 @@ uint16_t engine_float_to_half(float value) {
 
 RindiEngine::RindiEngine(const std::string& model_path)
     : model_path_(model_path) {
+    // Quality-qualified default for this Qwen-native engine. All accelerated
+    // stages are guarded by lanes > 1, so decode keeps its existing path.
+    if (!std::getenv("RINDI_QWEN_PREFILL_FAST") &&
+        !std::getenv("RINDI_DISABLE_QWEN_PREFILL_FAST"))
+        setenv("RINDI_QWEN_PREFILL_FAST", "1", 0);
     ready_ = init_model();
 }
 
@@ -46,18 +51,54 @@ RindiEngine::~RindiEngine() {
     if (lm_head_logits_gpu_) metal_buffer_release(lm_head_logits_gpu_);
     if (lm_head_input_gpu_) metal_buffer_release(lm_head_input_gpu_);
     if (lm_head_token_gpu_) metal_buffer_release(lm_head_token_gpu_);
-    if (metal_ctx_) {
-        metal_context_destroy(metal_ctx_);
-    }
+    // Deliberately do NOT destroy metal_ctx_: shared projection/recurrence
+    // sub-contexts hold device resources tied to this context; destroying it
+    // here trips os_unfair_lock ownership aborts at teardown. The process is
+    // exiting - reclaiming 2 pages of context state is not worth the risk.
+    (void)metal_ctx_;
 }
+
+extern "C" void* rindi_ane_load(const char*, int);
+extern "C" const char* rindi_ane_last_error(void);
 
 bool RindiEngine::init_model() {
     std::cout << "[RindiEngine] Initializing Apple Silicon 27B Model Engine..." << std::endl;
 
+    if (const char* e = std::getenv("RINDI_CONTEXT_LENGTH")) {
+        const unsigned long long requested = std::strtoull(e, nullptr, 10);
+        if (requested >= 256 && requested <= 262144)
+            context_length_ = static_cast<size_t>(requested);
+        else
+            std::cerr << "[RindiEngine] Ignoring invalid RINDI_CONTEXT_LENGTH="
+                      << e << " (valid range: 256..262144)" << std::endl;
+    }
+    std::cout << "  [Context] KV capacity " << context_length_
+              << " tokens (lazy allocation)" << std::endl;
+
     // 1. Initialize Metal Context
-    metal_ctx_ = metal_context_create();
+    const bool no_early_metal = std::getenv("RINDI_NO_EARLY_METAL") != nullptr;
+    if (!no_early_metal) {
+        metal_ctx_ = metal_context_create();
+    }
     if (metal_ctx_) {
         std::cout << "  [Metal GPU] " << metal_get_device_name(metal_ctx_) << " initialized." << std::endl;
+    }
+
+    // 1a. Determine ANE lane width early.
+    {
+        size_t w = 32;
+        if (const char* e = std::getenv("RINDI_ANE_WIDTH")) {
+            size_t v = (size_t)std::atoi(e);
+            if (v >= 32 && v <= 256 && (v % 32) == 0) w = v;
+        }
+        ane_width_ = w;
+    }
+
+    if (std::getenv("RINDI_TAIL_COREAI")) {
+        chain_ = std::make_unique<RindiNativeChain>(hidden_dim_, ane_width_);
+        for (size_t layer = 0; layer < num_layers_; ++layer) {
+            chain_->compile_layer(static_cast<int>(layer), "", safetensors_);
+        }
     }
 
     // 2. Load Tokenizer
@@ -103,10 +144,12 @@ bool RindiEngine::init_model() {
         }
         lm_head_loader_.close();
     }
+    const bool int4_target_requested =
+        std::getenv("RINDI_INT4_LM_HEAD") != nullptr;
     if (!has_separate_lm_head_) {
         std::cerr << "[RindiEngine] Separate lm_head.weight not found; "
                       << "falling back to tied embedding head" << std::endl;
-    } else if (!init_gpu_lm_head()) {
+    } else if (!int4_target_requested && !init_gpu_lm_head()) {
         std::cerr << "[RindiEngine] Metal LM head setup failed; "
                   << "falling back to CPU LM-head sampling" << std::endl;
     }
@@ -126,11 +169,21 @@ bool RindiEngine::init_model() {
         }
         ane_width_ = w;
     }
-    chain_ = std::make_unique<RindiNativeChain>(hidden_dim_, ane_width_);
+    if (!chain_) chain_ = std::make_unique<RindiNativeChain>(hidden_dim_, ane_width_);
+
     scheduler_ready_ = init_scheduler();
     if (!scheduler_ready_) {
         std::cerr << "[RindiEngine] Native transformer scheduler failed to initialize" << std::endl;
         return false;
+    }
+
+    if (int4_target_requested && !init_int4_lm_head()) {
+        std::cerr << "[RindiEngine] INT4 target LM head unavailable; "
+                     "falling back to BF16 target head" << std::endl;
+        if (!init_gpu_lm_head()) {
+            std::cerr << "[RindiEngine] BF16 target-head fallback unavailable"
+                      << std::endl;
+        }
     }
 
     init_mtp();
@@ -169,18 +222,41 @@ bool RindiEngine::init_gpu_lm_head() {
     return true;
 }
 
+bool RindiEngine::init_int4_lm_head() {
+    if (lm_head_draft_ready_) return true;
+    if (!metal_ctx_ || !has_separate_lm_head_ ||
+        !lm_head_loader_.has_tensor("lm_head.weight")) return false;
+    lm_head_draft_ready_ = lm_head_draft_.compile_int4_from_bf16(
+        metal_ctx_, lm_head_loader_, "lm_head.weight");
+    if (lm_head_draft_ready_)
+        std::cout << "  [Metal GPU] "
+                  << (std::getenv("RINDI_INT4_LM_HEAD") ? "Target" : "Draft")
+                  << " LM head resident (groupwise INT4, BF16 scale/bias, "
+                     "FP16 logits)" << std::endl;
+    return lm_head_draft_ready_;
+}
+
 bool RindiEngine::init_scheduler() {
-    if (!chain_ || !chain_->ane_context()) return false;
-    const std::string ane_dir = model_path_ + "/ane_layers";
-    if (!safetensors_.has_tensor("layers.0.input_layernorm.weight") ||
-        !safetensors_.get_tensor_fp16("layers.0.input_layernorm.weight", first_input_norm_) ||
-        first_input_norm_.size() != hidden_dim_ ||
-        !safetensors_.get_tensor_fp16("norm.weight", final_norm_) ||
-        final_norm_.size() != hidden_dim_) {
+    if (!chain_) return false;
+    if (!chain_->ane_context() && !std::getenv("RINDI_TAIL_COREAI")) return false;
+    const auto load_norm = [&](const std::vector<std::string>& candidates, std::vector<uint16_t>& out) -> bool {
+        for (const auto& name : candidates) {
+            if (safetensors_.has_tensor(name) &&
+                safetensors_.get_tensor_fp16(name, out) &&
+                out.size() == hidden_dim_) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    if (!load_norm({"layers.0.input_layernorm.weight", "model.layers.0.input_layernorm.weight", "model.language_model.layers.0.input_layernorm.weight"}, first_input_norm_) ||
+        !load_norm({"norm.weight", "model.norm.weight", "model.language_model.norm.weight"}, final_norm_)) {
         std::cerr << "[RindiEngine] Missing input/final RMSNorm weights" << std::endl;
         return false;
     }
 
+    const std::string ane_dir = model_path_ + "/ane_layers";
     for (size_t layer = 0; layer < num_layers_; ++layer) {
         if (!chain_->compile_layer(static_cast<int>(layer), ane_dir, safetensors_)) {
             std::cerr << "[RindiEngine] Failed to compile fused tail " << layer << std::endl;
@@ -196,7 +272,7 @@ bool RindiEngine::init_scheduler() {
         if (safetensors_.has_tensor(p + "self_attn.o_proj.weight")) {
             attention_layers_[layer] = std::make_unique<RindiAttention>();
             if (!attention_layers_[layer]->compile_core(chain_->ane_context(), safetensors_,
-                                                        static_cast<int>(layer), 4096,
+                                                        static_cast<int>(layer), context_length_,
                                                         ane_width_)) {
                 std::cerr << "[RindiEngine] Failed to compile attention core " << layer << std::endl;
                 return false;
@@ -232,33 +308,19 @@ bool RindiEngine::init_mtp() {
         std::cout << "  [MTP] no mtp tensors in shard; disabled" << std::endl;
         return false;
     }
-    if (!mtp_.compile(chain_->ane_context(), lm_head_loader_, hidden_dim_, 4096)) {
+    if (!mtp_.compile(chain_->ane_context(), lm_head_loader_, hidden_dim_,
+                      context_length_)) {
         std::cout << "  [MTP] compile failed; speculative decode unavailable" << std::endl;
         return false;
     }
     // Draft-time head: quantized once at load; argmax scans the fp16 logits.
-    lm_head_draft_ready_ =
-        lm_head_draft_.compile_int4_from_bf16(metal_ctx_, lm_head_loader_,
-                                              "lm_head.weight");
+    if (!lm_head_draft_ready_) init_int4_lm_head();
     if (!lm_head_draft_ready_)
         std::cout << "  [MTP] draft lm_head unavailable; using BF16 head"
                   << std::endl;
     mtp_.set_embed_loader(&safetensors_);
     mtp_.set_argmax_fn([this](const std::vector<uint16_t>& norm) {
-        if (lm_head_draft_ready_) {
-            std::vector<uint16_t> logits;
-            if (lm_head_draft_.evaluate(norm.data(), 1, logits) &&
-                !logits.empty()) {
-                const size_t vocab = std::min(tokenizer_.vocab_size(), logits.size());
-                int best = 0;
-                float best_val = engine_half_to_float(logits[0]);
-                for (size_t v = 1; v < vocab; ++v) {
-                    const float val = engine_half_to_float(logits[v]);
-                    if (val > best_val) { best_val = val; best = static_cast<int>(v); }
-                }
-                return best;
-            }
-        }
+        if (lm_head_draft_ready_) return this->int4_argmax_token(norm);
         return this->argmax_token(norm);
     });
     mtp_ready_ = true;
@@ -270,11 +332,35 @@ bool RindiEngine::init_mtp() {
 // Greedy next-token via the GPU BF16 LM head (identical rounding on every
 // caller). Falls back to the CPU mmap scan when the GPU head is unavailable.
 int RindiEngine::greedy_argmax(const std::vector<uint16_t>& norm_hidden) {
-    std::vector<int> toks;
-    if (lm_head_gpu_ready_ &&
-        argmax_over_hidden(norm_hidden, 1, toks) &&
-        !toks.empty() && toks[0] >= 0) return toks[0];
-    return argmax_token(norm_hidden);
+    if (std::getenv("RINDI_INT4_LM_HEAD") && lm_head_draft_ready_) {
+        const int tok = int4_argmax_token(norm_hidden);
+        if (tok >= 0) return tok;
+    }
+    if (lm_head_gpu_ready_) {
+        const int tok = argmax_token(norm_hidden);
+        if (tok >= 0) return tok;
+    }
+    return -1;
+}
+
+int RindiEngine::int4_argmax_token(
+    const std::vector<uint16_t>& logits_input) {
+    if (!lm_head_draft_ready_ || logits_input.size() != hidden_dim_) return -1;
+    std::vector<uint16_t> logits;
+    if (!lm_head_draft_.evaluate(logits_input.data(), 1, logits) ||
+        logits.empty()) return -1;
+    const size_t vocab = std::min(tokenizer_.vocab_size(), logits.size());
+    if (vocab == 0) return -1;
+    int best = 0;
+    float best_value = engine_half_to_float(logits[0]);
+    for (size_t token = 1; token < vocab; ++token) {
+        const float value = engine_half_to_float(logits[token]);
+        if (value > best_value) {
+            best_value = value;
+            best = static_cast<int>(token);
+        }
+    }
+    return best;
 }
 
 int RindiEngine::argmax_token(const std::vector<uint16_t>& logits_input) {
@@ -319,8 +405,20 @@ bool RindiEngine::argmax_over_hidden(const std::vector<uint16_t>& hidden,
                                      size_t lanes, std::vector<int>& tokens) {
     tokens.assign(lanes, -1);
     const size_t vocab = std::min(tokenizer_.vocab_size(), size_t(248320));
-    if (!lm_head_gpu_ready_ || vocab == 0 || lanes == 0 || lanes > 32 ||
+    if (vocab == 0 || lanes == 0 || lanes > 32 ||
         hidden.size() != hidden_dim_ * lanes) return false;
+    if (std::getenv("RINDI_INT4_LM_HEAD") && lm_head_draft_ready_) {
+        std::vector<uint16_t> lane_in(hidden_dim_), lane_norm;
+        for (size_t lane = 0; lane < lanes; ++lane) {
+            for (size_t c = 0; c < hidden_dim_; ++c)
+                lane_in[c] = hidden[c * lanes + lane];
+            if (!apply_rms_norm(lane_in, final_norm_, lane_norm)) return false;
+            tokens[lane] = int4_argmax_token(lane_norm);
+            if (tokens[lane] < 0) return false;
+        }
+        return true;
+    }
+    if (!lm_head_gpu_ready_) return false;
     // Normalize each lane with the final norm into a row-major staging block.
     if (!lm_head_batch_input_) {
         lm_head_batch_input_ = metal_buffer_create(metal_ctx_, 32 * hidden_dim_ * sizeof(uint16_t));
@@ -381,6 +479,124 @@ bool RindiEngine::argmax_over_hidden(const std::vector<uint16_t>& hidden,
         }
     }
     return true;
+}
+
+bool RindiEngine::score_text(const std::string& text, size_t max_tokens,
+                             double& average_nll, size_t& scored_tokens) {
+    average_nll = 0.0;
+    scored_tokens = 0;
+    const bool use_int4_head =
+        std::getenv("RINDI_INT4_LM_HEAD") && lm_head_draft_ready_;
+    if (!scheduler_ready_ || (!lm_head_gpu_ready_ && !use_int4_head) ||
+        !metal_ctx_) return false;
+    std::vector<int> tokens = tokenizer_.encode(text);
+    if (max_tokens > 0 && tokens.size() > max_tokens) tokens.resize(max_tokens);
+    if (tokens.size() < 2) return false;
+    const size_t vocab = std::min(tokenizer_.vocab_size(), size_t(248320));
+    if (vocab == 0) return false;
+
+    if (!lm_head_batch_input_) {
+        lm_head_batch_input_ = metal_buffer_create(
+            metal_ctx_, 32 * hidden_dim_ * sizeof(uint16_t));
+        lm_head_batch_logits_ = metal_buffer_create(
+            metal_ctx_, 32 * vocab * sizeof(uint16_t));
+        lm_head_batch_tokens_ = metal_buffer_create(
+            metal_ctx_, 32 * sizeof(int32_t));
+    }
+    if (!lm_head_batch_input_ || !lm_head_batch_logits_) return false;
+
+    reset_scheduler();
+    const bool fast = std::getenv("RINDI_QWEN_PREFILL_FAST") ||
+                      std::getenv("RINDI_GDN_METAL_CONV");
+    const size_t prompt_lanes = fast ? ane_width_ : ane_width_ - 3;
+    double total_nll = 0.0;
+    std::vector<uint16_t> embedding;
+    std::vector<uint16_t> lane_hidden(hidden_dim_), lane_norm;
+
+    for (size_t offset = 0; offset + 1 < tokens.size(); offset += prompt_lanes) {
+        const size_t lanes = std::min(prompt_lanes, tokens.size() - 1 - offset);
+        std::vector<uint16_t> batch_input(hidden_dim_ * lanes);
+        for (size_t lane = 0; lane < lanes; ++lane) {
+            if (!safetensors_.get_embedding_row_fp16(
+                    tokens[offset + lane], hidden_dim_, embedding) ||
+                embedding.size() != hidden_dim_) return false;
+            for (size_t c = 0; c < hidden_dim_; ++c)
+                batch_input[c * lanes + lane] = embedding[c];
+        }
+        std::vector<uint16_t> hidden;
+        if (!forward_prompt_batch(batch_input, lanes, hidden, true) ||
+            hidden.size() != hidden_dim_ * lanes) return false;
+
+        for (size_t block = 0; block < lanes; block += 32) {
+            const size_t count = std::min<size_t>(32, lanes - block);
+            auto* staged = static_cast<uint16_t*>(
+                metal_buffer_get_contents(lm_head_batch_input_));
+            for (size_t lane = 0; lane < count; ++lane) {
+                for (size_t c = 0; c < hidden_dim_; ++c)
+                    lane_hidden[c] = hidden[c * lanes + block + lane];
+                if (!apply_rms_norm(lane_hidden, final_norm_, lane_norm))
+                    return false;
+                std::memcpy(staged + lane * hidden_dim_, lane_norm.data(),
+                            hidden_dim_ * sizeof(uint16_t));
+            }
+            if (use_int4_head) {
+                std::vector<uint16_t> quantized_logits;
+                for (size_t lane = 0; lane < count; ++lane) {
+                    if (!lm_head_draft_.evaluate(
+                            staged + lane * hidden_dim_, 1,
+                            quantized_logits) ||
+                        quantized_logits.size() < vocab) return false;
+                    float maximum = engine_half_to_float(quantized_logits[0]);
+                    for (size_t token = 1; token < vocab; ++token)
+                        maximum = std::max(maximum,
+                            engine_half_to_float(quantized_logits[token]));
+                    double denominator = 0.0;
+                    for (size_t token = 0; token < vocab; ++token)
+                        denominator += std::exp(static_cast<double>(
+                            engine_half_to_float(quantized_logits[token]) -
+                            maximum));
+                    const int target = tokens[offset + block + lane + 1];
+                    if (target < 0 || static_cast<size_t>(target) >= vocab)
+                        return false;
+                    const double target_logit =
+                        engine_half_to_float(quantized_logits[target]);
+                    total_nll += std::log(denominator) + maximum - target_logit;
+                    ++scored_tokens;
+                }
+                continue;
+            }
+            MetalCommandBufferHandle cmd = metal_command_buffer_create(metal_ctx_);
+            if (!cmd) return false;
+            metal_dispatch_gemm_bf16(
+                metal_ctx_, cmd, lm_head_batch_input_, lm_head_gpu_,
+                lm_head_batch_logits_, static_cast<int>(count),
+                static_cast<int>(vocab), static_cast<int>(hidden_dim_));
+            metal_command_buffer_commit(cmd);
+            metal_command_buffer_wait(cmd);
+            const uint16_t* logits = static_cast<const uint16_t*>(
+                metal_buffer_get_contents(lm_head_batch_logits_));
+            if (!logits) return false;
+            for (size_t lane = 0; lane < count; ++lane) {
+                const uint16_t* row = logits + lane * vocab;
+                float maximum = engine_half_to_float(row[0]);
+                for (size_t token = 1; token < vocab; ++token)
+                    maximum = std::max(maximum,
+                        engine_half_to_float(row[token]));
+                double denominator = 0.0;
+                for (size_t token = 0; token < vocab; ++token)
+                    denominator += std::exp(
+                        static_cast<double>(engine_half_to_float(row[token]) - maximum));
+                const int target = tokens[offset + block + lane + 1];
+                if (target < 0 || static_cast<size_t>(target) >= vocab) return false;
+                const double target_logit = engine_half_to_float(row[target]);
+                total_nll += std::log(denominator) + maximum - target_logit;
+                ++scored_tokens;
+            }
+        }
+    }
+    if (scored_tokens == 0) return false;
+    average_nll = total_nll / static_cast<double>(scored_tokens);
+    return std::isfinite(average_nll);
 }
 
 void RindiEngine::capture_snapshot(DecodeSnapshot& snap) const {
@@ -537,7 +753,7 @@ bool RindiEngine::rebuild_state_only(const std::vector<uint16_t>& verify_input,
                         }
                 }
             } else {
-                {
+                if (std::getenv("RINDI_DEBUG_SPECSTATE")) {
                     unsigned long long hh=1469598103934665603ull;
                     for(auto x:normalized){hh^=x;hh*=1099511628211ull;}
                     fprintf(stderr,"[RB0] norm_hash=%llx keep=%zu",(unsigned long long)hh,keep);
@@ -552,7 +768,7 @@ bool RindiEngine::rebuild_state_only(const std::vector<uint16_t>& verify_input,
                     for (size_t c=0;c<chz;++c){hz^=z[c*keep+0];hz*=1099511628211ull;}
                     fprintf(stderr,"\n[CORE0-RB] keep=%zu gated0=%llx z0=%llx",keep,(unsigned long long)hg,(unsigned long long)hz);
                 }
-                {
+                if (std::getenv("RINDI_DEBUG_SPECSTATE")) {
                     std::vector<uint16_t> c2,r2;
                     gdn_layers_[layer]->snapshot_state(c2,r2);
                     unsigned long long h1=1469598103934665603ull,h2=1469598103934665603ull;
@@ -737,10 +953,26 @@ void RindiEngine::debug_ab_wN(const std::vector<int>& toks) {
 
 bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
                                        size_t lanes,
-                                       std::vector<uint16_t>& output) {
+                                       std::vector<uint16_t>& output,
+                                       bool allow_fast_projection_batch) {
+    const bool previous_batch_reductions =
+        RindiAneProjection::prefill_batch_reductions_enabled();
+    RindiAneProjection::set_prefill_batch_reductions(
+        allow_fast_projection_batch &&
+        std::getenv("RINDI_QWEN_PREFILL_FAST") != nullptr);
+    struct ProjectionBatchGuard {
+        bool previous;
+        ~ProjectionBatchGuard() {
+            RindiAneProjection::set_prefill_batch_reductions(previous);
+        }
+    } projection_batch_guard{previous_batch_reductions};
     // GDN's causal convolution has three history columns in a 32-column ANE
     // surface, so at most 29 new prompt tokens can be submitted together.
-    const size_t max_prefill_lanes = chain_ ? chain_->get_seq_len() - 3 : 29;
+    const size_t max_prefill_lanes = chain_
+        ? ((std::getenv("RINDI_GDN_METAL_CONV") ||
+            std::getenv("RINDI_QWEN_PREFILL_FAST"))
+            ? chain_->get_seq_len() : chain_->get_seq_len() - 3)
+        : 29;
     if (spec_capture_) {
         spec_np_.assign(num_layers_, {});
         spec_np_ch_.assign(num_layers_, 0);
@@ -769,6 +1001,11 @@ bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
     std::vector<uint16_t>& core = batch_core_scratch_;
     std::vector<uint16_t>& z = batch_z_scratch_;
     std::vector<uint16_t>& gated = batch_gated_scratch_;
+    // Keep decode/speculation on the lane-invariant attention path. Wide
+    // prefill can use the causal Metal batch implementation once per chunk,
+    // avoiding 29 command-buffer round trips per attention layer.
+    const bool batch_prefill_attention = lanes >= 16 && !spec_capture_ &&
+        std::getenv("RINDI_PREFILL_BATCH_ATTENTION") != nullptr;
 
     for (size_t layer = 0; layer < num_layers_; ++layer) {
         const auto layer_start = std::chrono::high_resolution_clock::now();
@@ -797,21 +1034,39 @@ bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
                 // chunking. Required for speculative-decode exactness.
                 constexpr size_t QA = 24 * 256;
                 core.assign(QA * lanes, 0);
-                std::vector<uint16_t> n1(hidden_dim_), q, k, v, a1;
-                for (size_t lane = 0; lane < lanes; ++lane) {
-                    for (size_t c = 0; c < hidden_dim_; ++c)
-                        n1[c] = normalized[c * lanes + lane];
-                    if (!attention_layers_[layer]->project(n1.data(), 1, q, k, v) ||
-                        !attention_layers_[layer]->core_step_batch(q, k, v, 1, a1))
-                        return false;
-                    for (size_t h = 0; h < 24; ++h)
-                        for (size_t d = 0; d < 256; ++d) {
-                            const size_t c = h * 256 + d;
-                            const float gate = engine_half_to_float(q[h * 512 + 256 + d]);
-                            core[c * lanes + lane] = engine_float_to_half(
-                                engine_half_to_float(a1[c]) /
-                                (1.0f + std::exp(-gate)));
-                        }
+                std::vector<uint16_t> q, k, v, a1;
+                if (batch_prefill_attention) {
+                    if (!attention_layers_[layer]->project(
+                            normalized.data(), lanes, q, k, v) ||
+                        !attention_layers_[layer]->core_step_batch(
+                            q, k, v, lanes, a1)) return false;
+                    for (size_t lane = 0; lane < lanes; ++lane)
+                        for (size_t h = 0; h < 24; ++h)
+                            for (size_t d = 0; d < 256; ++d) {
+                                const size_t c = h * 256 + d;
+                                const float gate = engine_half_to_float(
+                                    q[(h * 512 + 256 + d) * lanes + lane]);
+                                core[c * lanes + lane] = engine_float_to_half(
+                                    engine_half_to_float(a1[c * lanes + lane]) /
+                                    (1.0f + std::exp(-gate)));
+                            }
+                } else {
+                    std::vector<uint16_t> n1(hidden_dim_);
+                    for (size_t lane = 0; lane < lanes; ++lane) {
+                        for (size_t c = 0; c < hidden_dim_; ++c)
+                            n1[c] = normalized[c * lanes + lane];
+                        if (!attention_layers_[layer]->project(n1.data(), 1, q, k, v) ||
+                            !attention_layers_[layer]->core_step_batch(q, k, v, 1, a1))
+                            return false;
+                        for (size_t h = 0; h < 24; ++h)
+                            for (size_t d = 0; d < 256; ++d) {
+                                const size_t c = h * 256 + d;
+                                const float gate = engine_half_to_float(q[h * 512 + 256 + d]);
+                                core[c * lanes + lane] = engine_float_to_half(
+                                    engine_half_to_float(a1[c]) /
+                                    (1.0f + std::exp(-gate)));
+                            }
+                    }
                 }
             } else {
                 std::vector<uint16_t> gated;
@@ -846,25 +1101,44 @@ bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
                 // P11: per-lane processing (width-invariance requirement).
                 constexpr size_t QA = 24 * 256;
                 core.assign(QA * lanes, 0);
-                std::vector<uint16_t> nq(QG), nk(K), nv(K), a1;
-                for (size_t lane = 0; lane < lanes; ++lane) {
-                    for (size_t c = 0; c < QG; ++c)
-                        nq[c] = next_projection[c * lanes + lane];
-                    for (size_t c = 0; c < K; ++c) {
-                        nk[c] = next_projection[(QG + c) * lanes + lane];
-                        nv[c] = next_projection[(QG + K + c) * lanes + lane];
-                    }
-                    if (!attention_layers_[layer]->core_step_batch(nq, nk, nv, 1, a1))
-                        return false;
-                    for (size_t h = 0; h < 24; ++h)
-                        for (size_t d = 0; d < 256; ++d) {
-                            const size_t c = h * 256 + d;
-                            const float gate = engine_half_to_float(
-                                next_projection[(h * 512 + 256 + d) * lanes + lane]);
-                            core[c * lanes + lane] = engine_float_to_half(
-                                engine_half_to_float(a1[c]) /
-                                (1.0f + std::exp(-gate)));
+                std::vector<uint16_t> a1;
+                if (batch_prefill_attention) {
+                    const uint16_t* nq = next_projection.data();
+                    const uint16_t* nk = nq + QG * lanes;
+                    const uint16_t* nv = nk + K * lanes;
+                    if (!attention_layers_[layer]->core_step_batch(
+                            nq, nk, nv, lanes, a1)) return false;
+                    for (size_t lane = 0; lane < lanes; ++lane)
+                        for (size_t h = 0; h < 24; ++h)
+                            for (size_t d = 0; d < 256; ++d) {
+                                const size_t c = h * 256 + d;
+                                const float gate = engine_half_to_float(
+                                    next_projection[(h * 512 + 256 + d) * lanes + lane]);
+                                core[c * lanes + lane] = engine_float_to_half(
+                                    engine_half_to_float(a1[c * lanes + lane]) /
+                                    (1.0f + std::exp(-gate)));
+                            }
+                } else {
+                    std::vector<uint16_t> nq(QG), nk(K), nv(K);
+                    for (size_t lane = 0; lane < lanes; ++lane) {
+                        for (size_t c = 0; c < QG; ++c)
+                            nq[c] = next_projection[c * lanes + lane];
+                        for (size_t c = 0; c < K; ++c) {
+                            nk[c] = next_projection[(QG + c) * lanes + lane];
+                            nv[c] = next_projection[(QG + K + c) * lanes + lane];
                         }
+                        if (!attention_layers_[layer]->core_step_batch(nq, nk, nv, 1, a1))
+                            return false;
+                        for (size_t h = 0; h < 24; ++h)
+                            for (size_t d = 0; d < 256; ++d) {
+                                const size_t c = h * 256 + d;
+                                const float gate = engine_half_to_float(
+                                    next_projection[(h * 512 + 256 + d) * lanes + lane]);
+                                core[c * lanes + lane] = engine_float_to_half(
+                                    engine_half_to_float(a1[c]) /
+                                    (1.0f + std::exp(-gate)));
+                            }
+                    }
                 }
             } else {
                 if (next_projection.size() != (QKV + Z + 2 * G) * lanes) return false;
@@ -890,8 +1164,11 @@ bool RindiEngine::forward_prompt_batch(const std::vector<uint16_t>& input,
         const auto core_end = std::chrono::high_resolution_clock::now();
         if (!chain_->evaluate_tail_batch(static_cast<int>(layer), core.data(),
                                          core.size() / lanes, residual.data(), lanes,
-                                         hidden, has_next ? &next_projection : nullptr))
+                                         hidden, has_next ? &next_projection : nullptr)) {
+            std::cerr << "[RindiEngine] tail eval failed layer=" << layer
+                      << " lanes=" << lanes << std::endl;
             return false;
+        }
         if (spec_capture_ && has_next) {
             spec_np_[layer + 1] = next_projection;
             spec_np_ch_[layer + 1] = next_projection.size() / lanes;
@@ -958,7 +1235,29 @@ int RindiEngine::sample_next_token(const std::vector<uint16_t>& hidden,
     top.reserve(64);
     std::vector<uint16_t> row;
 
-    if (lm_head_gpu_ready_ && vocab > 0) {
+    if (std::getenv("RINDI_INT4_LM_HEAD") && lm_head_draft_ready_ &&
+        vocab > 0) {
+        std::vector<uint16_t> quantized_logits;
+        if (lm_head_draft_.evaluate(hidden.data(), 1, quantized_logits) &&
+            quantized_logits.size() >= vocab) {
+            for (size_t token = 0; token < vocab; ++token) {
+                const float score =
+                    engine_half_to_float(quantized_logits[token]);
+                if (top.size() < 64)
+                    top.emplace_back(score, static_cast<int>(token));
+                else {
+                    auto worst = std::min_element(
+                        top.begin(), top.end(), [](const auto& a, const auto& b) {
+                            return a.first < b.first;
+                        });
+                    if (score > worst->first)
+                        *worst = {score, static_cast<int>(token)};
+                }
+            }
+        }
+    }
+
+    if (top.empty() && lm_head_gpu_ready_ && vocab > 0) {
         std::memcpy(metal_buffer_get_contents(lm_head_input_gpu_),
                     hidden.data(), hidden_dim_ * sizeof(uint16_t));
         const bool greedy = temperature <= 0.0f;
@@ -1167,6 +1466,24 @@ std::string RindiEngine::generate(
     if (prompt_tokens.empty()) {
         prompt_tokens = {tokenizer_.im_start_id(), tokenizer_.im_end_id()};
     }
+    if (prompt_tokens.size() > context_length_) {
+        std::cerr << "[RindiEngine] Prompt has " << prompt_tokens.size()
+                  << " tokens but context capacity is " << context_length_
+                  << std::endl;
+        return "";
+    }
+    // Prefill consumes one attention position per prompt token. The first
+    // sampled token comes directly from the final prompt hidden, so generation
+    // may use the remaining positions plus that initial sample.
+    const size_t generation_capacity =
+        context_length_ - prompt_tokens.size() + 1;
+    if (max_tokens > static_cast<int>(generation_capacity)) {
+        std::cerr << "[RindiEngine] Clamping max_tokens from " << max_tokens
+                  << " to " << generation_capacity
+                  << " to fit the context window" << std::endl;
+        max_tokens = static_cast<int>(generation_capacity);
+    }
+    if (max_tokens <= 0) return "";
 
     std::vector<uint16_t> embedding(hidden_dim_, 0);
     std::vector<uint16_t> hidden_state(hidden_dim_, 0);
@@ -1175,6 +1492,16 @@ std::string RindiEngine::generate(
     auto t0 = std::chrono::high_resolution_clock::now();
 
     reset_scheduler();
+    const size_t request_positions = std::min(
+        context_length_, prompt_tokens.size() +
+        static_cast<size_t>(std::max(0, max_tokens - 1)));
+    for (auto& attention : attention_layers_) {
+        if (attention && !attention->reserve_context(request_positions)) {
+            std::cerr << "[RindiEngine] Failed to reserve " << request_positions
+                      << " attention positions" << std::endl;
+            return "";
+        }
+    }
     // APC: if the prompt strictly extends the cached prefix, roll the model
     // back to end-of-prefix state and prefill only the suffix.
     size_t prefill_offset = 0;
@@ -1211,12 +1538,17 @@ std::string RindiEngine::generate(
 
     const auto prefill_start = std::chrono::high_resolution_clock::now();
 
-    // Prefill prompt chunks through the 32-column ANE tails. GDN's causal
+    // Prefill prompt chunks through the configured-width ANE tails. GDN's causal
     // convolution reserves three columns for history, leaving 29 live lanes.
     // Recurrent GDN and attention state are advanced in lane order inside the
     // batched core functions, while each fused tail is evaluated once per
     // chunk instead of once per token.
-    const size_t kPrefillLanes = ane_width_ - 3;   // minus GDN history columns
+    // The legacy ANE convolution stores its three history samples in the
+    // program width. The custom Metal convolution has separate history and
+    // can use every tail lane, avoiding a needless extra chunk at width 128.
+    const size_t kPrefillLanes = (std::getenv("RINDI_GDN_METAL_CONV") ||
+                                  std::getenv("RINDI_QWEN_PREFILL_FAST"))
+        ? ane_width_ : ane_width_ - 3;
     for (size_t offset = prefill_offset; offset < prompt_tokens.size(); offset += kPrefillLanes) {
         const size_t lanes = std::min(kPrefillLanes, prompt_tokens.size() - offset);
         std::vector<uint16_t> batch_input(hidden_dim_ * lanes);
@@ -1229,7 +1561,7 @@ std::string RindiEngine::generate(
                 batch_input[c * lanes + lane] = row[c];
         }
         std::vector<uint16_t> batch_hidden;
-        if (!forward_prompt_batch(batch_input, lanes, batch_hidden) ||
+        if (!forward_prompt_batch(batch_input, lanes, batch_hidden, true) ||
             batch_hidden.size() != hidden_dim_ * lanes) {
             std::cerr << "[RindiEngine] prompt batch failed at offset " << offset
                       << " lanes=" << lanes << std::endl;
@@ -1271,7 +1603,7 @@ std::string RindiEngine::generate(
     size_t generated_tokens = 0;
     bool got_first_token = false;
 
-    const bool spec = mtp_ready_ && mtp_depth_ > 0 && temperature <= 0.0f &&
+    const bool spec = mtp_ready_ && mtp_depth_ > 0 && (temperature <= 0.7f || std::getenv("RINDI_SPEC_DRAFT")) &&
                       prompt_tokens.size() > 0;
     const bool dbg_mtp = std::getenv("RINDI_DEBUG_MTP") != nullptr;
     size_t spec_steps = 0;
@@ -1344,7 +1676,7 @@ std::string RindiEngine::generate(
                 if (dbg_mtp) std::fprintf(stderr, "[MTPSAMPLE] ms=%.3f\n",
                     std::chrono::duration<double, std::milli>(
                         std::chrono::high_resolution_clock::now() - ts_sample).count());
-                if (cur == tokenizer_.eos_token_id()) break;
+                if (tokenizer_.is_stop_token(cur)) break;
                 emit(cur);
                 if (got_first_token == false) { first_token_time = std::chrono::high_resolution_clock::now(); got_first_token = true; }
             }
@@ -1386,7 +1718,7 @@ std::string RindiEngine::generate(
                 if (dbg_mtp) std::fprintf(stderr, "[MTPDRAFT] i=%d ms=%.3f\n", i,
                     std::chrono::duration<double, std::milli>(
                         std::chrono::high_resolution_clock::now() - ts_draft1).count());
-                if (t == tokenizer_.eos_token_id()) break;
+                if (tokenizer_.is_stop_token(t)) break;
                 drafts.push_back(t);
                 draft_hs.push_back(ho);
                 dtok = t;
@@ -1593,7 +1925,7 @@ std::string RindiEngine::generate(
                     std::fprintf(stderr, "\n");
                 }
                 std::vector<int> confirmed(drafts);
-                if (bonus != tokenizer_.eos_token_id()) confirmed.push_back(bonus);
+                if (!tokenizer_.is_stop_token(bonus)) confirmed.push_back(bonus);
                 const size_t allowed = max_tokens - generated_tokens;
                 if (dbg_mtp) {
                     std::fprintf(stderr, "[SPECEMIT] fast:");
@@ -1602,8 +1934,8 @@ std::string RindiEngine::generate(
                 }
                 const size_t took = emit_batch(confirmed, allowed);
                 cur = confirmed[took - 1];
-                if (took < confirmed.size() || bonus == tokenizer_.eos_token_id()) {
-                    if (bonus == tokenizer_.eos_token_id() && took == confirmed.size())
+                if (took < confirmed.size() || tokenizer_.is_stop_token(bonus)) {
+                    if (tokenizer_.is_stop_token(bonus) && took == confirmed.size())
                         cur = -1;
                     break;
                 }
@@ -1783,7 +2115,7 @@ std::string RindiEngine::generate(
                     : sample_next_token(fix_logits_input, temperature, rng);
                 std::vector<int> confirmed(drafts.begin(),
                                            drafts.begin() + n_ok);
-                if (fix != tokenizer_.eos_token_id()) confirmed.push_back(fix);
+                if (!tokenizer_.is_stop_token(fix)) confirmed.push_back(fix);
                 const size_t allowed = max_tokens - generated_tokens;
                 if (dbg_mtp) {
                     std::fprintf(stderr, "[SPECEMIT] norm:");
@@ -1791,7 +2123,7 @@ std::string RindiEngine::generate(
                     std::fprintf(stderr, "\n");
                 }
                 const size_t took = emit_batch(confirmed, allowed);
-                if (fix == tokenizer_.eos_token_id()) {
+                if (tokenizer_.is_stop_token(fix)) {
                     mtp_.restore_kv(snap.mtp_pos, {}, {});
                     break;
                 }
@@ -1851,7 +2183,7 @@ std::string RindiEngine::generate(
         int next_token_id = (temperature <= 0.0f)
             ? greedy_argmax(logits_input)
             : sample_next_token(logits_input, temperature, rng);
-        if (next_token_id == tokenizer_.eos_token_id()) break;
+        if (tokenizer_.is_stop_token(next_token_id)) break;
         if (std::getenv("RINDI_DEBUG_MTP"))
             std::fprintf(stderr, "[PLAINTRACE] emit %d\n", next_token_id);
         if (!got_first_token) {
