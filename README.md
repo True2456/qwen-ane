@@ -1,40 +1,134 @@
-# Running Qwen3.8-27B on the Apple Neural Engine
+# Rindi: Qwen3.8-27B on Apple Silicon ANE + Metal + SME2
 
-A working 27B LLM whose weights live on the Apple Neural Engine of an M5 Max,
-driven through the private `AppleNeuralEngine.framework` — no CoreML.
+Rindi is an experimental, native C/C++ inference engine and OpenAI-compatible
+server for Qwen3.8-27B. The current fast path combines official CoreAI execution
+on the Apple Neural Engine with custom Metal kernels and optional SME2 kernels;
+it does not require MLX, PyTorch, or Core ML at inference time.
+
+This is research software built and measured on an M5 Max running macOS 27
+beta. CoreAI and SME2 availability, compiler behavior, speed, and power can
+differ on other Apple Silicon and OS builds.
+
+### Model package
+
+The native engine expects a directory containing `gpu_backbone.safetensors`,
+the tokenizer/config files, and `ane_layers/`. Create it from the original
+Qwen checkpoint with the MLX-based exporter (MLX is needed for export, not for
+the resulting native inference process):
 
 ```bash
-tools/ane serve --ane-chain --ane-lm-head --dense-bits 4
+python3 tools/export_rindi_package.py \
+  --model "$HOME/.lmstudio/models/Qwen/Qwen3.8-27B" \
+  --output "$HOME/.lmstudio/models/Qwen/Qwen3.8-27B.rindi" \
+  --bits 4
 ```
 
-Answers on `http://127.0.0.1:1239/v1` (OpenAI-compatible).
+Qwen3.8 uses an untied output head. Keep the original checkpoint beside the
+`.rindi` directory so the engine can memory-map
+`model-00018-of-00018.safetensors`, or set `RINDI_LM_HEAD_FILE` to a readable
+safetensors file containing `lm_head.weight`.
 
-## Native C++ ANE + Metal server
+## Native server quick start
 
-The optimized native scheduler exposes an OpenAI-compatible endpoint for Pi
-and other chat-completions clients. Its default KV capacity is 131,072 tokens;
-host KV, Metal KV, and attention scratch grow lazily to the capacity required
-by each request. `RINDI_CONTEXT_LENGTH` may override the capacity in the range
-256..262144.
+Build the server, then point it at an exported `.rindi` model package:
 
 ```bash
+make -j8 runtime/rindi-server
+
 RINDI_HEADLESS=1 \
-RINDI_INT4_LM_HEAD=1 \
 RINDI_DISABLE_MTP=1 \
-RINDI_TAIL_COREAI=1 \
 RINDI_ENABLE_METAL_TAIL=1 \
 RINDI_PREFILL_BATCH_ATTENTION=1 \
 RINDI_ANE_WIDTH=128 \
-runtime/rindi-server --host 127.0.0.1 --port 2456
+runtime/rindi-server \
+  --model "$HOME/.lmstudio/models/Qwen/Qwen3.8-27B.rindi" \
+  --host 127.0.0.1 \
+  --port 2456
+```
 
+`RINDI_TAIL_COREAI=1` and the deterministic Qwen fast-prefill path are enabled
+by the native server. The explicit flags above select the measured width-128
+ANE prefill and optimized lane-1 Metal decode configuration. Add
+`RINDI_INT4_LM_HEAD=1` to replace the 2.37 GiB BF16 target vocabulary head with
+the approximately 698 MiB groupwise-INT4 head. This quantizes the target head,
+not every remaining decode operation.
+
+Verify the API before connecting a client:
+
+```bash
+curl http://127.0.0.1:2456/v1/models
+
+curl http://127.0.0.1:2456/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen3.8-27B",
+    "messages": [{"role": "user", "content": "Write one sentence about ANE."}],
+    "max_tokens": 64,
+    "stream": true,
+    "enable_thinking": false
+  }'
+```
+
+Pi and other OpenAI-compatible clients should use
+`http://127.0.0.1:2456/v1` as their base URL; the server does not validate the
+API key. After adding a `rindi` OpenAI-compatible provider to Pi, for example:
+
+```bash
 pi --provider rindi --model Qwen3.8-27B --thinking off
 ```
 
-`GET /v1/models` reports the engine's real `context_window`, and generation is
-clamped so prompt plus output cannot overrun the KV capacity. The current exact
-prefix-state cache remains limited to prompts of at most 8,192 tokens to avoid
-duplicating many GiB of KV state; this does not limit normal inference context.
-The `--host` option is honored, so the command above listens only on loopback.
+The endpoint implements `GET /v1/models` and streaming/non-streaming
+`POST /v1/chat/completions`, including Qwen reasoning content and OpenAI-style
+function tool calls. Inference requests are serialized because each request
+mutates shared GDN and KV state.
+
+### 128K context
+
+The native server defaults to a 131,072-token KV capacity. Host KV, Metal KV,
+and attention scratch grow lazily instead of committing the full capacity at
+startup. Override it with `RINDI_CONTEXT_LENGTH` from 256 through 262,144:
+
+```bash
+RINDI_CONTEXT_LENGTH=262144 runtime/rindi-server --model /path/to/model.rindi
+```
+
+`GET /v1/models` reports the active `context_window`, and generation is clamped
+so prompt plus output cannot overrun it. The exact prefix-state cache is limited
+to prompts of at most 8,192 tokens to avoid duplicating many GiB of KV state;
+that cache policy does not limit ordinary inference context. Long-context
+decode remains O(context), so 128K is capacity support rather than a claim of
+short-context latency at 128K.
+
+### Where each phase runs
+
+| phase | primary execution path | current role |
+|---|---|---|
+| prompt prefill | 64 fused CoreAI tails on ANE plus custom Metal attention/GDN kernels | parallel width-128 path; Qwen fast prefill is default |
+| token decode | custom lane-1 Metal projection, attention, GDN, and LM-head kernels | sequential path; ANE decode is not enabled |
+| SME2 | direct CPU Q4/INT8 projection kernels | optional experiments; off by default for dense decode |
+
+SME2 can add bandwidth on isolated projections, but the measured dense
+Metal→SME2 synchronization boundary made full-model decode slower. The dense
+default therefore remains Metal. The independent-expert structure of a future
+MoE backend is a better candidate for concurrent GPU/SME2 scheduling.
+
+### Measured native performance
+
+Representative cooled runs on the development M5 Max/macOS 27 beta, using a
+1,024-token prompt and generating 128 tokens:
+
+| configuration | prefill | decode | note |
+|---|---:|---:|---|
+| width-32 fast prefill, BF16 head | 82.86 tok/s | 10.48 tok/s | control width |
+| width-128 fast prefill, BF16 head | 94.95 tok/s | 9.67 tok/s | 8.718 prompt tok/J in that A/B |
+| width-128 fast prefill, INT4 target head | 95.22 tok/s | 12.25 tok/s | 0.572% aggregate PPL increase in the four-slice check |
+
+These are single-machine measurements, not portable guarantees. Decode width
+is one in every row; `RINDI_ANE_WIDTH=128` accelerates prompt ingestion and does
+not make autoregressive decode 128-wide. See
+[`docs/QWEN-PREFILL-FAST.md`](docs/QWEN-PREFILL-FAST.md) for validation and
+power details and [`docs/SME2.md`](docs/SME2.md) for the heterogeneous kernel
+results and promotion gates.
 
 ## Framework-free pure ANE backend
 
@@ -235,7 +329,7 @@ loading model 128 with no evaluations in flight (`0x50004`), so the two
 observations must not be conflated; unloading/multiplexing or a lower-level
 dispatch path may remove the resident-model restriction.
 
-## What actually runs on the ANE
+## What runs on the ANE in the 69-program pure/hybrid chain
 
 | block | coverage | programs |
 |---|---|---|
@@ -262,9 +356,15 @@ temporal convolution directly into the resident recurrence surface.
 
 ## Start here
 
+* **[runtime/rindi_engine.cpp](runtime/rindi_engine.cpp)** / **[runtime/rindi_server.cpp](runtime/rindi_server.cpp)** —
+  native scheduler, lazy 128K context, and OpenAI-compatible HTTP server.
 * **[runtime/metal_engine.h](runtime/metal_engine.h)** / **[runtime/metal_engine.m](runtime/metal_engine.m)** —
   Zero-copy Metal C runtime for GPU + ANE heterogeneous acceleration. Binds `IOSurfaceRef`
   directly to `MTLBuffer` and uses hardware `MTLSharedEvent` signals without MLX/PyTorch.
+* **[docs/QWEN-PREFILL-FAST.md](docs/QWEN-PREFILL-FAST.md)** — width-128 native
+  prefill, INT4 target-head validation, perplexity checks, and rail-power runs.
+* **[docs/SME2.md](docs/SME2.md)** — direct SME2 Q4 kernels, Metal comparison,
+  heterogeneous row splits, and why dense SME2 routing remains opt-in.
 * **[docs/SETUP.md](docs/SETUP.md)** — moving this to another machine, paths, the
   `libomp` crash, verifying the install.
 * **[docs/ANE-REFERENCE.md](docs/ANE-REFERENCE.md)** — what the ANE accepts and
@@ -285,7 +385,11 @@ temporal convolution directly into the resident recurrence surface.
 * **[docs/FULL-HANDOFF.md](docs/FULL-HANDOFF.md)** — the complete lab notebook,
   44 sections, including the dead ends and the claims that turned out wrong.
 
-## Honest summary
+## Pure-ANE backend summary
+
+This section describes the separate `tools/ane pure-*` backend and its private
+driver path. It should not be used as the speed summary for the newer native
+CoreAI + Metal server documented at the top of this README.
 
 The ANE is **1.7× more efficient per joule** than the M5 Max GPU (1.24 vs
 0.74 TFLOP/W) and draws ~6 W against 64–84 W. The comparable GPU kernel reaches
