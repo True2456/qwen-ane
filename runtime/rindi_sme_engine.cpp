@@ -187,6 +187,64 @@ static void compute_q4_sme(const int8_t* x, const uint8_t* weights,
 }
 
 __attribute__((noinline))
+static void dot_q8_q8_sme_rows(const int8_t* x, const int8_t* weights,
+                               int32_t* dots, size_t row_begin,
+                               size_t row_end, size_t cols) {
+    __asm__ volatile("smstart sm" ::: "memory",
+                     "v8", "v9", "v10", "v11",
+                     "v12", "v13", "v14", "v15");
+    int32_t vector_zero;
+    __asm__ volatile("mov %w0, wzr" : "=r"(vector_zero));
+    const svbool_t all_b = svptrue_b8();
+    const svbool_t all_s = svptrue_b32();
+    const size_t vector_bytes = static_cast<size_t>(svcntb());
+    for (size_t row = row_begin; row < row_end; ++row) {
+        const int8_t* row_weights = weights + row * cols;
+        svint32_t accum = svdup_n_s32(vector_zero);
+        size_t c = 0;
+        for (; c + vector_bytes <= cols; c += vector_bytes)
+            accum = svdot_s32(accum, svld1_s8(all_b, x + c),
+                              svld1_s8(all_b, row_weights + c));
+        int32_t sum = static_cast<int32_t>(svaddv_s32(all_s, accum));
+        for (; c < cols; ++c)
+            sum += static_cast<int32_t>(x[c]) * row_weights[c];
+        dots[row] = sum;
+    }
+    __asm__ volatile("smstop sm" ::: "memory");
+}
+
+struct Q8DispatchJob {
+    const int8_t* x;
+    const int8_t* weights;
+    int32_t* dots;
+    size_t rows;
+    size_t cols;
+    size_t workers;
+};
+
+static void q8_dispatch_worker(void* opaque, size_t worker) {
+    auto* job = static_cast<Q8DispatchJob*>(opaque);
+    const size_t begin = job->rows * worker / job->workers;
+    const size_t end = job->rows * (worker + 1) / job->workers;
+    if (begin != end)
+        dot_q8_q8_sme_rows(job->x, job->weights, job->dots,
+                           begin, end, job->cols);
+}
+
+static void compute_q8_sme(const int8_t* x, const int8_t* weights,
+                           int32_t* dots, size_t rows, size_t cols,
+                           size_t workers) {
+    if (workers <= 1 || rows < workers * 4) {
+        dot_q8_q8_sme_rows(x, weights, dots, 0, rows, cols);
+        return;
+    }
+    Q8DispatchJob job{x, weights, dots, rows, cols, workers};
+    dispatch_apply_f(workers,
+                     dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
+                     &job, q8_dispatch_worker);
+}
+
+__attribute__((noinline))
 static int32_t dot_q8_q8_sme(const int8_t* a, const int8_t* b, size_t cols) {
     __asm__ volatile("smstart sm" ::: "memory",
                      "v8", "v9", "v10", "v11",
@@ -283,6 +341,55 @@ bool RindiSmeEngine::gemv_q4_rowwise_fp16(
     static thread_local std::vector<float> output;
     output.resize(rows);
     if (!gemv_q4_rowwise_f32(x_fp16, packed_w, fp16_scales,
+                             output.data(), rows, cols)) return false;
+    for (size_t row = 0; row < rows; ++row)
+        y_fp16[row] = float_to_fp16(output[row]);
+    return true;
+}
+
+bool RindiSmeEngine::gemv_q8_rowwise_f32(
+    const uint16_t* x_fp16, const int8_t* weights,
+    const uint16_t* fp16_scales, float* y_f32,
+    size_t rows, size_t cols) {
+    if (!x_fp16 || !weights || !fp16_scales || !y_f32 ||
+        rows == 0 || cols == 0) return false;
+
+    std::lock_guard<std::mutex> lock(call_mutex_);
+    float activation_scale = 0.0f;
+    if (!quantize_fp16_activation(x_fp16, cols, q8_activation_, activation_scale))
+        return false;
+    dot_scratch_.resize(rows);
+
+#if defined(__aarch64__)
+    if (available_) {
+        compute_q8_sme(q8_activation_.data(), weights, dot_scratch_.data(),
+                       rows, cols, workers_);
+    } else
+#endif
+    {
+        for (size_t row = 0; row < rows; ++row) {
+            int32_t sum = 0;
+            const int8_t* row_weights = weights + row * cols;
+            for (size_t c = 0; c < cols; ++c)
+                sum += static_cast<int32_t>(q8_activation_[c]) * row_weights[c];
+            dot_scratch_[row] = sum;
+        }
+    }
+
+    for (size_t row = 0; row < rows; ++row)
+        y_f32[row] = static_cast<float>(dot_scratch_[row]) * activation_scale *
+                     fp16_to_float(fp16_scales[row]);
+    return true;
+}
+
+bool RindiSmeEngine::gemv_q8_rowwise_fp16(
+    const uint16_t* x_fp16, const int8_t* weights,
+    const uint16_t* fp16_scales, uint16_t* y_fp16,
+    size_t rows, size_t cols) {
+    if (!y_fp16) return false;
+    static thread_local std::vector<float> output;
+    output.resize(rows);
+    if (!gemv_q8_rowwise_f32(x_fp16, weights, fp16_scales,
                              output.data(), rows, cols)) return false;
     for (size_t row = 0; row < rows; ++row)
         y_fp16[row] = float_to_fp16(output[row]);

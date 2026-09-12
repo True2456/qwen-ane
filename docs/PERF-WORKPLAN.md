@@ -273,10 +273,12 @@ second (needs careful exactness validation vs sequential recurrence).
   (2.9x TTFT at 16-token generations; pure-prefill saving is larger),
   outputs BIT-IDENTICAL across cold/cached runs, single-chunk and
   multi-chunk both exact. RINDI_DISABLE_APC=1 disables.
-- KNOWN LIMIT: multi-turn growth does NOT hit when the previous prompt ended
-  with generation-prime tokens - a grown conversation is never a strict
-  token-prefix of the old prompt. Fixing needs segment-boundary snapshots
-  (cache state before the prime), tracked as follow-up.
+- MULTI-TURN FIX: non-thinking assistant history is serialized with the same
+  empty-think generation-prime tokens used by the preceding request. A Pi
+  full-history request is therefore a strict extension of the cached prompt,
+  so APC can restore the established conversation without an extra ANE pass
+  or a second segment-boundary snapshot. Thinking-mode history still needs
+  reasoning-content preservation before it can provide the same invariant.
 - MTP STATUS (separate pre-existing issue): accepted/step ~1.1-1.8,
   speedup 0.84-0.99x (net loss) ALREADY BEFORE today's kernel work (clean
   tree measured 0.90x this morning vs d17de73-era claims of 4.57 acc).

@@ -619,6 +619,18 @@ std::string BPETokenizer::apply_chat_template(
         if (msg.first == "system") continue;
         if (msg.first == "tool") {
             out += "<|im_start|>user\n<tool_response>\n" + msg.second + "\n</tool_response><|im_end|>\n";
+        } else if (msg.first == "assistant") {
+            out += "<|im_start|>assistant\n";
+            // A non-thinking generation is primed with an empty think block.
+            // Preserve that same token prefix when Pi sends the assistant turn
+            // back as conversation history. This makes the previous request's
+            // complete prompt a strict token-prefix of the next turn, allowing
+            // APC to restore its full KV/recurrent state instead of missing at
+            // the assistant-history boundary.
+            if (!enable_thinking && msg.second.rfind("<think>", 0) != 0) {
+                out += "<think>\n\n</think>\n\n";
+            }
+            out += msg.second + "<|im_end|>\n";
         } else {
             out += "<|im_start|>" + msg.first + "\n" + msg.second + "<|im_end|>\n";
         }

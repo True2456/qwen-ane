@@ -288,7 +288,12 @@ swap-per-layer). Verified exact through our native pipeline (RelErr 5.4e-4).
 This removes per-shape recompiles and the ~119-compiles-per-process limit
 (their mitigation: exec() restart).
 
-**BLOCKED on macOS26/M5-h17: INT8 W8A8 via text MIL.** Their 1.88x recipe
+**SUPERSEDED (Sep 2026) -- see [W8A8-PROJECTIONS.md](W8A8-PROJECTIONS.md):
+W8A8 works on macOS 27/h17. The rejection below came from testing int8 at the
+func signature and from a single-conv graph; the working recipe keeps an fp16
+signature and puts quantize/dequantize between convs in one fused program.**
+
+~~BLOCKED on macOS26/M5-h17: INT8 W8A8 via text MIL.~~ Their 1.88x recipe
 (`constexpr_affine_dequantize` int8 blobs + `quantize`/`dequantize`
 activation ops between fused ops, halving tile SRAM traffic) is rejected by
 ANECCompile here. Tried: their exact op syntax, three blob-container variants

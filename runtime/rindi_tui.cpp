@@ -170,6 +170,22 @@ namespace {
         auto wsback = std::find_if_not(s.rbegin(), s.rend(), [](int c){ return std::isspace(c); }).base();
         return (wsback <= wsfront ? std::string() : std::string(wsfront, wsback));
     }
+
+    std::string single_line_text(const std::string& text) {
+        std::string out;
+        out.reserve(text.size());
+        bool pending_space = false;
+        for (unsigned char c : text) {
+            if (c == '\n' || c == '\r' || c == '\t' || c == ' ') {
+                pending_space = !out.empty();
+                continue;
+            }
+            if (pending_space) out.push_back(' ');
+            pending_space = false;
+            out.push_back(static_cast<char>(c));
+        }
+        return out;
+    }
 }
 
 RindiTUI::RindiTUI(const ServerConfig& config)
@@ -323,6 +339,17 @@ void RindiTUI::log(const std::string& message, const std::string& tag) {
     }
 }
 
+void RindiTUI::add_chat_message(const std::string& role,
+                                const std::string& content) {
+    const std::string clean = single_line_text(content);
+    if (clean.empty()) return;
+    std::lock_guard<std::mutex> lock(chat_mutex_);
+    chat_buffer_.push_back({role, clean});
+    if (chat_buffer_.size() > max_chat_messages_) {
+        chat_buffer_.pop_front();
+    }
+}
+
 void RindiTUI::record_request_start() {
     metrics_.active_requests.fetch_add(1);
     metrics_.total_requests.fetch_add(1);
@@ -334,12 +361,17 @@ void RindiTUI::record_request_chunk(size_t token_count) {
 
 void RindiTUI::record_request_end(size_t prompt_tokens, size_t completion_tokens,
                                   double ttft_ms, double decode_tps, double prefill_tps,
-                                  bool apc_hit, size_t tokens_saved) {
+                                  bool apc_hit, size_t tokens_saved,
+                                  bool completion_already_counted) {
     if (metrics_.active_requests.load() > 0) {
         metrics_.active_requests.fetch_sub(1);
     }
     metrics_.total_prompt_tokens.fetch_add(prompt_tokens);
-    metrics_.total_completion_tokens.fetch_add(completion_tokens);
+    // Streaming paths account for tokens live through record_request_chunk().
+    // Adding the final count again made every TUI/streaming turn look doubled.
+    if (!completion_already_counted) {
+        metrics_.total_completion_tokens.fetch_add(completion_tokens);
+    }
     metrics_.total_tokens_saved.fetch_add(tokens_saved);
 
     metrics_.last_ttft_ms.store(ttft_ms);
@@ -515,13 +547,44 @@ std::string RindiTUI::render_dashboard() {
     oss << FG_CYAN << "│ " << RESET << fit_to_width(" • " + std::string(perf4_l), col_left) << FG_CYAN << " │ " << RESET << fit_to_width(" • " + std::string(perf4_r), col_right) << FG_CYAN << " │" << RESET << "\n";
     oss << FG_CYAN << "├" << repeat_str("─", inner_width) << "┤" << RESET << "\n";
 
-    // 5. Recent Event Logs & Activity Stream
+    // 5. Conversation. User and assistant text stays out of the diagnostic
+    // event stream so a local chat reads like a conversation, not a trace.
+    std::string chat_hdr = std::string(BOLD) + FG_BRIGHT_GREEN + "CONVERSATION" + RESET;
+    oss << FG_CYAN << "│ " << RESET << fit_to_width(chat_hdr, full_row_width) << FG_CYAN << " │" << RESET << "\n";
+
+    {
+        std::lock_guard<std::mutex> lock(chat_mutex_);
+        const int lines_to_show = 6;
+        const int total_messages = static_cast<int>(chat_buffer_.size());
+        const int start_idx = std::max(0, total_messages - lines_to_show);
+
+        for (int i = 0; i < lines_to_show; ++i) {
+            const int idx = start_idx + i;
+            std::string line;
+            if (idx < total_messages) {
+                const auto& entry = chat_buffer_[idx];
+                if (entry.first == "user") {
+                    line = std::string(BOLD) + FG_BRIGHT_WHITE + "You › " + RESET + entry.second;
+                } else {
+                    line = std::string(BOLD) + FG_BRIGHT_GREEN + "Rindi › " + RESET + entry.second;
+                }
+            } else if (total_messages == 0 && i == 0) {
+                line = std::string(DIM) + "No conversation yet. Use /chat <message>." + RESET;
+            }
+            oss << FG_CYAN << "│ " << RESET
+                << fit_to_width("  " + line, full_row_width)
+                << FG_CYAN << " │" << RESET << "\n";
+        }
+    }
+    oss << FG_CYAN << "├" << repeat_str("─", inner_width) << "┤" << RESET << "\n";
+
+    // 6. Recent Event Logs & Activity Stream
     std::string log_hdr = std::string(BOLD) + FG_CYAN + "EVENT LOGS & ACTIVITY STREAM" + RESET;
     oss << FG_CYAN << "│ " << RESET << fit_to_width(log_hdr, full_row_width) << FG_CYAN << " │" << RESET << "\n";
 
     {
         std::lock_guard<std::mutex> lock(log_mutex_);
-        int lines_to_show = 6;
+        int lines_to_show = 4;
         int total_logs = (int)log_buffer_.size();
         int start_idx = std::max(0, total_logs - lines_to_show);
         
@@ -537,12 +600,12 @@ std::string RindiTUI::render_dashboard() {
     }
     oss << FG_CYAN << "├" << repeat_str("─", inner_width) << "┤" << RESET << "\n";
 
-    // 6. Interactive Command Helper Line
+    // 7. Interactive Command Helper Line
     std::string cmd_help = std::string(DIM) + "Commands: /chat <msg> │ turbo │ silent │ set <k> <v> │ clear │ stats │ help │ quit" + RESET;
     oss << FG_CYAN << "│ " << RESET << fit_to_width(cmd_help, full_row_width) << FG_CYAN << " │" << RESET << "\n";
     oss << FG_CYAN << "└" << repeat_str("─", inner_width) << "┘" << RESET << "\n";
 
-    // 7. Command Input Prompt with clean cursor positioning
+    // 8. Command Input Prompt with clean cursor positioning
     {
         std::lock_guard<std::mutex> lock(input_mutex_);
         oss << "\r\033[2K" << FG_BRIGHT_GREEN << "[rindi]> " << RESET << current_input_line_;
@@ -596,7 +659,9 @@ void RindiTUI::run_interactive_loop(CommandHandler cmd_handler, ChatDispatchFn c
             std::string trimmed = trim(line);
             if (trimmed.empty()) continue;
 
-            log(trimmed, "rindi]>");
+            const bool is_chat_command =
+                trimmed.rfind("/chat ", 0) == 0 || trimmed.rfind("chat ", 0) == 0;
+            if (!is_chat_command) log(trimmed, "rindi]>");
 
             if (trimmed == "q" || trimmed == "quit" || trimmed == "exit") {
                 log("Shutting down Rindi server...", "INFO");
@@ -607,9 +672,15 @@ void RindiTUI::run_interactive_loop(CommandHandler cmd_handler, ChatDispatchFn c
             } else if (trimmed == "silent" || trimmed == "mode silent") {
                 set_mode("silent");
             } else if (trimmed == "clear" || trimmed == "cls") {
-                std::lock_guard<std::mutex> lock(log_mutex_);
-                log_buffer_.clear();
-                log("Log buffer cleared.", "INFO");
+                {
+                    std::lock_guard<std::mutex> lock(log_mutex_);
+                    log_buffer_.clear();
+                }
+                {
+                    std::lock_guard<std::mutex> lock(chat_mutex_);
+                    chat_buffer_.clear();
+                }
+                log("Conversation and event logs cleared.", "INFO");
             } else if (trimmed == "reset-stats" || trimmed == "reset") {
                 metrics_.total_requests.store(0);
                 metrics_.total_prompt_tokens.store(0);
@@ -647,10 +718,11 @@ void RindiTUI::run_interactive_loop(CommandHandler cmd_handler, ChatDispatchFn c
                         log("Set top_p = " + val, "INFO");
                     }
                 }
-            } else if (trimmed.rfind("/chat ", 0) == 0 || trimmed.rfind("chat ", 0) == 0) {
+            } else if (is_chat_command) {
                 size_t p = trimmed.find(' ');
-                std::string prompt = trimmed.substr(p + 1);
+                std::string prompt = trim(trimmed.substr(p + 1));
                 if (chat_fn) {
+                    add_chat_message("user", prompt);
                     in_chat_stream_.store(true);
                     auto t0 = std::chrono::high_resolution_clock::now();
                     record_request_start();
@@ -684,10 +756,10 @@ void RindiTUI::run_interactive_loop(CommandHandler cmd_handler, ChatDispatchFn c
                                        ttft_ms > 0.0 ? ttft_ms : stats.ttft_ms,
                                        decode_tps,
                                        stats.prefill_tps,
-                                       false, 0);
+                                       false, 0, true);
                     in_chat_stream_.store(false);
 
-                    log("Assistant: " + full_response, "ANE");
+                    add_chat_message("assistant", full_response);
                 }
             }
         }
@@ -695,6 +767,10 @@ void RindiTUI::run_interactive_loop(CommandHandler cmd_handler, ChatDispatchFn c
     }
 
     // Full Raw Mode Interactive Character Editor with Live Redraw & History
+    // Some terminal/front-end combinations deliver Enter as a CR/LF pair.
+    // The inference call is synchronous, so the second byte can remain queued
+    // until generation finishes and look like a second submission event.
+    char pending_line_ending = 0;
     while (running_.load()) {
         char c = 0;
         ssize_t n = read(STDIN_FILENO, &c, 1);
@@ -706,6 +782,11 @@ void RindiTUI::run_interactive_loop(CommandHandler cmd_handler, ChatDispatchFn c
         bool need_refresh = false;
 
         if (c == '\r' || c == '\n') {
+            if (pending_line_ending != 0 && pending_line_ending != c) {
+                pending_line_ending = 0;
+                continue;
+            }
+            pending_line_ending = c;
             // ENTER: Submit line
             std::string line_to_exec;
             {
@@ -721,7 +802,9 @@ void RindiTUI::run_interactive_loop(CommandHandler cmd_handler, ChatDispatchFn c
 
             std::string trimmed = trim(line_to_exec);
             if (!trimmed.empty()) {
-                log(trimmed, "rindi]>");
+                const bool is_chat_command =
+                    trimmed.rfind("/chat ", 0) == 0 || trimmed.rfind("chat ", 0) == 0;
+                if (!is_chat_command) log(trimmed, "rindi]>");
 
                 if (trimmed == "q" || trimmed == "quit" || trimmed == "exit") {
                     log("Shutting down Rindi server...", "INFO");
@@ -736,7 +819,11 @@ void RindiTUI::run_interactive_loop(CommandHandler cmd_handler, ChatDispatchFn c
                         std::lock_guard<std::mutex> lock(log_mutex_);
                         log_buffer_.clear();
                     }
-                    log("Log buffer cleared.", "INFO");
+                    {
+                        std::lock_guard<std::mutex> lock(chat_mutex_);
+                        chat_buffer_.clear();
+                    }
+                    log("Conversation and event logs cleared.", "INFO");
                 } else if (trimmed == "reset-stats" || trimmed == "reset") {
                     metrics_.total_requests.store(0);
                     metrics_.total_prompt_tokens.store(0);
@@ -780,11 +867,12 @@ void RindiTUI::run_interactive_loop(CommandHandler cmd_handler, ChatDispatchFn c
                     }
                 } else if (trimmed == "help" || trimmed == "?") {
                     log("Commands: /chat <msg>, turbo, silent, set temp <val>, set max_tokens <val>, clear, reset-stats, stats, quit", "INFO");
-                } else if (trimmed.rfind("/chat ", 0) == 0 || trimmed.rfind("chat ", 0) == 0) {
+                } else if (is_chat_command) {
                     size_t p = trimmed.find(' ');
-                    std::string prompt = trimmed.substr(p + 1);
+                    std::string prompt = trim(trimmed.substr(p + 1));
 
                     if (chat_fn) {
+                        add_chat_message("user", prompt);
                         in_chat_stream_.store(true);
                         auto t0 = std::chrono::high_resolution_clock::now();
                         record_request_start();
@@ -818,10 +906,10 @@ void RindiTUI::run_interactive_loop(CommandHandler cmd_handler, ChatDispatchFn c
 
                         record_request_end(prompt_tokens, reported_gen,
                                            ttft_ms > 0.0 ? ttft_ms : stats.ttft_ms,
-                                           decode_tps, stats.prefill_tps, false, 0);
+                                           decode_tps, stats.prefill_tps, false, 0, true);
                         in_chat_stream_.store(false);
 
-                        log("Assistant: " + full_response, "ANE");
+                        add_chat_message("assistant", full_response);
                         char cbuf[128];
                         snprintf(cbuf, sizeof(cbuf), "Generated %zu tokens in %.2fs (%.1f tok/s) [TTFT: %.1fms]",
                                  gen_tokens, total_decode_sec, decode_tps, ttft_ms);
@@ -836,6 +924,7 @@ void RindiTUI::run_interactive_loop(CommandHandler cmd_handler, ChatDispatchFn c
             }
             need_refresh = true;
         } else if (c == 127 || c == 8) {
+            pending_line_ending = 0;
             // BACKSPACE
             std::lock_guard<std::mutex> lock(input_mutex_);
             if (cursor_pos_ > 0 && !current_input_line_.empty()) {
@@ -844,23 +933,28 @@ void RindiTUI::run_interactive_loop(CommandHandler cmd_handler, ChatDispatchFn c
                 need_refresh = true;
             }
         } else if (c == 1) { // Ctrl+A (Home)
+            pending_line_ending = 0;
             std::lock_guard<std::mutex> lock(input_mutex_);
             cursor_pos_ = 0;
             need_refresh = true;
         } else if (c == 5) { // Ctrl+E (End)
+            pending_line_ending = 0;
             std::lock_guard<std::mutex> lock(input_mutex_);
             cursor_pos_ = current_input_line_.size();
             need_refresh = true;
         } else if (c == 21) { // Ctrl+U (Clear line)
+            pending_line_ending = 0;
             std::lock_guard<std::mutex> lock(input_mutex_);
             current_input_line_.clear();
             cursor_pos_ = 0;
             need_refresh = true;
         } else if (c == 3 || c == 4) { // Ctrl+C or Ctrl+D
+            pending_line_ending = 0;
             log("Shutting down Rindi server...", "INFO");
             running_.store(false);
             break;
         } else if (c == '\033') {
+            pending_line_ending = 0;
             // ESCAPE SEQUENCE (Arrow keys, Home, End, Delete)
             char seq[4] = {0};
             if (read(STDIN_FILENO, &seq[0], 1) > 0 && read(STDIN_FILENO, &seq[1], 1) > 0) {
@@ -938,6 +1032,7 @@ void RindiTUI::run_interactive_loop(CommandHandler cmd_handler, ChatDispatchFn c
                 }
             }
         } else if (c >= 32 && c <= 126) {
+            pending_line_ending = 0;
             // Printable character insert at cursor
             std::lock_guard<std::mutex> lock(input_mutex_);
             current_input_line_.insert(cursor_pos_, 1, c);

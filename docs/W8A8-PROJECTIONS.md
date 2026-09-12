@@ -824,3 +824,42 @@ self-limiting here, and the earlier extrapolation ignored it.
 is now small:** bounded in depth (~0.06 across the stack) and non-divergent in
 time. For calibration the shipping 4-bit build measures 0.102 *per tensor*.
 Item 4's evaluation should confirm rather than discover.
+
+
+## WIRED: MIL int8 GDN in the decode loop — win condition 1 met
+
+`FLASHNEXT_MIL_GDN=1`. The 36 MIL layers replace the Core AI `pure_step`
+graphs (never both resident: 36 MIL + 12 Core AI QSA = 48, against the ~80
+ceiling). Build takes **15.6 s** for all 36.
+
+`--prompt-ids 760 --max-new 12`:
+
+| | Core AI fp16 | **MIL int8** |
+|---|---|---|
+| ANE + I/O | 119 ms | **81 ms** |
+| MoE | 54 ms | 41-44 ms |
+| mixers / recombine / head | 12 ms | 10 ms |
+| **per token** | **185 ms** | **133-137 ms** |
+| measured wall per step | — | **0.13-0.14 s (7.3 tok/s)** |
+| output | `The 2016-17 season marked a pivotal` | **identical, BF16 greedy MATCH** |
+
+**Decode under 150 ms/token with output matching BF16 greedy — challenge win
+condition 1.** From 4.3 tok/s at the start of this work to 7.3.
+
+The int8 error (rel 0.027 per layer, ~0.06 across the stack) did not flip a
+single token on this path. That is not a guarantee for other prompts — the
+quality evaluation is still worth running — but it is a stronger result than
+the error bounds predicted.
+
+One wiring detail worth recording: `host_recombine` takes **slot-0** tensors
+`(1, *, 1, 1)`, which is what `pool.take_pure` hands it, while the MIL graph
+returns all 32 slots. Passing the full tensors raises
+`cannot reshape array of size 128 into shape (1,4,1,1)` on the `inj` argument.
+
+### Remaining
+
+* Port the 12 QSA layers the same way — every op verified, batched matmul over
+  24 heads replaces the per-head einsum. Should take the ANE half below 60 ms.
+* Quality evaluation across the three arms (fp16 ANE, int8 MIL, MLX).
+* The MIL path currently rebuilds its programs each run (15.6 s). The engine's
+  compile cache should make that cheaper; not investigated.

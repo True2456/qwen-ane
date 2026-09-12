@@ -17,11 +17,13 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <termios.h>
 #include <csignal>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <cerrno>
 
 #include "rindi_tui.h"
 #include "rindi_engine.h"
@@ -32,6 +34,137 @@ static std::atomic<bool> g_running{true};
 static RindiTUI* g_tui = nullptr;
 static RindiEngine* g_engine = nullptr;
 static std::mutex g_engine_mutex;
+
+static std::string trim_copy(const std::string& input) {
+    const auto first = std::find_if_not(input.begin(), input.end(), [](unsigned char c) {
+        return std::isspace(c) != 0;
+    });
+    const auto last = std::find_if_not(input.rbegin(), input.rend(), [](unsigned char c) {
+        return std::isspace(c) != 0;
+    }).base();
+    return last <= first ? std::string() : std::string(first, last);
+}
+
+static int run_local_chat(RindiEngine* engine, const ServerConfig& config) {
+    if (!engine || !engine->is_ready()) return 1;
+
+    const bool interactive_input = isatty(STDIN_FILENO);
+    if (interactive_input) {
+        // Do not assume a previous dashboard/process restored every terminal
+        // bit. In particular, ICANON with ICRNL disabled makes Return produce
+        // a literal CR that never completes std::getline(). Establish a full
+        // cooked line discipline for focused chat and leave the shell sane on
+        // exit as well.
+        struct termios cooked{};
+        if (tcgetattr(STDIN_FILENO, &cooked) == 0) {
+            cooked.c_iflag |= (ICRNL | BRKINT);
+            cooked.c_iflag &= ~(IGNCR | INLCR);
+            cooked.c_lflag |= (ICANON | ECHO | ISIG | IEXTEN);
+            cooked.c_oflag |= (OPOST | ONLCR);
+            cooked.c_cc[VEOF] = 4;
+            cooked.c_cc[VEOL] = 0;
+            cooked.c_cc[VMIN] = 1;
+            cooked.c_cc[VTIME] = 0;
+            tcsetattr(STDIN_FILENO, TCSANOW, &cooked);
+        }
+    }
+
+    const bool color = isatty(STDOUT_FILENO);
+    const char* green = color ? "\033[92m" : "";
+    const char* white = color ? "\033[97m" : "";
+    const char* dim = color ? "\033[2m" : "";
+    const char* bold = color ? "\033[1m" : "";
+    const char* reset = color ? "\033[0m" : "";
+    if (color) std::cout << "\033[2J\033[H";
+    std::cout << bold << green << "Rindi Chat" << reset << "  "
+              << dim << config.model_name << " · ANE prefill · Metal decode" << reset << "\n"
+              << dim << "Multi-turn APC enabled. Type /help for commands." << reset << "\n\n";
+
+    std::vector<std::pair<std::string, std::string>> history;
+    int max_tokens = 512;
+    if (const char* value = std::getenv("RINDI_CHAT_MAX_TOKENS")) {
+        max_tokens = std::clamp(std::atoi(value), 1, 8192);
+    }
+    float temperature = 0.7f;
+
+    while (g_running.load()) {
+        std::cout << bold << white << "You › " << reset << std::flush;
+        std::string input;
+        if (!std::getline(std::cin, input)) break;
+        input = trim_copy(input);
+        if (input.empty()) continue;
+
+        if (input == "/quit" || input == "/exit" || input == "quit" || input == "exit") {
+            break;
+        }
+        if (input == "/clear") {
+            history.clear();
+            std::cout << dim << "Conversation cleared." << reset << "\n\n";
+            continue;
+        }
+        if (input == "/stats") {
+            const GenerationStats& stats = engine->get_last_stats();
+            std::cout << dim << "prompt=" << stats.prompt_tokens
+                      << " prefill=" << stats.prefill_tps() << " tok/s"
+                      << " decode=" << stats.decode_tps() << " tok/s"
+                      << " APC=" << (engine->last_apc_hit() ? "hit" : "miss")
+                      << " reused=" << engine->last_apc_saved() << reset << "\n\n";
+            continue;
+        }
+        if (input.rfind("/tokens ", 0) == 0) {
+            max_tokens = std::clamp(std::atoi(input.c_str() + 8), 1, 8192);
+            std::cout << dim << "Maximum response tokens: " << max_tokens << reset << "\n\n";
+            continue;
+        }
+        if (input.rfind("/temp ", 0) == 0) {
+            temperature = std::clamp(std::strtof(input.c_str() + 6, nullptr), 0.0f, 2.0f);
+            std::cout << dim << "Temperature: " << temperature << reset << "\n\n";
+            continue;
+        }
+        if (input == "/help") {
+            std::cout << dim
+                      << "/clear      start a fresh conversation\n"
+                      << "/stats      show last-turn performance and cache status\n"
+                      << "/tokens N   set maximum response length\n"
+                      << "/temp N     set sampling temperature\n"
+                      << "/quit       leave chat"
+                      << reset << "\n\n";
+            continue;
+        }
+        if (input.rfind("/chat ", 0) == 0) {
+            input = trim_copy(input.substr(6));
+            if (input.empty()) continue;
+        }
+
+        history.push_back({"user", input});
+        std::cout << bold << green << "Rindi › " << reset << std::flush;
+        std::string response = engine->chat_completion(
+            history, "", max_tokens, temperature,
+            [](const std::string& token) {
+                std::cout << token << std::flush;
+            }, false);
+        std::cout << "\n";
+        if (response.empty()) {
+            history.pop_back();
+            std::cout << dim << "Generation failed; the turn was not added to history."
+                      << reset << "\n\n";
+            continue;
+        }
+        history.push_back({"assistant", response});
+
+        const GenerationStats& stats = engine->get_last_stats();
+        std::cout << dim << "[" << stats.prompt_tokens << " prompt · "
+                  << stats.prefill_tps() << " prefill tok/s · "
+                  << stats.decode_tps() << " decode tok/s";
+        if (engine->last_apc_hit()) {
+            std::cout << " · APC reused " << engine->last_apc_saved();
+        }
+        std::cout << "]" << reset << "\n\n";
+    }
+
+    std::cout << dim << "Chat closed." << reset << "\n";
+    return 0;
+}
 
 void signal_handler(int signum) {
     if (g_tui) {
@@ -801,7 +934,7 @@ void handle_client(int client_fd, RindiEngine* engine) {
                 g_tui->record_request_end(real_prompt_tokens, token_count, ttft_ms,
                                           decode_tps, sstats.prefill_tps(),
                                           g_engine->last_apc_hit(),
-                                          g_engine->last_apc_saved());
+                                          g_engine->last_apc_saved(), true);
                 char lbuf[160];
                 snprintf(lbuf, sizeof(lbuf),
                          "Stream complete: %zu tokens in %.2fs (%.1f tok/s) [TTFT: %.1fms, prefill %zu tok @ %.1f tok/s]",
@@ -907,9 +1040,12 @@ int main(int argc, char* argv[]) {
     config.resident_layers = 64;
 
     std::string model_path = "/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi";
+    bool chat_only = false;
 
     for (int i = 1; i < argc; i++) {
-        if (std::string(argv[i]) == "--port" && i + 1 < argc) {
+        if (std::string(argv[i]) == "chat" || std::string(argv[i]) == "--chat") {
+            chat_only = true;
+        } else if (std::string(argv[i]) == "--port" && i + 1 < argc) {
             config.port = std::stoi(argv[i + 1]);
         } else if (std::string(argv[i]) == "--host" && i + 1 < argc) {
             config.host = argv[i + 1];
@@ -919,8 +1055,10 @@ int main(int argc, char* argv[]) {
             model_path = argv[i + 1];
             config.model_name = argv[i + 1];
         } else if (std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h") {
-            std::cout << "Rindi Apple Silicon Standalone Native C++ ANE + Metal GPU Inference Server\n"
-                      << "Usage: rindi [options]\n\n"
+            std::cout << "Rindi Apple Silicon Standalone Native C++ ANE + Metal GPU Inference Engine\n"
+                      << "Usage: rindi [chat] [options]\n\n"
+                      << "Commands:\n"
+                      << "  chat                Open the focused local chat interface\n\n"
                       << "Options:\n"
                       << "  --port <port>       Port to listen on (current: " << config.port << ")\n"
                       << "  --host <host>       Host IP to bind to (current: " << config.host << ")\n"
@@ -948,9 +1086,25 @@ int main(int argc, char* argv[]) {
     }
     g_tui->log("Loaded 27B Model (" + model_path + ") with 64 ANE Layers", "ANE");
 
+    // Focused local conversation mode. It deliberately skips socket setup and
+    // the telemetry dashboard: one process owns the model, conversation state,
+    // and APC cache, while token deltas stream directly to the terminal.
+    if (chat_only) {
+        const int result = run_local_chat(g_engine, config);
+        delete g_engine;
+        g_engine = nullptr;
+        delete g_tui;
+        g_tui = nullptr;
+        return result;
+    }
+
     // 3. Setup High-Performance POSIX Socket Server
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     bool socket_ok = false;
+    std::string socket_error;
+    if (server_fd < 0) {
+        socket_error = "socket: " + std::string(std::strerror(errno));
+    }
     if (server_fd >= 0) {
         int opt = 1;
         setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -961,7 +1115,7 @@ int main(int argc, char* argv[]) {
             address.sin_addr.s_addr = htonl(INADDR_ANY);
         } else if (inet_pton(AF_INET, config.host.c_str(),
                              &address.sin_addr) != 1) {
-            g_tui->log("Invalid IPv4 bind address: " + config.host, "ERROR");
+            socket_error = "invalid IPv4 bind address: " + config.host;
             close(server_fd);
             server_fd = -1;
         }
@@ -973,11 +1127,34 @@ int main(int argc, char* argv[]) {
                 socket_ok = true;
                 g_tui->log("HTTP Server listening on " + config.host + ":" + std::to_string(config.port), "HTTP");
                 g_tui->log("OpenAI API endpoint active: /v1/chat/completions, /v1/models", "INFO");
+                std::cout << "[Rindi] HTTP server ready at http://" << config.host << ':'
+                          << config.port << " (OpenAI API: /v1)\n" << std::flush;
+            } else {
+                socket_error = "listen: " + std::string(std::strerror(errno));
             }
+        } else if (server_fd >= 0) {
+            socket_error = "bind " + config.host + ":" + std::to_string(config.port) +
+                           ": " + std::string(std::strerror(errno));
         }
     }
     if (!socket_ok) {
-        g_tui->log("Network socket offline. Interactive TUI console mode active.", "INFO");
+        if (server_fd >= 0) {
+            close(server_fd);
+            server_fd = -1;
+        }
+        if (socket_error.empty()) socket_error = "unknown socket error";
+        std::cerr << "[Rindi] HTTP server failed: " << socket_error << '\n' << std::flush;
+        g_tui->log("HTTP server failed: " + socket_error, "ERROR");
+
+        // A headless process with no listening socket is unusable and otherwise
+        // appears to have launched successfully while sleeping forever.
+        if (std::getenv("RINDI_HEADLESS") != nullptr) {
+            delete g_engine;
+            g_engine = nullptr;
+            delete g_tui;
+            g_tui = nullptr;
+            return 1;
+        }
     }
 
     const bool headless = std::getenv("RINDI_HEADLESS") != nullptr;

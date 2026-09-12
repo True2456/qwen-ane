@@ -48,6 +48,19 @@ public:
                               uint16_t* y_fp16,
                               size_t rows, size_t cols);
 
+    // Row-wise signed INT8 x per-token INT8 GEMV. This is useful for BF16
+    // projections that can tolerate a one-time per-row weight conversion.
+    bool gemv_q8_rowwise_f32(const uint16_t* x_fp16,
+                             const int8_t* weights,
+                             const uint16_t* fp16_scales,
+                             float* y_f32,
+                             size_t rows, size_t cols);
+    bool gemv_q8_rowwise_fp16(const uint16_t* x_fp16,
+                              const int8_t* weights,
+                              const uint16_t* fp16_scales,
+                              uint16_t* y_fp16,
+                              size_t rows, size_t cols);
+
     // References used by probes and regression tests. The quantized reference
     // must match SME2 apart from the final FP operation. The full reference
     // keeps FP16 activations and measures the accuracy cost of Q8 activations.

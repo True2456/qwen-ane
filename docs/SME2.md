@@ -5,6 +5,7 @@ backend for dense and MoE execution plans. It currently implements:
 
 - pointer-driven INT8 matrix multiplication;
 - signed row-wise INT4 weight × per-token INT8 activation GEMV;
+- signed row-wise INT8 weight × per-token INT8 activation GEMV;
 - FP32 and FP16 output APIs;
 - scalar quantized and full-FP16-activation references;
 - configurable output-row parallelism; and
@@ -61,6 +62,18 @@ The object is part of the shared native library, but no dense or MoE model is
 routed through it by default. This preserves the existing dense hot path. A
 feature-gated lane-1 dense experiment keeps gate/up on Metal and moves only the
 down projection to SME2:
+
+`runtime/librindi_sme.dylib` also exposes the row-wise Q8 path through a small
+C ABI for embedding experiments. Build and test it with:
+
+```sh
+make test-sme2 runtime/librindi_sme.dylib bench-sme2-q8
+```
+
+On an M5 Max, the Qwen3.8 PLE geometry (`12800 x 2560`) measured 0.368 ms at
+12 workers, or 83 GiB/s. Splitting the real PLE key/value projections between
+MLX Metal and SME2 saved only about 8 microseconds because MLX already overlaps
+the independent GPU projections, so that model does not enable the path.
 
 ```sh
 RINDI_SME2_DOWN=1 RINDI_SME2_WORKERS=4 bin/rindi serve

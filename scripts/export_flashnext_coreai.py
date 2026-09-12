@@ -2970,6 +2970,8 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
         fn_qsa_multi: dict[int, object] = {}
         fn_qsa_step: dict[int, object] = {}
         fn_qsa_step1: dict[int, object] = {}
+        mil_gdn: dict[int, object] = {}
+        use_mil = os.environ.get("FLASHNEXT_MIL_GDN", "0") not in ("0", "false", "")
         fn_qsa_rung: dict[tuple, dict] = {}
         qsa_rungs = [int(v) for v in os.environ.get(
             "FLASHNEXT_QSA_RUNGS", "256").split(",") if v.strip()]
@@ -3020,6 +3022,28 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 keep.append(m_q)
                 fn_qsa[i] = fn_q
 
+            if use_mil:
+                # MIL int8 GDN replaces pure_step; they are never both resident
+                # (ANE ceiling ~80 programs). 1.60x on the layer, rel 0.027.
+                from runtime.mil_gdn_backend import MilGdnLayer
+                from flashnext_multitoken_step import MultiTokenStep as _MTS
+                t_mil = time.perf_counter()
+                for i in sorted(pure_assets):
+                    lw = layer_w(i)
+                    try:
+                        mil_gdn[i] = MilGdnLayer(i, lw, _MTS(lw, 1).eval().half())
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"  MIL L{i} failed ({exc}); falling back to Core AI",
+                              flush=True)
+                        mil_gdn.clear()
+                        break
+                    if (i + 1) % 8 == 0:
+                        print(f"    MIL GDN {len(mil_gdn)}/{len(pure_assets)} "
+                              f"{time.perf_counter() - t_mil:.0f}s", flush=True)
+                if mil_gdn:
+                    print(f"  MIL int8 GDN: {len(mil_gdn)} layers in "
+                          f"{time.perf_counter() - t_mil:.1f}s", flush=True)
+                    pure_assets.clear()
             for i, pp in sorted(list(pure_assets.items())):
                 print(f"  loading ANE pure_step L{i} (mix+GDN+mlp mix)…", flush=True)
                 try:
@@ -3674,7 +3698,30 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     timers["ple_lookup"] += ple_layers[i].last_lookup_ms/1e3
                 used = "numpy"
                 hl = host_layers[i]
-                if i in fn_pure:
+                if i in mil_gdn:
+                    t_a = time.perf_counter()
+                    xb = np.zeros((1, HC_W, 1, seq), np.float16)
+                    bc = _bsh_to_bc1s(np.asarray(hidden[:, :1, :], np.float32))
+                    xb[..., :1] = np.asarray(bc[..., :1], np.float16)
+                    m_mix, m_hyp, m_inj, m_sh = mil_gdn[i](xb)
+                    # host_recombine takes slot-0 tensors, as pool.take_pure
+                    # hands it; the MIL graph returns all 32 slots.
+                    m_hyp = np.ascontiguousarray(m_hyp[..., :1])
+                    m_inj = np.ascontiguousarray(m_inj[..., :1])
+                    timers["ane"] += time.perf_counter() - t_a
+                    used = "MIL-int8"
+                    t_m = time.perf_counter()
+                    mixed_bsh = _bc1s_to_bsh(m_mix)[:, :1, :]
+                    inds, sc = hl.moe._route(
+                        np.asarray(mixed_bsh, np.float32).reshape(-1, H))
+                    routed = hl.moe._resident.routed_multi(mixed_bsh, inds, sc)
+                    y = routed + _bc1s_to_bsh(m_sh)[:, :1, :]
+                    timers["moe"] += time.perf_counter() - t_m
+                    t_r = time.perf_counter()
+                    hc = host_recombine(_bsh_to_bc1s(y), m_hyp, m_inj)
+                    hidden = _bc1s_to_bsh(hc)[:, :1, :]
+                    timers["recombine"] += time.perf_counter() - t_r
+                elif i in fn_pure:
                     t_a = time.perf_counter()
                     _pad32_into(_bsh_to_bc1s(hidden[:, :1, :]), pool.x_hc)
                     out_p = await fn_pure[i](pool.pure_feeds(i))

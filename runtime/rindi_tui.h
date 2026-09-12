@@ -15,6 +15,7 @@
 #include <functional>
 #include <thread>
 #include <cstdint>
+#include <utility>
 
 // ANSI Color and Style Definitions (Zero Emojis)
 namespace RindiANSI {
@@ -117,13 +118,15 @@ public:
 
     // Logging & Event Stream
     void log(const std::string& message, const std::string& tag = "INFO");
+    void add_chat_message(const std::string& role, const std::string& content);
 
     // Metrics recording
     void record_request_start();
     void record_request_chunk(size_t token_count = 1);
     void record_request_end(size_t prompt_tokens, size_t completion_tokens,
                            double ttft_ms, double decode_tps, double prefill_tps,
-                           bool apc_hit, size_t tokens_saved);
+                           bool apc_hit, size_t tokens_saved,
+                           bool completion_already_counted = false);
     void record_ane_step(double latency_ms);
 
     // Dashboard rendering
@@ -157,6 +160,9 @@ private:
     std::deque<std::string> log_buffer_;
     size_t max_logs_{200};
     std::mutex log_mutex_;
+    std::deque<std::pair<std::string, std::string>> chat_buffer_;
+    size_t max_chat_messages_{100};
+    std::mutex chat_mutex_;
     std::mutex render_mutex_;
 
     std::atomic<bool> running_{true};
