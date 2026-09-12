@@ -76,7 +76,7 @@ class MilGdnLayer:
         self._state[:] = 0
 
     def __call__(self, x_bc1s: np.ndarray):
-        """x is (1, HC_W, 1, S). Returns (mixed, hyper, inj, shared), all BC1S.
+        """x is (1, HC_W, 1, S). Returns (mixed, hyper, inj, shared) at slot 0.
 
         The recurrent state and conv cache advance in place, as `pure_step` does.
         """
@@ -91,10 +91,12 @@ class MilGdnLayer:
             raise RuntimeError(f"MIL layer {self.layer}: submit failed")
         # surfaces bind alphabetically: u_shared, v_mixed, w_hyper, x_inj,
         # y_conv, z_state
+        # Decode reads slot 0 only. Converting all 32 columns costs ~0.2 ms a
+        # layer in memory traffic for 31 columns nothing looks at.
         out = []
         for idx, shape in ((0, (H, S)), (1, (H, S)), (2, (HC_W, S)), (3, (HC, S))):
             with _iosurface_view(p._out_surfs[idx], shape, np.float16) as o:
-                out.append(np.array(o, np.float32).reshape(1, shape[0], 1, shape[1]))
+                out.append(np.array(o[:, :1], np.float32).reshape(1, shape[0], 1, 1))
         with _iosurface_view(p._out_surfs[4], (3 * QKV, S), np.float16) as o:
             np.copyto(self._conv, np.asarray(o, np.float16))
         with _iosurface_view(p._out_surfs[5], (HV, DV, DK), np.float16) as o:

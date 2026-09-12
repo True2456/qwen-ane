@@ -863,3 +863,78 @@ returns all 32 slots. Passing the full tensors raises
 * Quality evaluation across the three arms (fp16 ANE, int8 MIL, MLX).
 * The MIL path currently rebuilds its programs each run (15.6 s). The engine's
   compile cache should make that cheaper; not investigated.
+
+## WIRED: MIL int8 QSA — the 12 attention layers join the MIL path
+
+`FLASHNEXT_MIL_QSA=1`, alongside `FLASHNEXT_MIL_GDN=1`. All 48 layers now run
+on hand-written MIL instead of Core AI. 36 GDN programs plus 12 QSA layers at
+two key-window rungs each is 60 resident models, under the ~80 ceiling.
+
+### The bug that cost the most: I/O row stride
+
+The decode-only QSA graph was built against a key axis of `max_s + 1` — the
+cache plus the one new token, which is all decode needs. It compiled, ran at
+0.787 ms, and returned `new_k` and `new_v` correct to rel 0.0028, but the
+attention output was wrong at rel 0.909.
+
+An IOSurface row is padded to 64 bytes. A last dim of 33 fp16 is 66 bytes, so
+the surface carries a padded stride the MIL program does not, and the host and
+the ANE disagree about where every row after the first begins. Nothing rejects
+this; the numbers just come out wrong.
+
+**Every I/O last dim must be a multiple of 32.** Widening the key axis to
+`max_s + S`, which is what the torch reference uses anyway, with the S-1 dead
+slots masked off, took the output to rel 0.01235 with no other change.
+
+This is the same family as the two constraints already recorded (last-dim-1
+inputs abort at submit; last-dim-1 outputs silently return zeros) and it
+subsumes them: the rule is the last dim, not the value 1.
+
+### Layer results (layer 3, k=1)
+
+| key window | MIL int8 | Core AI fp16 folded |
+|---|---|---|
+| 256 | **0.941 ms** | 2.96 ms (3.1x) |
+| 512 | 0.963 ms | |
+| 2048 | **1.333 ms** | (2.2x) |
+
+`mixed` rel 0.028, `hyper` 0.026, `shared` 0.042, `new_k` 0.014 — the same band
+as the GDN MIL layer (0.027), against a shipping MLX 4-bit build at 0.102.
+
+Decode is one live query, which collapses the Core AI graph's per-head einsum
+over 24 heads into a single grouped matmul of `[1, HKV, G, HD]` against
+`[1, HKV, KV, HD]^T`. No head expansion, no rank-5 tensor, and the mask
+broadcasts from `[1, 1, 1, KV]`.
+
+### End to end
+
+`--prompt-ids 760 --max-new 8`, steady state:
+
+| | MIL GDN + Core AI QSA | **MIL GDN + MIL QSA** |
+|---|---|---|
+| ANE + I/O | 81 ms | 84 ms (includes the QSA MoE) |
+| MoE | 41-44 ms | 26 ms + 8.5 ms inside the QSA step |
+| lm_head | 10 ms | 14 ms |
+| **per token** | **133-137 ms** | **~124 ms** |
+| output | BF16 greedy MATCH | **BF16 greedy MATCH** |
+
+The QSA step breaks down as host mixer 3.6 ms, indexer 0.9, KV feed 0.4, ANE
+14.3 (1.19 ms a layer), MoE 8.5, recombine 0.1.
+
+**The headline gain is smaller than the layer benchmark suggests**, because the
+2.96 ms/layer figure for the Core AI path was measured in the decode loop and
+already included the host mixer and the KV feed that the MIL path still pays.
+The real ANE saving is about 4 ms a token. What the port actually buys is
+elsewhere: no exported `.aimodel` assets for attention, and a KV feed that
+writes only the selected columns instead of copying a `max_s`-wide surface per
+layer per submit, which is what made the wide rungs expensive for long context.
+
+Reading only slot 0 out of the output surfaces, rather than converting all 32
+columns, took another 6 ms a token off both backends.
+
+### Remaining
+
+* Speculation. 124 ms/token is 8.1 tok/s; the 20-30 target needs several
+  tokens per pass, not a faster pass.
+* Quality evaluation across the three arms (fp16 ANE, int8 MIL, MLX).
+* Prefill still falls back to the Core AI multi-token graphs.

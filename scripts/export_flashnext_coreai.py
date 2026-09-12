@@ -2971,7 +2971,9 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
         fn_qsa_step: dict[int, object] = {}
         fn_qsa_step1: dict[int, object] = {}
         mil_gdn: dict[int, object] = {}
+        mil_qsa: dict[int, object] = {}
         use_mil = os.environ.get("FLASHNEXT_MIL_GDN", "0") not in ("0", "false", "")
+        use_mil_qsa = os.environ.get("FLASHNEXT_MIL_QSA", "0") not in ("0", "false", "")
         fn_qsa_rung: dict[tuple, dict] = {}
         qsa_rungs = [int(v) for v in os.environ.get(
             "FLASHNEXT_QSA_RUNGS", "256").split(",") if v.strip()]
@@ -3010,6 +3012,29 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                         await asyncio.sleep(0.5 * (attempt + 1))
                 raise last
 
+            if use_mil_qsa and qsa_assets:
+                # MIL int8 QSA replaces the folded Core AI qsa_step, 3.1x on the
+                # layer at m=256 and 2.2x at m=2048. Same exclusivity rule as
+                # the GDN side: one path or the other, never both resident.
+                from runtime.mil_qsa_backend import MilQsaLayer
+                from flashnext_mil_qsa_layer import _Ref as _QRef
+                t_mq = time.perf_counter()
+                mq_rungs = sorted(set(qsa_rungs))
+                for i in sorted(qsa_assets):
+                    lw = layer_w(i)
+                    try:
+                        qd = FlashNextQSADecode(max_s=max(mq_rungs)).eval().half()
+                        qd.load_from_layer(lw)
+                        mil_qsa[i] = MilQsaLayer(i, lw, _QRef(lw), qd, mq_rungs)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"  MIL QSA L{i} failed ({exc}); falling back to Core AI",
+                              flush=True)
+                        mil_qsa.clear()
+                        break
+                if mil_qsa:
+                    print(f"  MIL int8 QSA: {len(mil_qsa)} layers, rungs "
+                          f"{mq_rungs} in {time.perf_counter() - t_mq:.1f}s", flush=True)
+                    qsa_assets.clear()
             for i, pq in sorted(qsa_assets.items()):
                 print(f"  loading ANE QSA L{i}…", flush=True)
                 try:
@@ -3112,7 +3137,9 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             # only additions are k real token slots and a "shared" output.
             if prefill_k:
                 t_m = time.perf_counter()
-                for i in sorted(fn_pure):
+                gdn_ids = sorted(fn_pure) or sorted(mil_gdn)
+                qsa_ids = sorted(fn_qsa) or sorted(mil_qsa)
+                for i in gdn_ids:
                     pm = OUT_DIR / f"flashnext_multitoken_step_k{prefill_k}_L{i}.aimodel"
                     if not pm.is_dir():
                         print(f"  prefill: missing {pm.name}; falling back to serial",
@@ -3126,7 +3153,7 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     # Folded QSA (mixers inside the graph) when exported: it
                     # costs +0.55 ms on the ANE and removes two host mixer
                     # passes and two recombines per layer per chunk.
-                    for i in sorted(fn_qsa):
+                    for i in qsa_ids:
                         # Folded FP16 mixers change greedy near-ties (including
                         # the required "The 2016–17" prefix). Keep bare QSA as
                         # the correctness default; folding is experimental.
@@ -3153,7 +3180,7 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     for rung in qsa_rungs:
                         for kk in (1,):
                             d = {}
-                            for i in sorted(fn_qsa):
+                            for i in qsa_ids:
                                 pr = (OUT_DIR
                                       / f"flashnext_qsa_step_k{kk}_L{i}_m{rung}.aimodel")
                                 if not pr.is_dir():
@@ -3168,7 +3195,7 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                         print("  QSA rungs: " + ", ".join(
                             f"m{r}/k{k}" for (r, k) in sorted(fn_qsa_rung)), flush=True)
                 if fn_multi and not fn_qsa_step:
-                    for i in sorted(fn_qsa):
+                    for i in qsa_ids:
                         pm = (OUT_DIR
                               / f"flashnext_multitoken_qsa_L{i}_m{prefill_max_s}.aimodel")
                         if not pm.is_dir():
@@ -3301,7 +3328,7 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
         qsa_idx: dict[int, object] = {}
         qsa_idx_state: dict[int, object] = {}
         qsa_bufs_multi: dict[str, np.ndarray] = {}
-        _qsa_any = fn_qsa_step or fn_qsa_multi
+        _qsa_any = fn_qsa_step or fn_qsa_multi or mil_qsa
         if _qsa_any:
             from runtime.flashnext_indexer import QSAIndexer, IndexerState, clip_to_budget
             kv_c_m = QSA_HKV * QSA_HD
@@ -3317,6 +3344,11 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 for i in _qsa_any
             }
             qsa_rung_bufs: dict[int, dict] = {}
+            mil_qsa_ms = {"mix": 0.0, "index": 0.0, "feed": 0.0, "ane": 0.0,
+                          "moe": 0.0, "recombine": 0.0}
+            mil_qsa_inv = (1.0 / (10_000_000.0 ** (
+                np.arange(0, QSA_ROTARY, 2, dtype=np.float32)
+                / np.float32(QSA_ROTARY)))).astype(np.float32)
 
             def _bufs_for(m: int) -> dict:
                 b = qsa_rung_bufs.get(m)
@@ -3526,6 +3558,68 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             if pt is not None:
                 pt["recombine"] += time.perf_counter() - _t6
             return out
+
+        def mil_qsa_step_layer(i: int, hidden: np.ndarray, bc1s: bool = False):
+            """One QSA layer on the MIL int8 backend, decode (one live slot).
+
+            The host still runs the attention mixer, because the indexer picks
+            keys from it and that has to happen before the ANE call; the graph
+            runs its own copy. What the graph folds in is everything after the
+            selection: attention, recombine, the MLP mixer and the shared
+            expert.
+            """
+            hl = host_layers[i]
+            lay = mil_qsa[i]
+            cache = attn_state[i]
+            tq = mil_qsa_ms
+            _t0 = time.perf_counter()
+            off = int(cache.offset)
+            m = lay.rung_for(off + 1)
+            x_bc = (np.asarray(hidden, np.float32) if bc1s
+                    else _bsh_to_bc1s(np.asarray(hidden, np.float32)))
+            mixed, _, _ = host_gated_residual_cached(x_bc, hl.attn)
+            _t1 = time.perf_counter()
+            tq["mix"] += _t1 - _t0
+            sel = qsa_idx[i].update_and_select(
+                np.asarray(_bc1s_to_bsh(mixed), np.float32).reshape(-1, H),
+                off, qsa_idx_state[i])
+            keep = (np.asarray(sel, np.int64) if sel is not None
+                    else np.arange(off, dtype=np.int64))
+            keep = clip_to_budget(keep, off, m)
+            nsel = int(keep.size)
+            _t2 = time.perf_counter()
+            tq["index"] += _t2 - _t1
+            kv_c = QSA_HKV * QSA_HD
+            ks = (cache.keys[:, keep].transpose(0, 2, 1).reshape(kv_c, nsel)
+                  if nsel else np.zeros((kv_c, 0), np.float16))
+            vs = (cache.values[:, keep].transpose(0, 2, 1).reshape(kv_c, nsel)
+                  if nsel else np.zeros((kv_c, 0), np.float16))
+            pos = np.float32(off) * mil_qsa_inv
+            cos_b = np.zeros((QSA_ROTARY // 2, seq), np.float16)
+            sin_b = np.zeros((QSA_ROTARY // 2, seq), np.float16)
+            cos_b[:, 0] = np.cos(pos).astype(np.float16)
+            sin_b[:, 0] = np.sin(pos).astype(np.float16)
+            xb = np.zeros((HC_W, seq), np.float16)
+            xb[:, :1] = np.asarray(x_bc[0, :, 0, :1], np.float16)
+            _t3 = time.perf_counter()
+            tq["feed"] += _t3 - _t2
+            m_mix, m_hyp, m_inj, m_sh, nk, nv = lay(
+                xb, np.asarray(ks, np.float16), np.asarray(vs, np.float16),
+                cos_b, sin_b, nsel, m)
+            _t4 = time.perf_counter()
+            tq["ane"] += _t4 - _t3
+            cache.keys[:, off] = nk.reshape(QSA_HKV, QSA_HD)
+            cache.values[:, off] = nv.reshape(QSA_HKV, QSA_HD)
+            cache.offset = off + 1
+            mixed_bsh2 = _bc1s_to_bsh(m_mix)
+            inds, sc = hl.moe._route(np.asarray(mixed_bsh2, np.float32).reshape(-1, H))
+            routed = hl.moe._resident.routed_multi(mixed_bsh2, inds, sc)
+            y = routed + _bc1s_to_bsh(m_sh)
+            _t5 = time.perf_counter()
+            tq["moe"] += _t5 - _t4
+            hc = host_recombine(_bsh_to_bc1s(y), m_hyp, m_inj)
+            tq["recombine"] += time.perf_counter() - _t5
+            return hc if bc1s else _bc1s_to_bsh(hc)
 
         async def prefill_chunked(ids: list[int], k: int) -> int:
             """Run prompt tokens through the k-token graphs, k slots per submit.
@@ -3782,6 +3876,11 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                         timers["ane"] += time.perf_counter() - t_a
                         used = "ANE-GDN/1sub"
                     hidden = apply_moe(i, attn0, hyper, inj, timers)
+                elif i in mil_qsa:
+                    t_a = time.perf_counter()
+                    hidden = mil_qsa_step_layer(i, hidden[:, :1, :])
+                    timers["ane"] += time.perf_counter() - t_a
+                    used = "MIL-qsa"
                 elif i in fn_qsa_step:
                     t_a = time.perf_counter()
                     hidden = await qsa_step_layer(i, hidden[:, :1, :], 1)
@@ -3865,6 +3964,11 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 f"ple={timers['ple']*1e3:.1f} (lookup={timers['ple_lookup']*1e3:.1f})",
                 flush=True,
             )
+            if mil_qsa:
+                print("    qsa(MIL) ms  " + "  ".join(
+                    f"{k}={v * 1e3:.1f}" for k, v in mil_qsa_ms.items()), flush=True)
+                for k in mil_qsa_ms:
+                    mil_qsa_ms[k] = 0.0
             h1, d1, m1 = store.counts()
             if moe_mode == "q4gemv":
                 print(f"    native Q4 expert evaluations={d1-store_c0[1]} bank={store.ram_bytes()/1e9:.2f} GB", flush=True)
