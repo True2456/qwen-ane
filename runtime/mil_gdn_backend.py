@@ -57,7 +57,7 @@ class MilGdnLayer:
     matching the Core AI graph's contract so decode can swap between them.
     """
 
-    __slots__ = ("layer", "k", "_prog", "_param", "_hcn", "_conv", "_state", "_eng")
+    __slots__ = ("layer", "k", "_prog", "_param", "_hcn", "_conv", "_eng")
 
     def __init__(self, layer: int, weights, ref_step, k: int = 1,
                  engine: AneEngine | None = None):
@@ -71,23 +71,38 @@ class MilGdnLayer:
             raise RuntimeError(f"MIL layer {layer} failed to compile")
         self.layer = int(layer)
         self._prog, self._param, self._hcn = built
-        self._conv = np.zeros((3 * QKV, S), np.float16)
-        self._state = np.zeros((HV, DV, DK), np.float16)
+        # Only column 0 of the conv cache is read (the three taps are stacked
+        # on the channel axis), so the surface is written a column at a time
+        # rather than 1.97 MB a layer.
+        self._conv = np.zeros((3 * QKV,), np.float16)
+        # The recurrent state lives in its input surface and never visits a
+        # host array: it is 1.57 MB a layer, 56 MB a pass across 36 layers, and
+        # staging it through NumPy copied that twice.
+        with _iosurface_view(self._prog._in_surfs[4], (HV, DV, DK),
+                             np.float16) as dst:
+            dst[:] = 0
 
     def reset(self) -> None:
         self._conv[:] = 0
-        self._state[:] = 0
+        with _iosurface_view(self._prog._in_surfs[1], (3 * QKV, S),
+                             np.float16) as dst:
+            dst[:] = 0
+        with _iosurface_view(self._prog._in_surfs[4], (HV, DV, DK),
+                             np.float16) as dst:
+            dst[:] = 0
 
     def __call__(self, x_bc1s: np.ndarray, n: int | None = None):
         """x is (1, HC_W, 1, S). Returns (mixed, hyper, inj, shared) over n slots.
 
         The recurrent state and conv cache advance in place, as `pure_step` does.
         """
-        x = np.ascontiguousarray(
-            np.asarray(x_bc1s, np.float16).reshape(HC_W, S))
+        x = np.asarray(x_bc1s, np.float16).reshape(HC_W, S)
         p = self._prog
-        for surf, val in zip(p._in_surfs, (x, self._conv, self._param,
-                                           self._hcn, self._state)):
+        with _iosurface_view(p._in_surfs[0], (HC_W, S), np.float16) as dst:
+            np.copyto(dst, x)
+        with _iosurface_view(p._in_surfs[1], (3 * QKV, S), np.float16) as dst:
+            dst[:, 0] = self._conv
+        for surf, val in zip(p._in_surfs[2:], (self._param, self._hcn)):
             with _iosurface_view(surf, val.shape, np.float16) as dst:
                 np.copyto(dst, val)
         if not self._eng.submit(p, procedure_index=0):
@@ -113,6 +128,12 @@ class MilGdnLayer:
                              np.float16) as o:
             return np.array(o, np.float16)
 
+    def set_state(self, value) -> None:
+        """Seed the recurrent state; the surface is the only copy."""
+        with _iosurface_view(self._prog._in_surfs[4], (HV, DV, DK),
+                             np.float16) as dst:
+            np.copyto(dst, np.asarray(value, np.float16).reshape(HV, DV, DK))
+
     def commit(self, j: int) -> None:
         """Advance the layer's state and conv window to the `j + 1` boundary.
 
@@ -123,10 +144,11 @@ class MilGdnLayer:
         j = int(j)
         p = self._prog
         with _iosurface_view(p._out_surfs[j], (HV, DV, DK), np.float16) as o:
-            np.copyto(self._state, np.asarray(o, np.float16))
+            with _iosurface_view(p._in_surfs[4], (HV, DV, DK), np.float16) as d:
+                np.copyto(d, o)
         with _iosurface_view(p._out_surfs[self.k + 4], (QKV, 64), np.float16) as o:
             for t in range(3):
-                self._conv[t * QKV:(t + 1) * QKV, 0] = o[:, j + 1 + t]
+                self._conv[t * QKV:(t + 1) * QKV] = o[:, j + 1 + t]
 
 
 def build_layers(layer_indices, loader_fn, step_fn, engine=None):

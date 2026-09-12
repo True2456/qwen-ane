@@ -38,8 +38,8 @@ def main() -> None:
     x[:, :k] = (rng.standard_normal((HC_W, k)) * 0.05).astype(np.float16)
     conv = np.ascontiguousarray((rng.standard_normal((3 * QKV, S)) * 0.02).astype(np.float16))
     state = np.ascontiguousarray((rng.standard_normal((HV, DV, DK)) * 0.02).astype(np.float16))
-    lay._conv[:] = conv
-    lay._state[:] = state
+    lay._conv[:] = conv[:, 0]
+    lay.set_state(state)
 
     with torch.no_grad():
         r = ref(torch.from_numpy(x).reshape(1, HC_W, 1, S),
@@ -52,7 +52,7 @@ def main() -> None:
     g_mixed = lay(x.reshape(1, HC_W, 1, S), n=k)[0].reshape(H, k)
     g_state = lay.state_at(k - 1).astype(np.float32)
     lay.commit(k - 1)
-    g_conv = lay._conv.astype(np.float32)[:, :1]
+    g_conv = lay._conv.astype(np.float32).reshape(-1, 1)
 
     def rel(a, b_):
         return float(np.linalg.norm(a - b_) / max(np.linalg.norm(b_), 1e-12))

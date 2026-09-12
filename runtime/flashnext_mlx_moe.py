@@ -17,7 +17,10 @@ class ResidentMoe:
     _configured = False
 
     def __init__(self, layer, shared, path=MLX4_DEFAULT):
-        self.dtype = getattr(mx, os.environ.get("FLASHNEXT_MOE_DTYPE", "float32"))
+        # fp16 throughout. fp32 scales and biases were 15 GB of a 76 GB bank,
+        # and on a 137 GB machine that margin decides whether the bank stays
+        # resident — see docs/W8A8-PROJECTIONS.md. It is also the faster pair.
+        self.dtype = getattr(mx, os.environ.get("FLASHNEXT_MOE_DTYPE", "float16"))
         # gather_qmm promotes FP16 + BF16 to FP32, then casts *all* scales
         # and biases before selecting experts (mlx/ops.cpp). With 48 banks
         # this creates ~15 GB/token of conversion output. Materialize the
@@ -69,6 +72,11 @@ class ResidentMoe:
         up = project(x, self.projections[1])
         y = project(gate * mx.sigmoid(gate) * up, self.projections[2])
         return mx.sum(y.squeeze(-2) * scores, axis=-2)
+
+    # A GPU router (softmax + argpartition + gather in one graph, one eval a
+    # layer) was tried and is a net loss: it removed the 6 ms of host routing
+    # and added 34 ms to the gather. The MoE eval is latency-bound, and the
+    # extra ops in the same graph cost more than the NumPy matmul they replace.
 
     def routed_multi(self, x_k, ids_k, scores_k):
         """Routed experts for k tokens in one submit.

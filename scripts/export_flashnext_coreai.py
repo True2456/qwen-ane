@@ -3760,12 +3760,14 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                           f"{elapsed / pos * 1e3:.1f} ms/token", flush=True)
             return full
 
-        _moe_split = os.environ.get("FLASHNEXT_MOE_SPLIT") == "1"
+        # Slots past the block width stay zero for the whole run, so the
+        # staging buffer is allocated and zeroed once rather than 36 times a
+        # pass.
+        _spec_xb = np.zeros((1, HC_W, 1, seq), np.float16)
         spec_pos = [[0, 0] for _ in range(max(1, spec_k))]
         _spec_n1 = os.environ.get("FLASHNEXT_SPEC_N1") == "1"
         spec_ms = {"embed": 0.0, "gdn_ane": 0.0, "gdn_route": 0.0, "gdn_moe": 0.0,
-                   "gdn_rec": 0.0, "qsa": 0.0, "head": 0.0, "commit": 0.0,
-                   "gdn_uniq": 0.0}
+                   "gdn_rec": 0.0, "qsa": 0.0, "head": 0.0, "commit": 0.0}
 
         def _block_forward(ids):
             """One K-slot backbone pass. Returns (hidden BSH, logits per slot).
@@ -3786,10 +3788,9 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 hl = host_layers[i]
                 if i in mil_gdn:
                     _t = time.perf_counter()
-                    xb = np.zeros((1, HC_W, 1, seq), np.float16)
                     bc = _bsh_to_bc1s(np.asarray(hid, np.float32))
-                    xb[..., :n] = np.asarray(bc[..., :n], np.float16)
-                    m_mix, m_hyp, m_inj, m_sh = mil_gdn[i](xb, n=n)
+                    _spec_xb[..., :n] = np.asarray(bc[..., :n], np.float16)
+                    m_mix, m_hyp, m_inj, m_sh = mil_gdn[i](_spec_xb, n=n)
                     _t2 = time.perf_counter()
                     _b["gdn_ane"] += _t2 - _t
                     mixed_bsh = _bc1s_to_bsh(m_mix)
@@ -3797,14 +3798,7 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                         np.asarray(mixed_bsh, np.float32).reshape(-1, H))
                     _tr = time.perf_counter()
                     _b["gdn_route"] += _tr - _t2
-                    if _moe_split:
-                        routed = np.concatenate([
-                            hl.moe._resident.routed_multi(
-                                mixed_bsh[:, t:t + 1], inds[t:t + 1], sc[t:t + 1])
-                            for t in range(n)], axis=1)
-                    else:
-                        routed = hl.moe._resident.routed_multi(mixed_bsh, inds, sc)
-                    _b["gdn_uniq"] += len(np.unique(inds))
+                    routed = hl.moe._resident.routed_multi(mixed_bsh, inds, sc)
                     y = routed + _bc1s_to_bsh(m_sh)
                     _t3 = time.perf_counter()
                     _b["gdn_moe"] += _t3 - _tr
@@ -3888,7 +3882,7 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 f"d{t + 1}={a}/{b}" for t, (a, b) in enumerate(spec_pos) if b),
                 flush=True)
             print("    per block ms  " + "  ".join(
-                f"{k2}={v2 * (1 if k2 == 'gdn_uniq' else 1e3) / max(blocks, 1):.1f}"
+                f"{k2}={v2 * 1e3 / max(blocks, 1):.1f}"
                 for k2, v2 in spec_ms.items()), flush=True)
             print("    qsa(MIL) ms/block  " + "  ".join(
                 f"{k2}={v2 * 1e3 / max(blocks, 1):.1f}"

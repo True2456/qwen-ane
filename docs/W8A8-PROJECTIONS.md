@@ -1011,3 +1011,52 @@ neither did a lower MLX cache limit. Only shrinking the total did.
   mixer (12 ms), the MoE router (6 ms), the state commit (5 ms).
 * Tree drafting would exploit the free width, but the GDN recurrence is a
   chain and cannot verify a branch.
+
+## Four optimizations that did not work
+
+All four were aimed at the 160 ms speculative pass. Recording them so nobody
+spends the day again.
+
+**int8 mixers and shared expert** (fp16 to int8, 18 MB off the ~94 MB a GDN
+layer holds): 1.897 to 1.800 ms a layer, 5%, while per-slot error went from
+0.028-0.034 to 0.031-0.038. A 10% error increase for a 5% gain.
+
+**int4 in_proj** (per-channel, 42 MB to 21 MB — the single largest weight in
+the layer): 1.897 to 1.880 ms, 1%, and error exploded from 0.028 to 0.22-0.29.
+
+Those two together disprove the model I had been working from: **the MIL layer
+is not weight-bandwidth-bound.** Halving its largest weight bought nothing.
+
+**A GPU router** — softmax, argpartition and the gather in one MLX graph, one
+`eval` a layer instead of a NumPy matmul plus a separate gather. Host routing
+went from 6.3 ms a block to 0.1 and the gather went from 30 to 61. The MoE call
+is latency-bound, and extra ops in the same graph cost more than the NumPy
+matmul they replace. 14.7 tok/s to 11.1.
+
+**Folding the mixer's four branches into rank-4 ops.** The mixer slices its
+four hyper-connection branches apart and puts them back, which is 55 ANE ops
+against 26 for the same arithmetic on a (1, HC, H, S) reshape — and
+(1, HC_W, 1, S) is exactly that tensor in row-major order, so it is free.
+Bit-identical output, and **slower**: 1.849 to 2.247 ms a layer. The ANE wants
+work on the channel axis; four 2560-channel ops beat one 4-channel op over the
+same elements. So the layer is not simply dispatch-bound either.
+
+What did help, for about 3 ms a pass between them: keeping the recurrent state
+in its input IOSurface instead of staging it through a host array (it is 56 MB
+a pass and was being copied twice), writing only the one live column of the
+conv cache surface instead of 1.97 MB a layer, and hoisting the zeroed staging
+buffer out of the layer loop.
+
+### Where the 160 ms actually goes
+
+| | ms | |
+|---|---|---|
+| GDN layers, ANE | 72 | 36 x 2.0 ms |
+| QSA layers | 47 | 12 x 3.9: ANE 1.3, host mixer 1.2, MoE 1.1, indexer 0.2 |
+| GDN MoE, GPU | 29 | 48 evals a pass, latency-bound |
+| router, commit, head, embed | 17 | host |
+
+The QSA host mixer is the largest remaining piece of host work. It exists only
+because the indexer selects keys from the mixed state and has to run before the
+ANE call, while the ANE graph computes its own copy. Splitting the QSA layer
+into two programs would remove it at the cost of 12 more resident models.
