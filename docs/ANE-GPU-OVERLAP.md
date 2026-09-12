@@ -87,3 +87,20 @@ Getting past 20 tok/s needs either a per-layer ANE mailbox with a mid-graph GPU
 kickoff, which the private path does not expose, or the routed MoE itself
 moved off the GPU. The block is otherwise a strictly serial alternation and
 each half is at its own floor.
+
+## Postscript: the block was never the binding constraint
+
+After the overlap work, a width sweep showed where the ceiling actually is.
+K is compile-fixed; 3, 5 and 6 fail to compile at all (`ANECCompile() FAILED`),
+so the usable widths are 1, 2, 4 and 8.
+
+| K | tok/s | tokens per pass |
+| --- | --- | --- |
+| 2 | 14.76 | 1.88 |
+| 4 | 16.04 | 2.46 |
+| 8 | 12.51 | 2.56 |
+
+Widening the block barely raises the tokens it confirms: the MTP head predicts
+the first draft position at 92% and the rest at 40%, so K=8 accepted 24% of
+its drafts. The serial cost of a block was never the problem. Draft quality
+was. See `CONTEXT-LOOKUP-DRAFTS.md`.

@@ -316,8 +316,15 @@ class MtpDrafter:
         mixed, _ = self.out_mix(pre)
         return self.head.logits_mx(mixed), pre
 
-    def draft(self, hidden_hc, token_id: int, n: int) -> list[int]:
-        """Chain `n` greedy drafts. Each one is a serialized round trip."""
+    def draft(self, hidden_hc, token_id: int, n: int, lookup=None) -> list[int]:
+        """Chain `n` greedy drafts. Each one is a serialized round trip.
+
+        `lookup` is an optional `ContextLookup`: when the drafted suffix has
+        occurred before, the token that followed it then replaces the head's
+        own argmax and is fed back into the chain. The head still runs every
+        step, because the drafter's attention cache needs a row per drafted
+        position for a partly accepted block to unwind.
+        """
         out: list[int] = []
         h = hidden_hc
         tok = int(token_id)
@@ -326,6 +333,10 @@ class MtpDrafter:
             nxt = mx.argmax(logits.reshape(-1))
             mx.eval(nxt, h)
             tok = int(nxt.item())
+            if lookup is not None:
+                hit = lookup.next_token(out)
+                if hit is not None:
+                    tok = int(hit)
             out.append(tok)
         return out
 

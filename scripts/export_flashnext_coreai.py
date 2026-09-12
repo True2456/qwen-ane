@@ -3976,13 +3976,22 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             t_draft = t_verify = t_eager = 0.0
             drafter_base = drafter.offset if drafter is not None else 0
             pending_drafts = None
+            # Suffix matching over the prompt and everything generated so far.
+            # The MTP head carries the first draft position; this carries the
+            # rest whenever the text is repeating something it has already
+            # seen, which is most of what a coding model emits.
+            lookup = None
+            if os.environ.get("FLASHNEXT_NGRAM", "1") not in ("0", "false", ""):
+                from runtime.flashnext_ngram import ContextLookup
+                lookup = ContextLookup()
+                lookup.extend(cur)
             while len(generated) < max_new:
                 _t0 = time.perf_counter()
                 if pending_drafts is not None:
                     drafts = pending_drafts
                     pending_drafts = None
                 else:
-                    drafts = (drafter.draft(chain, tid_l, kk - 1)
+                    drafts = (drafter.draft(chain, tid_l, kk - 1, lookup)
                               if chain is not None and not _spec_n1
                               and drafter else [])
                 t_draft += time.perf_counter() - _t0
@@ -4003,11 +4012,14 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     spec_pos[t][0] += int(preds[t] == drafts[t])
                 accepted += m
                 emit = drafts[:m] + [preds[m]]
+                _before = len(cur)
                 for tok in emit:
                     if len(generated) >= max_new:
                         break
                     generated.append(tok)
                     cur.append(tok)
+                if lookup is not None:
+                    lookup.extend(cur[_before:])
                 tid_l = preds[m]
                 chain = mx.array(np.ascontiguousarray(
                     np.asarray(hid, np.float32)[:, m:m + 1, :]))
@@ -4035,7 +4047,8 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     # thread and run GDN/QSA commit on another.
                     commit_th = threading.Thread(target=_commit, daemon=True)
                     commit_th.start()
-                    pending_drafts = drafter.draft(chain, tid_l, next_n)
+                    pending_drafts = drafter.draft(chain, tid_l, next_n,
+                                                   lookup)
                     commit_th.join()
                     if "err" in commit_box:
                         raise commit_box["err"]
@@ -4049,6 +4062,9 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             print(f"    draft {t_draft * 1e3:.0f} ms  "
                   f"verify {t_verify * 1e3:.0f} ms  "
                   f"eager-overlap {t_eager * 1e3:.0f} ms", flush=True)
+            if lookup is not None:
+                print(f"    context lookup fired {lookup.stats()} draft steps",
+                      flush=True)
             print("    draft position top-1 match  " + "  ".join(
                 f"d{t + 1}={a}/{b}" for t, (a, b) in enumerate(spec_pos) if b),
                 flush=True)
