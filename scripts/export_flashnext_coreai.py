@@ -2979,6 +2979,8 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
         mil_qsa: dict[int, object] = {}
         use_mil = os.environ.get("FLASHNEXT_MIL_GDN", "0") not in ("0", "false", "")
         use_mil_qsa = os.environ.get("FLASHNEXT_MIL_QSA", "0") not in ("0", "false", "")
+        _idx_host = os.environ.get("FLASHNEXT_IDX_HOST", "0") not in (
+            "0", "false", "")
         # Speculation width: the MIL graphs are baked at this many live slots
         # and are used for plain decode too, which just leaves the extra slots
         # unread. One set of programs, not two — the ANE ceiling is ~80.
@@ -3599,9 +3601,17 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             a_mixed, a_inj, a_qk = lay.front(xb, n)
             _t1 = time.perf_counter()
             tq["mix"] += _t1 - _t0
-            sel = qsa_idx[i].update_and_select(
-                None, off, qsa_idx_state[i],
-                projected=qsa_idx[i].split_qk(a_qk))
+            if _idx_host:
+                # A/B for long context: project the indexer's q and k on the
+                # host in fp32 from the ANE's mixed hidden, instead of taking
+                # the int8 projection the front program already computed.
+                sel = qsa_idx[i].update_and_select(
+                    np.ascontiguousarray(a_mixed.T),
+                    off, qsa_idx_state[i])
+            else:
+                sel = qsa_idx[i].update_and_select(
+                    None, off, qsa_idx_state[i],
+                    projected=qsa_idx[i].split_qk(a_qk))
             keep = (np.asarray(sel, np.int64) if sel is not None
                     else np.arange(off, dtype=np.int64))
             keep = clip_to_budget(keep, off, m)
@@ -3981,6 +3991,10 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             pos = 0
             total = 0.0
             n_scored = 0
+            # Every slot but the first reuses the key set the block selected,
+            # so a gap that lands only on the later slots means the shared
+            # selection is the cost, not the arithmetic.
+            per_slot = [[0.0, 0] for _ in range(max(1, kk))]
             t0 = time.perf_counter()
             while pos < len(eval_ids):
                 n = min(kk, len(eval_ids) - pos)
@@ -3992,7 +4006,10 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 mx_ = lg.max(axis=-1, keepdims=True)
                 lse = mx_[:, 0] + np.log(np.exp(lg - mx_).sum(axis=-1))
                 for j in range(n):
-                    total += lse[j] - lg[j, int(eval_ids[pos + j])]
+                    d = lse[j] - lg[j, int(eval_ids[pos + j])]
+                    total += d
+                    per_slot[j][0] += d
+                    per_slot[j][1] += 1
                 n_scored += n
                 _block_commit(n - 1)
                 tid = int(eval_ids[pos + n - 1])
@@ -4002,6 +4019,17 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     print(f"    {n_scored}/{len(eval_ids)} tokens  "
                           f"ppl {np.exp(total / n_scored):.4f}  "
                           f"{n_scored / max(el, 1e-9):.1f} tok/s", flush=True)
+            print("    per slot nll  " + "  ".join(
+                f"s{j}={v / max(c, 1):.4f}" for j, (v, c) in enumerate(per_slot)
+                if c), flush=True)
+            from runtime.flashnext_indexer import STATS as _IST
+            if _IST["calls"]:
+                print(f"    indexer past budget: {_IST['calls']} calls, "
+                      f"{_IST['none_past_budget']} fell back to recency, "
+                      f"{_IST['lost_prefix']} had lost the prefix, "
+                      f"{_IST['in_recent_2048'] / max(_IST['selected'], 1):.1%}"
+                      f" of selected keys were in the last 2048",
+                      flush=True)
             el = time.perf_counter() - t0
             print(f"  ppl over {n_scored} tokens: "
                   f"nll {total / max(n_scored, 1):.6f}  "

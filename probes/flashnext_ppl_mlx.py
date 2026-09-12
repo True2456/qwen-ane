@@ -19,6 +19,17 @@ import mlx.core as mx
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.utils import load
 
+if not hasattr(mx, "unique"):
+    # The indexer's block selection past the 2048-token budget calls
+    # mx.unique, which this MLX build does not have. Sorted unique values is
+    # the whole contract, and the sync it costs only affects this arm.
+    import numpy as _np
+
+    def _unique(a, *_a, **_k):
+        return mx.array(_np.unique(_np.array(a)))
+
+    mx.unique = _unique
+
 MODEL = "/Users/true/models/Qwen3.8-Flash-Next-MLX-4bit"
 # Feed the file in chunks through one prompt cache, so context accumulates the
 # way it does on the ANE arm. Scoring independent windows would measure a

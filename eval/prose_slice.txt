@@ -1,0 +1,136 @@
+ ms | TOPS | vs fp16 |
+|---:|---|---:|---:|---:|
+| 128 | fp16 | 0.451 | 14.89 | 1.00x |
+| 128 | w8a16 | 0.447 | 15.01 | 1.01x |
+| 128 | w8a8 | 0.451 | 14.87 | 1.00x |
+| 256 | fp16 | 0.809 | 16.59 | 1.00x |
+| 256 | w8a16 | 0.794 | 16.91 | 1.02x |
+| 256 | w8a8 | 0.493 | 27.22 | 1.64x |
+| 512 | fp16 | 1.881 | 14.27 | 1.00x |
+| 512 | w8a16 | 1.517 | 17.69 | 1.24x |
+| 512 | w8a8 | 0.899 | **29.86** | **2.09x** |
+
+## Three things the table says
+
+**There is a width threshold at S=256.** At S=128 W8A8 is worth nothing on two
+of the three families (0.99x and 1.00x) and the whole gain appears at 256 and
+holds at 512. Below the threshold the chain is latency-bound, so halving
+activation bytes buys nothing. Prefill tiles should therefore be 256 wide or
+more, and decode at S=1 will see none of this.
+
+**The 16384-wide projection is the weight-bandwidth-bound one.** It earns the
+largest relative win (3.67x) but the lowest absolute rate (15.83 TOPS against
+30.57 for the square case), because its weights are read once per tile and
+never reused. Absolute throughput tracks reuse; the W8A8 multiplier tracks
+activation bytes.
+
+**Fusion is now a precondition, not an optimization.** The saving exists only
+inside a single compiled program. Every projection compiled as its own program
+is fp16 in and fp16 out and can never benefit, however its weights are stored.
+One program per layer, spanning the gated delta net projections or an expert
+group, is what makes this reachable.
+
+## Caveats
+
+- **Numerics are not verified.** The probe checks only that outputs are finite
+  and non-zero. It does not compare against a dequantized reference. No
+  accuracy claim is made here.
+- The `finite` check flips intermittently on the fp16 control arm at some
+  widths while timings stay consistent. Unexplained; suspected stale surface
+  read rather than overflow. Treat the flag as a smoke test.
+- Weight scale is one scalar per conv, chosen as `1/(4*sqrt(in_dim))` to keep a
+  deep random chain magnitude-preserving. Real weights need per-output-channel
+  scales. `constexpr_affine_dequantize` takes an `axis` argument, so per-channel
+  should be reachable, untested.
+- Activation scale is a single hardcoded constant. Real inference needs
+  calibrated per-tensor activation scales, which is the main accuracy risk in
+  the whole approach.
+
+## Next
+
+1. Per-output-channel weight scales through the `axis` argument, then a
+   correctness check against a dequantized reference.
+2. Calibrated activation scales from real Flash-Next activations.
+3. Fuse one full linear-attention layer into a single program and A/B it
+   against the current per-projection version.
+4. Rail power over a fused layer. W8A8 cuts SRAM traffic rather than adding
+   compute, so power should fall while throughput rises. That is the number the
+   battery-mode backend is actually trying to move.
+
+## Accuracy: established (supersedes the "unmeasured" note below)
+
+The blocker named below was the `_make_blob` container bug, now fixed: header
+byte 80 is a FILE-ABSOLUTE payload pointer hardcoded to 0x80, so every
+concatenated chunk aliased tensor 0. `_BlobPacker` in
+`../runtime/q38_ane_engine.py` rewrites it per chunk, and
+`../tests/test_blob_pack.py` is the regression test (fp16/int8/int4, aligned
+and deliberately unaligned, every procedure resolving to its own weight). The
+same bug was live in the production bank packer — every procedure in a bank
+computed with the first tensor's weights, and int8 banks read that tensor's
+data as their dequant scale (`inf`). The "invalid model" / garbage-chain
+symptoms catalogued below were all this one uint32.
+
+With the container fixed, the fused projection block scores against an fp32
+reference (real layer-0 weights, outlier-injected activations, scales
+calibrated on an independent draw; full table in
+[FLASHNEXT-FUSED-AND-ROUTING.md](FLASHNEXT-FUSED-AND-ROUTING.md)):
+
+- fp16 control: 2.3e-3 (harness sound)
+- int8 per-channel weights only (w8a16): **4.7e-4** — beats fp16, because
+  per-channel int8 spends its codes where fp16 spends exponent bits on this
+  weight distribution
+- w8a8 (per-channel weights + per-channel activations): **2.8e-3** on
+  out_proj, 3.1e-3 worst case (depthwise conv1d), ~2.2 ms vs fp16's 3.4 ms
+
+Recipe, confirmed by two independent probes plus a numpy model that reproduces
+hardware to 1.4e-5 across 48 arms (`../probes/ane_act_quant_error.py`):
+
+- **Per-channel weights** through `constexpr_blockwise_shift_scale`
+  (`constexpr_affine_dequantize` is scalar-only).
+- **Per-channel activations**: rank-1 scale const + explicit `axis=int32(1)`
+  on BOTH `quantize` and `dequantize`. Rank-4 scales and rank-1-without-axis
+  are both InvalidMILProgram.
+- **Calibration margin**: a per-channel max from one draw underestimates the
+  next on about half the channels, and an undersized scale clips. Use
+  1.5-2.0x the calibration max; without the margin, per-channel max
+  calibration is WORSE than per-tensor on held-out data.
+- Per-tensor activation scales are off the table: the published 0.125 uses
+  ~10 of 254 codes (4.1e-1 rel L2); best-possible per-tensor is 2.2e-2;
+  per-channel-from-max is 7.0e-3.
+- The residual error term is now the int8 WEIGHT quantization, not
+  activations.
+
+The container lessons below remain load-bearing even with the bug fixed, plus
+one new one: **ANE binds output surfaces in compiled symbol order
+(alphabetical), not MIL return order.** Query
+`kANEFModelOutputSymbolsArrayKey` on `ANEFModelDescription`; mis-ordered
+surfaces fail at eval with Code=42 "IOSurface smaller than the model
+expects".
+
+### Historical record: how the container bug was isolated
+
+[`../probes/ane_w8a8_accuracy.py`](../probes/ane_w8a8_accuracy.py) runs real
+layer-0 weights (`in_proj_z` [6144, 2560] then `out_proj` [2560, 6144], which
+chain exactly) against an fp32 reference, with iid and outlier-injected
+activations. It compiles and reproduces the speed (0.74 ms w8a8 against 2.28 ms
+fp16, 3.1x) but **its numerics are invalid, including the fp16 control**, so no
+accuracy conclusion can be drawn from it yet. Timings in that probe are
+believable; error columns are not.
+
+The blocker is multi-tensor weight addressing, not the method. Established
+while narrowing it:
+
+- **A single-conv program with one real fp16 weight verifies at 2.99e-3**
+  against an fp32 reference, which is ordinary fp16 accumulation error. The
+  harness, IO surface layout and reference are all correct in that case.
+- **More than one blob FILE per program fails**, at any size, with
+  `verifyBundleAtPath: invalid model` (Code 10). A 1 MB 512-512-512 chain fails;
+  a single 31.5 MB conv succeeds. Chain depth is not the issue: an 8-conv chain
+  in one packed file compiles fine. Pack every tensor into one `weight.bin`.
+- **`_make_blob`'s payload-offset field appears to be file-absolute, not
+  chunk-relative.** It writes 0x80 at header byte 80, and a packed file of
+  several `_make_blob` chunks yields a correct first tensor and garbage for
+  every later one, which is exactly that symptom. The gist's own header variant
+  omits the field entirely and works, which is consistent.
+- **Do not add the gist's dtype marker to a `_make_blob` chunk.** The gist puts
+  it

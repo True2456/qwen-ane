@@ -18,6 +18,8 @@ this MLX build, so it has never run.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 
@@ -47,6 +49,14 @@ def _rope(x: np.ndarray, positions: np.ndarray, rotary_dim: int, theta: float) -
 #: to fit: a rejected draft chain (tens of tokens) and a snapshot trimmed back
 #: to the recovery boundary (a further 64). Matches the Swift backend.
 RETAINED_KEYS = 192
+
+#: Counters for the long-context audit. Cheap enough to leave on: three
+#: integers per selection, against a 2048-wide argpartition in the same call.
+STATS = {"calls": 0, "none_past_budget": 0, "lost_prefix": 0,
+         "selected": 0, "in_recent_2048": 0}
+
+_RECENCY_ONLY = os.environ.get("FLASHNEXT_IDX_RECENCY", "0") not in (
+    "0", "false", "")
 
 
 def clip_to_budget(keep: np.ndarray, offset: int, budget: int,
@@ -215,7 +225,17 @@ class QSAIndexer:
             return None
 
         total = offset + L
+        if _RECENCY_ONLY:
+            # A/B floor: skip selection and let the caller keep the most recent
+            # `budget` keys, to see what the block selection is actually worth.
+            return None
+        if total > self.budget:
+            STATS["calls"] += 1
+            if not state.covers_prefix:
+                STATS["lost_prefix"] += 1
         if total <= self.budget or state.block_keys is None:
+            if total > self.budget:
+                STATS["none_past_budget"] += 1
             return None
         # Both bounds come from the array about to be partitioned; deriving the
         # count from the offset instead lets them disagree, which aborts inside
@@ -223,6 +243,7 @@ class QSAIndexer:
         held_blocks = state.block_keys.shape[0]
         n_blocks = min(total // self.compress_ratio, held_blocks)
         if n_blocks <= self.block_topk:
+            STATS["none_past_budget"] += 1
             return None
 
         qn = _rms_norm(q, self.q_norm, self.eps)                      # (L, heads, hd)
@@ -246,4 +267,6 @@ class QSAIndexer:
         idx = (top[:, None] * self.compress_ratio + np.arange(self.compress_ratio)).reshape(-1)
         if tail_len > 0:
             idx = np.concatenate([idx, np.arange(n_blocks * self.compress_ratio, total)])
+        STATS["selected"] += int(idx.size)
+        STATS["in_recent_2048"] += int((idx >= total - self.budget).sum())
         return idx.astype(np.int32)
