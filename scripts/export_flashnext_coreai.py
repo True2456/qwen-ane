@@ -55,6 +55,7 @@ import mmap
 import os
 import shutil
 import sys
+import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -3571,7 +3572,7 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             return out
 
         def mil_qsa_step_layer(i: int, hidden: np.ndarray, bc1s: bool = False,
-                               n: int = 1, commit: bool = True):
+                               n: int = 1, commit: bool = True, until: str = "full"):
             """One QSA layer on the MIL int8 backend over n live token slots.
 
             The host still runs the attention mixer, because the indexer picks
@@ -3580,6 +3581,8 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             selection: attention, recombine, the MLP mixer and the shared
             expert. `commit=False` leaves the cache offset for the caller to
             rewind, which is how a partly accepted speculative block unwinds.
+            `until="ane"` returns (mixed, hyper, inj, shared) BC1S so the
+            caller can overlap GPU MoE with the next ANE submit.
             """
             hl = host_layers[i]
             lay = mil_qsa[i]
@@ -3627,6 +3630,8 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             cache.keys[:, off:off + n] = nk.reshape(QSA_HKV, QSA_HD, n).transpose(0, 2, 1)
             cache.values[:, off:off + n] = nv.reshape(QSA_HKV, QSA_HD, n).transpose(0, 2, 1)
             cache.offset = off + n
+            if until == "ane":
+                return m_mix, m_hyp, m_inj, m_sh
             mixed_bsh2 = _bc1s_to_bsh(m_mix)
             inds, sc = hl.moe._route(np.asarray(mixed_bsh2, np.float32).reshape(-1, H))
             routed = hl.moe._resident.routed_multi(mixed_bsh2, inds, sc)
@@ -3769,15 +3774,28 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
         spec_pos = [[0, 0] for _ in range(max(1, spec_k))]
         _spec_n1 = os.environ.get("FLASHNEXT_SPEC_N1") == "1"
         spec_ms = {"embed": 0.0, "gdn_ane": 0.0, "gdn_route": 0.0, "gdn_moe": 0.0,
-                   "gdn_rec": 0.0, "qsa": 0.0, "head": 0.0, "commit": 0.0}
+                   "gdn_rec": 0.0, "qsa": 0.0, "head": 0.0, "commit": 0.0,
+                   "overlap": 0.0}
+        _spec_pipe = os.environ.get("FLASHNEXT_PIPE", "0") not in ("0", "false", "")
 
-        def _block_forward(ids):
-            """One K-slot backbone pass. Returns (hidden BSH, logits per slot).
+        def _moe_from_ane(hl, m_mix, m_hyp, m_inj, m_sh, _b=None):
+            mixed_bsh = _bc1s_to_bsh(m_mix)
+            t0 = time.perf_counter()
+            inds, sc = hl.moe._route(
+                np.asarray(mixed_bsh, np.float32).reshape(-1, H))
+            t1 = time.perf_counter()
+            routed = hl.moe._resident.routed_multi(mixed_bsh, inds, sc)
+            y = routed + _bc1s_to_bsh(m_sh)
+            t2 = time.perf_counter()
+            hid_h = _bc1s_to_bsh(host_recombine(_bsh_to_bc1s(y), m_hyp, m_inj))
+            t3 = time.perf_counter()
+            if _b is not None:
+                _b["gdn_route"] += t1 - t0
+                _b["gdn_moe"] += t2 - t1
+                _b["gdn_rec"] += t3 - t2
+            return hid_h
 
-            No state is committed: speculation only knows how many tokens the
-            block confirmed after it sees the logits, so every layer holds a
-            state per prefix until `_block_commit` picks one.
-            """
+        def _block_forward_serial(ids):
             n = len(ids)
             _b = spec_ms
             _t = time.perf_counter()
@@ -3795,17 +3813,7 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     m_mix, m_hyp, m_inj, m_sh = mil_gdn[i](_spec_xb, n=n)
                     _t2 = time.perf_counter()
                     _b["gdn_ane"] += _t2 - _t
-                    mixed_bsh = _bc1s_to_bsh(m_mix)
-                    inds, sc = hl.moe._route(
-                        np.asarray(mixed_bsh, np.float32).reshape(-1, H))
-                    _tr = time.perf_counter()
-                    _b["gdn_route"] += _tr - _t2
-                    routed = hl.moe._resident.routed_multi(mixed_bsh, inds, sc)
-                    y = routed + _bc1s_to_bsh(m_sh)
-                    _t3 = time.perf_counter()
-                    _b["gdn_moe"] += _t3 - _tr
-                    hid = _bc1s_to_bsh(host_recombine(_bsh_to_bc1s(y), m_hyp, m_inj))
-                    _b["gdn_rec"] += time.perf_counter() - _t3
+                    hid = _moe_from_ane(hl, m_mix, m_hyp, m_inj, m_sh, _b)
                 elif i in mil_qsa:
                     _t = time.perf_counter()
                     hid = mil_qsa_step_layer(i, hid, n=n, commit=False)
@@ -3818,6 +3826,132 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             _b["head"] += time.perf_counter() - _t
             return hid, np.asarray(lg, np.float32).reshape(n, -1)
 
+        def _block_forward_pipe(ids):
+            """Two-half wavefront: GPU MoE of half h overlaps ANE of the next half.
+
+            ANE(i, h1); GPU(i,h1) || ANE(i,h2); GPU(i,h2) || ANE(i+1,h1).
+            GDN recurrent state is fenced into the input surface between
+            halves of the same layer. QSA stays one K-slot submit (attention
+            across the block) and its MoE is split so it overlaps the next
+            GDN half.
+            """
+            n = len(ids)
+            n0 = n // 2
+            cuts = ((0, n0), (n0, n))
+            _b = spec_ms
+            _t = time.perf_counter()
+            hid = real_embedding_hidden(loader, list(ids))
+            _b["embed"] += time.perf_counter() - _t
+            pending = None  # (layer_i, lo, hi, mix, hyp, inj, sh)
+
+            def run_pending_gpu():
+                nonlocal pending, hid
+                if pending is None:
+                    return
+                i, lo, hi, mix, hyp, inj, sh = pending
+                hid[:, lo:hi, :] = _moe_from_ane(
+                    host_layers[i], mix, hyp, inj, sh, _b)
+                pending = None
+
+            def gdn_ane_half(i, h, *, async_):
+                lo, hi = cuts[h]
+                w = hi - lo
+                _spec_xb.fill(0)
+                bc = _bsh_to_bc1s(np.asarray(hid[:, lo:hi, :], np.float32))
+                _spec_xb[..., :w] = np.asarray(bc[..., :w], np.float16)
+                t0 = time.perf_counter()
+                mil_gdn[i].run(_spec_xb, w, async_=async_)
+                if not async_:
+                    _b["gdn_ane"] += time.perf_counter() - t0
+                return t0
+
+            def gdn_finish_half(i, h, *, fence):
+                lo, hi = cuts[h]
+                w = hi - lo
+                t0 = time.perf_counter()
+                out = mil_gdn[i].finish(w, offset=lo, fence=fence)
+                _b["gdn_ane"] += time.perf_counter() - t0
+                return out
+
+            def ple_range(lo, hi):
+                if i_ple not in ple_layers:
+                    return
+                for j in range(lo, hi):
+                    hid[:, j:j + 1, :] = ple_layers[i_ple].step(
+                        hid[:, j:j + 1, :], ids[j])
+
+            for i in range(n_layers):
+                i_ple = i
+                if i in mil_gdn:
+                    mil_gdn[i].begin_block(n)
+                    # hid[h1] is already ready (embed, or GPU of the previous
+                    # layer's h1). GPU of the previous h2 may still be pending
+                    # — that is the GPU(i,h2) || ANE(i+1,h1) slot.
+                    ple_range(*cuts[0])
+                    have_gpu = pending is not None
+                    t_sub = gdn_ane_half(i, 0, async_=have_gpu)
+                    if have_gpu:
+                        t_gpu = time.perf_counter()
+                        run_pending_gpu()
+                        gpu_dt = time.perf_counter() - t_gpu
+                        ple_range(*cuts[1])
+                    else:
+                        ple_range(*cuts[1])
+                        gpu_dt = 0.0
+                    mix, hyp, inj, sh = gdn_finish_half(i, 0, fence=True)
+                    if have_gpu:
+                        _b["overlap"] += min(gpu_dt, time.perf_counter() - t_sub)
+                    pending = (i, cuts[0][0], cuts[0][1], mix, hyp, inj, sh)
+                    t_sub = gdn_ane_half(i, 1, async_=True)
+                    t_gpu = time.perf_counter()
+                    run_pending_gpu()
+                    gpu_dt = time.perf_counter() - t_gpu
+                    mix, hyp, inj, sh = gdn_finish_half(i, 1, fence=False)
+                    _b["overlap"] += min(gpu_dt, time.perf_counter() - t_sub)
+                    pending = (i, cuts[1][0], cuts[1][1], mix, hyp, inj, sh)
+                elif i in mil_qsa:
+                    run_pending_gpu()
+                    ple_range(0, n)
+                    _t = time.perf_counter()
+                    mix, hyp, inj, sh = mil_qsa_step_layer(
+                        i, hid, n=n, commit=False, until="ane")
+                    _b["qsa"] += time.perf_counter() - _t
+                    # Split the QSA MoE so GPU(h1) is done before the next
+                    # GDN half, and GPU(h2) overlaps that GDN.
+                    lo, hi = cuts[0]
+                    pending = (i, lo, hi,
+                               np.ascontiguousarray(mix[..., :n0]),
+                               np.ascontiguousarray(hyp[..., :n0]),
+                               np.ascontiguousarray(inj[..., :n0]),
+                               np.ascontiguousarray(sh[..., :n0]))
+                    run_pending_gpu()
+                    lo, hi = cuts[1]
+                    pending = (i, lo, hi,
+                               np.ascontiguousarray(mix[..., n0:]),
+                               np.ascontiguousarray(hyp[..., n0:]),
+                               np.ascontiguousarray(inj[..., n0:]),
+                               np.ascontiguousarray(sh[..., n0:]))
+                else:
+                    raise RuntimeError(f"speculation: layer {i} has no K-slot graph")
+            run_pending_gpu()
+            _t = time.perf_counter()
+            mixed = gated_residual(mix_w, "hyper_connection_mixer", hid, False)
+            lg = q_head(mixed) if q_head is not None else lm_logits(mixed, lm_w)
+            _b["head"] += time.perf_counter() - _t
+            return hid, np.asarray(lg, np.float32).reshape(n, -1)
+
+        def _block_forward(ids):
+            """One K-slot backbone pass. Returns (hidden BSH, logits per slot).
+
+            No state is committed: speculation only knows how many tokens the
+            block confirmed after it sees the logits, so every layer holds a
+            state per prefix until `_block_commit` picks one.
+            """
+            n = len(ids)
+            if _spec_pipe and n >= 2 and mil_gdn:
+                return _block_forward_pipe(ids)
+            return _block_forward_serial(ids)
+
         def _block_commit(j: int) -> None:
             """Adopt the prefix of length j + 1 across every layer."""
             _t = time.perf_counter()
@@ -3829,6 +3963,9 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 qsa_idx_state[i].trim(cache.offset, qsa_idx[i].compress_ratio)
             spec_ms["commit"] += time.perf_counter() - _t
 
+        _spec_eager = os.environ.get("FLASHNEXT_EAGER", "1") not in (
+            "0", "false", "")
+
         async def speculate() -> None:
             """Draft with the MTP head, verify the whole block on the ANE."""
             nonlocal generated, cur
@@ -3836,12 +3973,18 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             tid_l = cur[-1]
             chain = None
             blocks = accepted = proposed = 0
-            t_draft = t_verify = 0.0
+            t_draft = t_verify = t_eager = 0.0
             drafter_base = drafter.offset if drafter is not None else 0
+            pending_drafts = None
             while len(generated) < max_new:
                 _t0 = time.perf_counter()
-                drafts = (drafter.draft(chain, tid_l, kk - 1)
-                          if chain is not None and not _spec_n1 and drafter else [])
+                if pending_drafts is not None:
+                    drafts = pending_drafts
+                    pending_drafts = None
+                else:
+                    drafts = (drafter.draft(chain, tid_l, kk - 1)
+                              if chain is not None and not _spec_n1
+                              and drafter else [])
                 t_draft += time.perf_counter() - _t0
                 ids = [tid_l] + drafts
                 proposed += len(drafts)
@@ -3859,7 +4002,6 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     spec_pos[t][1] += 1
                     spec_pos[t][0] += int(preds[t] == drafts[t])
                 accepted += m
-                _block_commit(m)
                 emit = drafts[:m] + [preds[m]]
                 for tok in emit:
                     if len(generated) >= max_new:
@@ -3870,16 +4012,43 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 chain = mx.array(np.ascontiguousarray(
                     np.asarray(hid, np.float32)[:, m:m + 1, :]))
                 # Drafter positions past the accepted prefix were conditioned
-                # on a token the backbone rejected.
+                # on a token the backbone rejected. Trim first, then overlap
+                # the next MTP chain with GDN/QSA commit (different engines).
                 if drafter is not None:
                     drafter.trim_to(drafter_base + m)
                     drafter_base = drafter.offset
+                next_n = kk - 1
+                do_eager = (_spec_eager and drafter is not None
+                            and not _spec_n1 and next_n > 0
+                            and len(generated) < max_new)
+                commit_box = {}
+
+                def _commit():
+                    try:
+                        _block_commit(m)
+                    except Exception as exc:  # noqa: BLE001
+                        commit_box["err"] = exc
+
+                _t_c = time.perf_counter()
+                if do_eager:
+                    # MLX streams are thread-local; keep drafting on this
+                    # thread and run GDN/QSA commit on another.
+                    commit_th = threading.Thread(target=_commit, daemon=True)
+                    commit_th.start()
+                    pending_drafts = drafter.draft(chain, tid_l, next_n)
+                    commit_th.join()
+                    if "err" in commit_box:
+                        raise commit_box["err"]
+                    t_eager += time.perf_counter() - _t_c
+                else:
+                    _block_commit(m)
             print(f"  speculation: {blocks} blocks, {len(generated)} tokens, "
                   f"{accepted}/{proposed} drafts accepted "
                   f"({accepted / max(proposed, 1):.0%}), "
                   f"{len(generated) / blocks:.2f} tokens/pass", flush=True)
             print(f"    draft {t_draft * 1e3:.0f} ms  "
-                  f"verify {t_verify * 1e3:.0f} ms", flush=True)
+                  f"verify {t_verify * 1e3:.0f} ms  "
+                  f"eager-overlap {t_eager * 1e3:.0f} ms", flush=True)
             print("    draft position top-1 match  " + "  ".join(
                 f"d{t + 1}={a}/{b}" for t, (a, b) in enumerate(spec_pos) if b),
                 flush=True)
@@ -3906,6 +4075,13 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                   f"peak {mx.get_peak_memory() / 1e9:.1f} GB  "
                   f"max working set "
                   f"{_info['max_recommended_working_set_size'] / 1e9:.1f} GB",
+                  flush=True)
+            print(f"  ANE/GPU pipeline: "
+                  f"{'on' if _spec_pipe else 'off'} "
+                  f"(FLASHNEXT_PIPE, two micro-batches of {spec_k // 2}+"
+                  f"{spec_k - spec_k // 2}); "
+                  f"eager MTP {'on' if _spec_eager else 'off'} "
+                  f"(FLASHNEXT_EAGER, draft || commit)",
                   flush=True)
 
         t_all = time.perf_counter()

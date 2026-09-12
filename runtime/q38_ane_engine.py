@@ -776,6 +776,7 @@ class AneEngine:
             "compile_seconds": 0.0,
             "load_seconds": 0.0,
         }
+        self._submit_q = None
         self._init_framework()
 
     def _init_framework(self):
@@ -810,21 +811,9 @@ class AneEngine:
     def available(self) -> bool:
         return self._available
 
-    def submit(self, program: "AneProgram", procedure_index: int = 0) -> bool:
-        """Run a loaded program, optionally selecting a procedure.
-
-        _ensure_io builds the request once with procedureIndex hardcoded to 0.
-        A multi-procedure program (one per expert) needs the index chosen per
-        call, and _ANERequest takes it at construction, so switching means
-        rebuilding the request. The IOSurfaces are reused, so this is object
-        churn only -- no weight movement, which is the point of baking.
-        """
-        if not self._ensure_io(program):
-            return False
-
-        if not self._ensure_request(program, procedure_index):
-            return False
-
+    def _evaluate_blocking(self, program: "AneProgram",
+                           procedure_index: int = 0) -> bool:
+        """Synchronous `evaluateWithQoS:` — does not build the request."""
         err_ptr = ctypes.c_void_p(0)
         Eval = ctypes.CFUNCTYPE(
             ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p,
@@ -837,6 +826,46 @@ class AneEngine:
             logger.error("submit: evaluate FAILED: %s",
                          _desc(err_ptr.value) if err_ptr.value else "unknown")
         return bool(ok)
+
+    def submit(self, program: "AneProgram", procedure_index: int = 0) -> bool:
+        """Run a loaded program, optionally selecting a procedure.
+
+        _ensure_io builds the request once with procedureIndex hardcoded to 0.
+        A multi-procedure program (one per expert) needs the index chosen per
+        call, and _ANERequest takes it at construction, so switching means
+        rebuilding the request. The IOSurfaces are reused, so this is object
+        churn only -- no weight movement, which is the point of baking.
+
+        Blocks until the ANE finishes. Use `submit_async` to overlap with GPU
+        work on another thread.
+        """
+        if not self._ensure_io(program):
+            return False
+        if not self._ensure_request(program, procedure_index):
+            return False
+        return self._evaluate_blocking(program, procedure_index)
+
+    def submit_async(self, program: "AneProgram", procedure_index: int = 0):
+        """Queue an evaluate on the ANE worker thread.
+
+        Returns an `AneFuture`. The call itself does not wait. Completion is
+        the private `_ANERequest` handler when it attaches, otherwise the
+        worker seeing `evaluateWithQoS:` return. MLX must not share this
+        thread: `mx.eval` belongs on the caller.
+        """
+        from runtime.ane_async import AneFuture, AneSubmitQueue
+
+        if not self._ensure_io(program) or not self._ensure_request(
+                program, procedure_index):
+            fut = AneFuture()
+            fut._finish(False)
+            return fut
+        if self._submit_q is None:
+            self._submit_q = AneSubmitQueue(self)
+        attach = os.environ.get("FLASHNEXT_ANE_HANDLER", "0") not in (
+            "0", "false", "")
+        return self._submit_q.submit(program, procedure_index,
+                                     attach_handler=attach)
 
     def compile_multiproc(
         self,

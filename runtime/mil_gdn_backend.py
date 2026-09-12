@@ -58,7 +58,8 @@ class MilGdnLayer:
     """
 
     __slots__ = ("layer", "k", "_prog", "_param", "_hcn", "_conv", "_eng",
-                 "_conv_out_width", "_conv_surface_current")
+                 "_conv_out_width", "_conv_surface_current",
+                 "_fut", "_prefix_state", "_prefix_fseq")
 
     def __init__(self, layer: int, weights, ref_step, k: int = 1,
                  engine: AneEngine | None = None):
@@ -84,9 +85,14 @@ class MilGdnLayer:
         # rather than 1.97 MB a layer.
         self._conv = np.zeros((3 * QKV,), np.float16)
         self._conv_surface_current = False
+        self._fut = None
+        self._prefix_state = None
+        self._prefix_fseq = None
         # The recurrent state lives in its input surface and never visits a
         # host array: it is 1.57 MB a layer, 56 MB a pass across 36 layers, and
         # staging it through NumPy copied that twice.
+        # Two in-flight micro-batches cannot share that surface: either a
+        # second slot or a fence before overwrite. The pipeline fences.
         with _iosurface_view(self._prog._in_surfs[4], (HV, DV, DK),
                              np.float16) as dst:
             dst[:] = 0
@@ -148,21 +154,115 @@ class MilGdnLayer:
 
         Speculation needs every prefix, not just the last: the graph emits a
         state per token and the whole conv window, so a partially accepted
-        block costs no extra pass.
+        block costs no extra pass. A pipelined two-half forward snapshots
+        prefixes on host because the second half overwrites the output
+        surfaces; `_block_commit` still calls this with the accepted j.
         """
         j = int(j)
+        if self._prefix_state is not None and self._prefix_state[j] is not None:
+            self._commit_saved(j)
+            return
         p = self._prog
         with _iosurface_view(p._out_surfs[j], (HV, DV, DK), np.float16) as o:
             with _iosurface_view(p._in_surfs[4], (HV, DV, DK), np.float16) as d:
                 np.copyto(d, o)
+        self._apply_conv_from_fseq(self._read_fseq(), j)
+
+    def begin_block(self, n: int) -> None:
+        """Reset prefix snapshots for a K-slot verification pass of width n."""
+        self._prefix_state = [None] * int(n)
+        self._prefix_fseq = []
+        self._fut = None
+
+    def _write_x(self, x_bc1s: np.ndarray) -> None:
+        x = np.asarray(x_bc1s, np.float16).reshape(HC_W, S)
+        p = self._prog
+        with _iosurface_view(p._in_surfs[0], (HC_W, S), np.float16) as dst:
+            np.copyto(dst, x)
+        if not self._conv_surface_current:
+            with _iosurface_view(p._in_surfs[1], (3 * QKV, S), np.float16) as dst:
+                dst[:, 0] = self._conv
+            self._conv_surface_current = True
+
+    def _take(self, w: int):
+        p = self._prog
+        kk = self.k
+        out = []
+        for j, shape in enumerate(((H, S), (H, S), (HC_W, S), (HC, S))):
+            with _iosurface_view(p._out_surfs[kk + j], shape, np.float16) as o:
+                out.append(np.array(o[:, :w], np.float32).reshape(1, shape[0], 1, w))
+        shared, mixed, hyper, inj = out
+        return mixed, hyper, inj, shared
+
+    def _read_fseq(self) -> np.ndarray:
+        p = self._prog
         with _iosurface_view(p._out_surfs[self.k + 4],
                              (QKV, self._conv_out_width), np.float16) as o:
-            with _iosurface_view(p._in_surfs[1], (3 * QKV, S), np.float16) as d:
-                for t in range(3):
-                    value = o[:, j + 1 + t]
-                    self._conv[t * QKV:(t + 1) * QKV] = value
-                    d[t * QKV:(t + 1) * QKV, 0] = value
+            return np.array(o, np.float16)
+
+    def _apply_conv_from_fseq(self, fseq: np.ndarray, j: int) -> None:
+        p = self._prog
+        with _iosurface_view(p._in_surfs[1], (3 * QKV, S), np.float16) as d:
+            for t in range(3):
+                value = fseq[:, j + 1 + t]
+                self._conv[t * QKV:(t + 1) * QKV] = value
+                d[t * QKV:(t + 1) * QKV, 0] = value
         self._conv_surface_current = True
+
+    def _commit_saved(self, j: int) -> None:
+        self.set_state(self._prefix_state[j])
+        for off, w, fseq in self._prefix_fseq:
+            if off <= j < off + w:
+                self._apply_conv_from_fseq(fseq, j - off)
+                return
+        raise RuntimeError(f"MIL layer {self.layer}: no fseq snapshot for j={j}")
+
+    def snapshot(self, offset: int, n: int) -> None:
+        """Keep prefix states so a later half can overwrite the output surfaces."""
+        if self._prefix_state is None:
+            return
+        for j in range(int(n)):
+            self._prefix_state[int(offset) + j] = self.state_at(j)
+        self._prefix_fseq.append((int(offset), int(n), self._read_fseq()))
+
+    def fence_state(self, n: int) -> None:
+        """Copy the last live slot's recurrent state into the input surface.
+
+        The next micro-batch of this layer reads that surface. Must not run
+        while an evaluate on this program is in flight.
+        """
+        if int(n) <= 0:
+            return
+        p = self._prog
+        j = int(n) - 1
+        with _iosurface_view(p._out_surfs[j], (HV, DV, DK), np.float16) as o:
+            with _iosurface_view(p._in_surfs[4], (HV, DV, DK), np.float16) as d:
+                np.copyto(d, o)
+        self._apply_conv_from_fseq(self._read_fseq(), j)
+
+    def run(self, x_bc1s: np.ndarray, n: int, *, async_: bool = False):
+        """Write inputs and evaluate. Async returns a future; caller must finish()."""
+        self._write_x(x_bc1s)
+        if async_:
+            self._fut = self._eng.submit_async(self._prog, procedure_index=0)
+            return self._fut
+        if not self._eng.submit(self._prog, procedure_index=0):
+            raise RuntimeError(f"MIL layer {self.layer}: submit failed")
+        self._fut = None
+        return None
+
+    def finish(self, n: int, *, offset: int = 0, fence: bool = False):
+        """Wait for an in-flight evaluate, take outputs, snapshot, maybe fence."""
+        if self._fut is not None:
+            ok = self._fut.wait()
+            self._fut = None
+            if not ok:
+                raise RuntimeError(f"MIL layer {self.layer}: async submit failed")
+        out = self._take(int(n))
+        self.snapshot(int(offset), int(n))
+        if fence:
+            self.fence_state(int(n))
+        return out
 
 
 def build_layers(layer_indices, loader_fn, step_fn, engine=None):
