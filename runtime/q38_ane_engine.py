@@ -1374,6 +1374,16 @@ class AneEngine:
 
         in_list = program._in_surfs or [program._in_surf]
         out_list = program._out_surfs or [program._out_surf]
+        # Procedures in one program can declare different numbers of outputs.
+        # The request pairs surfaces with the procedure's symbol indices by
+        # position, so a procedure with fewer outputs has to be handed the
+        # surfaces it actually writes, not the front of the list.
+        proc_map = getattr(program, "proc_out_map", None)
+        if proc_map and int(procedure_index) in proc_map:
+            out_list = [out_list[i] for i in proc_map[int(procedure_index)]]
+        proc_in = getattr(program, "proc_in_map", None)
+        if proc_in and int(procedure_index) in proc_in:
+            in_list = [in_list[i] for i in proc_in[int(procedure_index)]]
         in_objs = [wrap(s_) for s_ in in_list]
         out_objs = [wrap(s_) for s_ in out_list]
         if not all(in_objs) or not all(out_objs):

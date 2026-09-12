@@ -400,8 +400,17 @@ K = [1]          # live token slots; must divide S
 SINGLE_STATE = [False]
 
 
+#: An explicit list of slots to export, overriding both defaults. Two
+#: procedures in one program share one set of output surfaces, so a wide
+#: procedure has to export as many states as the narrow one it sits beside
+#: even though a prompt chunk only ever reads the last.
+EXPORT_SLOTS: list[list[int] | None] = [None]
+
+
 def state_slots() -> list[int]:
     """Which prefix states the graph exports."""
+    if EXPORT_SLOTS[0] is not None:
+        return list(EXPORT_SLOTS[0])
     return [K[0] - 1] if SINGLE_STATE[0] else list(range(K[0]))
 
 
