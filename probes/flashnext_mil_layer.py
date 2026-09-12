@@ -105,14 +105,8 @@ def sl4(name, src, beg, end, dims):
     emit(f'tensor<fp16, [{", ".join(map(str,dims))}]> {name} = slice_by_index(x={src}, begin={name}b, end={name}e, begin_mask=mm, end_mask=mm)[name=string("{name}")];')
 
 
-def gdn_core(t, state_in, state_out):
-    """One recurrence step over slot `t` of `fyin`. Emits `g{t}yf`, (1, GDN_Y, 1, 1).
-
-    Unrolling is what makes multi-token verification possible: everything else
-    in the layer (mixers, projections, the depthwise conv, the shared expert)
-    already runs across all 32 slots, so only this and the QSA attention were
-    ever single-token.
-    """
+def gdn_prepare(t):
+    """Prepare Q/K/V, scalar decay, beta and output gate for slot t."""
     g = f"g{t}"
     sl4(f"{g}one", "fyin", (0, 0, 0, t), (1, IN_O, 1, t + 1), (1, IN_O, 1, 1))
     sl4(f"{g}qk1", f"{g}one", (0, 0, 0, 0), (1, QKV, 1, 1), (1, QKV, 1, 1))
@@ -145,6 +139,12 @@ def gdn_core(t, state_in, state_out):
     emit(f'tensor<fp16, [1, {HV}, 1, {DK}]> {g}sg = sigmoid(x={g}an)[name=string("{g}sg")];')
     emit(f'tensor<fp16, [1, {HV}, 1, {DK}]> {g}dec = pow(x={g}sg, y=gam)[name=string("{g}dec")];')
     emit(f'tensor<fp16, [1, {HV}, 1, 1]> {g}bet = sigmoid(x={g}b1)[name=string("{g}bet")];')
+
+
+def gdn_core(t, state_in, state_out):
+    """The original fp16 per-token recurrence, retained for decode and A/B."""
+    gdn_prepare(t)
+    g = f"g{t}"
     emit(f'tensor<fp16, [1, {HV}, {DV}, {DK}]> {g}st1 = mul(x={state_in}, y={g}dec)[name=string("{g}st1")];')
     emit(f'tensor<fp16, [1, {HV}, {DV}, {DK}]> {g}sk = mul(x={g}st1, y={g}kn48)[name=string("{g}sk")];')
     emit(f'tensor<fp16, [1, {HV}, {DV}, 1]> {g}mem = reduce_sum(x={g}sk, axes=ax, keep_dims=kd)[name=string("{g}mem")];')
@@ -156,6 +156,12 @@ def gdn_core(t, state_in, state_out):
     emit(f'tensor<fp16, [1, {HV}, {DV}, {DK}]> {g}sq = mul(x={state_out}, y={g}qn48)[name=string("{g}sq")];')
     emit(f'tensor<fp16, [1, {HV}, {DV}, 1]> {g}yv = reduce_sum(x={g}sq, axes=ax, keep_dims=kd)[name=string("{g}yv")];')
     emit(f'tensor<fp16, [1, {HV}, 1, {DV}]> {g}yt = transpose(x={g}yv, perm=pm)[name=string("{g}yt")];')
+    gdn_finish(t)
+
+
+def gdn_finish(t):
+    """Normalize and gate a token output in the existing arithmetic order."""
+    g = f"g{t}"
     emit(f'tensor<fp16, [1, {HV}, 1, {DV}]> {g}y2 = mul(x={g}yt, y={g}yt)[name=string("{g}y2")];')
     emit(f'tensor<fp16, [1, {HV}, 1, 1]> {g}ym = reduce_mean(x={g}y2, axes=ax, keep_dims=kd)[name=string("{g}ym")];')
     emit(f'tensor<fp16, [1, {HV}, 1, 1]> {g}ye = add(x={g}ym, y=eps)[name=string("{g}ye")];')
@@ -245,13 +251,15 @@ def build_mil(offs):
     sl("gam", "c_param", 0, HV, HV, 1, DK, 1, DK)
     sl("dtb", "c_param", HV, 2 * HV, HV, 1, DK, 1, DK)
     sl("nw", "c_param", 2 * HV, 3 * HV, HV, 1, DK, 1, DK)
-    prev = "e_state"
-    for t in range(k):
-        # Surfaces bind in alphabetical symbol order, so the index has to be
-        # zero padded: at k=16 "q_state10" sorts before "q_state2" and every
-        # prefix state comes back under the wrong slot.
-        gdn_core(t, prev, f"q_state{t:02d}")
-        prev = f"q_state{t:02d}"
+    chunk = SINGLE_STATE[0] and os.environ.get("MIL_GDN_CHUNK", "0") == "1"
+    if chunk:
+        from flashnext_mil_chunk import gdn_chunk
+        gdn_chunk(sys.modules[__name__], k, offs)
+    else:
+        prev = "e_state"
+        for t in range(k):
+            gdn_core(t, prev, f"q_state{t:02d}")
+            prev = f"q_state{t:02d}"
     if k == 1:
         emit(f'tensor<fp16, [1, {HV}, {DV}, 1]> ystk = transpose(x=g0yo, perm=pm)[name=string("ystk")];')
     else:
@@ -334,6 +342,12 @@ def build_layer(w, ref):
                             ("sh_down", sd_, H, I), ("sh_sg", sgate_, 1, H)):
         offs[key] = dp.append(
             np.ascontiguousarray(wt).astype(np.float16).reshape(co, ci, 1, 1).tobytes()) + 64
+    if SINGLE_STATE[0] and os.environ.get("MIL_GDN_CHUNK", "0") == "1":
+        c = 32
+        for name, mask in (("lower", np.tril(np.ones((c,c)))),
+                           ("strict", np.tril(np.ones((c,c)), -1)),
+                           ("eye", np.eye(c))):
+            offs["chunk_" + name] = sp.append(mask.astype(np.float16).tobytes()) + 64
     files = {"weight_data.bin": dp.getvalue(), "weight_scale.bin": sp.getvalue()}
     param = np.concatenate([
         np.repeat(conn.gamma.detach().float().numpy().reshape(HV, 1), DK, 1),
@@ -352,7 +366,9 @@ def build_layer(w, ref):
             buf.write(str(exc))
     if prog is None:
         import os as _os
-        if _os.environ.get("MIL_VERBOSE"):
+        if _os.environ.get("MIL_VERBOSE") == "2":
+            print(buf.getvalue())
+        elif _os.environ.get("MIL_VERBOSE"):
             hit = [l for l in buf.getvalue().splitlines()
                    if "rror" in l or "nvalid" in l]
             print("  MIL compile: " + (hit[-1] if hit else buf.getvalue()[-400:]))

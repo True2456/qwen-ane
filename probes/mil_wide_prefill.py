@@ -11,6 +11,7 @@ compiling. The emitter's sequence width is 32, which caps k there.
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -42,7 +43,7 @@ def main() -> None:
     for k in ks:
         t0 = time.perf_counter()
         try:
-            lay = MilGdnLayer(0, w, ref, k=k)
+            lay = MilGdnLayer(0, w, ref, k=k, single_state=os.environ.get("MIL_K_SINGLE_STATE") == "1")
         except Exception as exc:  # noqa: BLE001
             print(f"{k:4d}  FAILED: {exc}")
             continue
