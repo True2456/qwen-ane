@@ -85,3 +85,39 @@ kernel that holds the state in registers for a whole sequence; the ANE cannot,
 so matching it needs the chunked form of the delta rule, where a chunk of C
 tokens is matmuls and the state is updated once. That is the next real step on
 prefill, and it is worth about 5 of the 18.6 ms a token.
+
+## One program, both widths
+
+Two graph sets meant two copies of the baked weights, 94.1 MB a layer twice,
+because a compiled program carries its own. `compile_multiproc` already puts
+many procedures in one program for the routed experts, and the two unrolls fit
+the same way: procedure 0 at k=4 exporting a state per prefix, procedure 1 at
+k=32 exporting only its end-of-chunk state, sharing one weights dictionary.
+
+Two things had to be arranged. The request pairs output surfaces with a
+procedure's symbol indices by position, so a procedure declaring fewer outputs
+bound to the front of the list and the evaluate failed with no error text;
+programs now carry a per-procedure surface map. And the wide procedure's single
+state is mapped onto the *last* state surface, which is exactly where the
+narrow procedure's `commit` already looks — so there is no handover between
+prefill and decode at all, only a `select`.
+
+It is also faster, which was not the point:
+
+| | prefill, 511 tokens | GDN, ms a token |
+| --- | --- | --- |
+| two programs | 59.7 and 65.2 tok/s | 6.10 and 6.17 |
+| one program, two procedures | 78.0 and 82.0 tok/s | 4.76 |
+
+Halving the resident weights is the likely reason. Perplexity is unchanged to
+every digit, 1.886208 and 6.5943 scoring 1024 tokens after a 512-token
+prefill, and a decode run emits the same ids at 20.7 tok/s.
+
+The cost is compile time. Building 36 two-procedure programs took 136s against
+about 22s for the two separate sets, and ANE compile times here are volatile
+enough that the number should be re-checked on a warm cache before anyone
+plans around it.
+
+Prefill across this whole sequence: 7.4, then 25.6 filling every slot, 40 at
+K=8, 58 with a second graph set, 65 with the chunked delta rule, and 82 with
+both unrolls in one program.

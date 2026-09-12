@@ -59,10 +59,12 @@ class MilGdnLayer:
 
     __slots__ = ("layer", "k", "_prog", "_param", "_hcn", "_conv", "_eng",
                  "_conv_out_width", "_conv_surface_current",
-                 "_fut", "_prefix_state", "_prefix_fseq", "_ns")
+                 "_fut", "_prefix_state", "_prefix_fseq", "_ns",
+                 "_proc", "_ob", "_proc_k", "_proc_ns")
 
     def __init__(self, layer: int, weights, ref_step, k: int = 1,
-                 engine: AneEngine | None = None, single_state: bool = False):
+                 engine: AneEngine | None = None, single_state: bool = False,
+                 prefill_k: int = 0):
         import flashnext_mil_layer as _ML
         self._eng = engine or _ML.eng
         _ML.LAYER[0] = int(layer)
@@ -70,17 +72,31 @@ class MilGdnLayer:
         _ML.SINGLE_STATE[0] = bool(single_state)
         self.k = int(k)
         try:
-            built = _ML.build_layer(weights, ref_step)
+            if prefill_k:
+                # Two unrolls in one program. A program carries its own copy
+                # of the baked weights, so building them separately costs
+                # 94 MB a layer twice; as two procedures they share one.
+                built = _ML.build_program_multi(
+                    weights, ref_step, [(k, single_state), (prefill_k, True)])
+            else:
+                built = _ML.build_layer(weights, ref_step)
         finally:
             _ML.SINGLE_STATE[0] = False
         if built is None:
             raise RuntimeError(f"MIL layer {layer} failed to compile")
         self.layer = int(layer)
         self._prog, self._param, self._hcn = built
-        # Prefix states exported. One means only the last slot's state is
-        # readable, which is all a prompt chunk needs; everything after the
-        # states shifts down by that much.
-        self._ns = int(getattr(self._prog, "n_states", self.k))
+        # Prefix states exported by the selected procedure. One means only the
+        # last slot's state is readable, which is all a prompt chunk needs.
+        # `_ob` is where the non-state outputs start and never moves, because
+        # every procedure shares one set of surfaces.
+        self._proc = 0
+        self._proc_k = dict(getattr(self._prog, "proc_states", {}) and
+                            {0: int(k), 1: int(prefill_k)} or {0: int(k)})
+        self._proc_ns = dict(getattr(self._prog, "proc_states", None)
+                             or {0: int(getattr(self._prog, "n_states", self.k))})
+        self._ns = self._proc_ns[0]
+        self._ob = int(getattr(self._prog, "n_state_surfs", self._ns))
         self._conv_out_width = int(getattr(self._prog, "conv_out_width", 64))
         # These immutable arrays are MIL inputs only because the frontend
         # rejects their constant spelling.  Copy them to their IOSurfaces once.
@@ -128,7 +144,7 @@ class MilGdnLayer:
             with _iosurface_view(p._in_surfs[1], (3 * QKV, S), np.float16) as dst:
                 dst[:, 0] = self._conv
             self._conv_surface_current = True
-        if not self._eng.submit(p, procedure_index=0):
+        if not self._eng.submit(p, procedure_index=self._proc):
             raise RuntimeError(f"MIL layer {self.layer}: submit failed")
         # Surfaces bind alphabetically: q_state0 .. q_state{k-1}, then
         # u_shared, v_mixed, w_hyper, x_inj, y_conv.
@@ -140,7 +156,7 @@ class MilGdnLayer:
             self.commit(kk - 1)
         out = []
         for j, shape in enumerate(((H, S), (H, S), (HC_W, S), (HC, S))):
-            with _iosurface_view(p._out_surfs[self._ns + j], shape, np.float16) as o:
+            with _iosurface_view(p._out_surfs[self._ob + j], shape, np.float16) as o:
                 out.append(np.array(o[:, :w], np.float32).reshape(1, shape[0], 1, w))
         shared, mixed, hyper, inj = out
         return mixed, hyper, inj, shared
@@ -152,15 +168,30 @@ class MilGdnLayer:
                              np.float16) as o:
             return np.array(o, np.float16)
 
+    def select(self, proc: int) -> None:
+        """Point every accessor at one procedure of a shared program."""
+        proc = int(proc)
+        if proc not in self._proc_ns:
+            raise RuntimeError(f"MIL layer {self.layer}: no procedure {proc}")
+        self._proc = proc
+        self.k = self._proc_k[proc]
+        self._ns = self._proc_ns[proc]
+
     def _state_slot(self, j: int) -> int:
-        """Output index holding the state after slot j."""
+        """Output index holding the state after slot j.
+
+        A procedure that exports every prefix indexes them directly. One that
+        exports only the end of its chunk writes into the last state surface,
+        which is where the widest procedure's `commit` already looks, so the
+        two need no handover between them.
+        """
         if self._ns == self.k:
             return int(j)
         if int(j) != self.k - 1:
             raise RuntimeError(
                 f"MIL layer {self.layer}: only the last of {self.k} slots has "
                 f"a state in this graph, asked for {j}")
-        return 0
+        return self._ob - 1
 
     def current_state(self) -> np.ndarray:
         """The committed recurrent state, read out of its input surface.
@@ -219,14 +250,14 @@ class MilGdnLayer:
         kk = self.k
         out = []
         for j, shape in enumerate(((H, S), (H, S), (HC_W, S), (HC, S))):
-            with _iosurface_view(p._out_surfs[self._ns + j], shape, np.float16) as o:
+            with _iosurface_view(p._out_surfs[self._ob + j], shape, np.float16) as o:
                 out.append(np.array(o[:, :w], np.float32).reshape(1, shape[0], 1, w))
         shared, mixed, hyper, inj = out
         return mixed, hyper, inj, shared
 
     def _read_fseq(self) -> np.ndarray:
         p = self._prog
-        with _iosurface_view(p._out_surfs[self._ns + 4],
+        with _iosurface_view(p._out_surfs[self._ob + 4],
                              (QKV, self._conv_out_width), np.float16) as o:
             return np.array(o, np.float16)
 
@@ -274,9 +305,9 @@ class MilGdnLayer:
         """Write inputs and evaluate. Async returns a future; caller must finish()."""
         self._write_x(x_bc1s)
         if async_:
-            self._fut = self._eng.submit_async(self._prog, procedure_index=0)
+            self._fut = self._eng.submit_async(self._prog, procedure_index=self._proc)
             return self._fut
-        if not self._eng.submit(self._prog, procedure_index=0):
+        if not self._eng.submit(self._prog, procedure_index=self._proc):
             raise RuntimeError(f"MIL layer {self.layer}: submit failed")
         self._fut = None
         return None

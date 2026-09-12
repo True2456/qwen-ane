@@ -363,6 +363,15 @@ def build_layer(w, ref):
     hcn = np.concatenate([ref.attn.hc_n.detach().float().numpy().reshape(320, 32),
                           ref.mlp.hc_n.detach().float().numpy().reshape(320, 32)],
                          axis=0)
+    if CAPTURE[0] is not None:
+        # Hand the pieces back instead of compiling, so a caller can splice
+        # several widths into one program and bake the weights once.
+        CAPTURE[0] = {
+            "mil": build_mil(offs), "files": files, "slots": state_slots(),
+            "param": np.ascontiguousarray(param.astype(np.float16)),
+            "hcn": np.ascontiguousarray(hcn.astype(np.float16)),
+        }
+        return None
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         try:
@@ -405,6 +414,10 @@ SINGLE_STATE = [False]
 #: procedure has to export as many states as the narrow one it sits beside
 #: even though a prompt chunk only ever reads the last.
 EXPORT_SLOTS: list[list[int] | None] = [None]
+
+#: Set to a truthy placeholder to make `build_layer` return its pieces
+#: instead of compiling. See `build_program_multi`.
+CAPTURE: list[dict | None] = [None]
 
 
 def state_slots() -> list[int]:
@@ -513,3 +526,83 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def build_program_multi(w, ref, specs):
+    """One program with a procedure per (k, single_state) pair.
+
+    A compiled program carries its own copy of the layer's baked weights, so
+    two widths as two programs is two copies of 94 MB a layer. The procedures
+    share one weights dictionary instead.
+
+    They also share one set of IOSurfaces, and the request pairs surfaces with
+    a procedure's symbol indices by position. A procedure exporting fewer
+    prefix states therefore has to be handed the surfaces it writes rather
+    than the front of the list, which is what `proc_out_map` is for. The last
+    state surface is the one every procedure writes its end-of-chunk state to,
+    so the widest procedure's single state lands exactly where the narrow
+    procedure's `commit` already looks.
+
+    Returns (program, param, hcn) or None.
+    """
+    caught = []
+    for k, single in specs:
+        K[0] = int(k)
+        SINGLE_STATE[0] = bool(single)
+        CAPTURE[0] = {}
+        try:
+            build_layer(w, ref)
+            got = CAPTURE[0]
+        finally:
+            CAPTURE[0] = None
+            SINGLE_STATE[0] = False
+        if not got:
+            return None
+        caught.append(got)
+
+    def body(text, name):
+        i = text.index("  func main<ios18>")
+        j = text.rstrip().rindex("}")
+        return text[i:j].replace("func main<ios18>", f"func {name}<ios18>", 1)
+
+    text = (f"program(1.3)\n{E._BUILD_INFO}\n{{\n"
+            + "".join(body(c["mil"], f"procedure{n:03d}")
+                     for n, c in enumerate(caught))
+            + "}\n")
+    # The widest packing is a superset: the base tensors land at the same
+    # offsets in every build and the chunk masks are appended after them.
+    files = max((c["files"] for c in caught),
+                key=lambda f: sum(len(v) for v in f.values()))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        try:
+            prog = eng.compile_multiproc(text, files, HC_W, H, S,
+                                         raw_weight_files=frozenset(files))
+        except Exception as exc:  # noqa: BLE001
+            prog = None
+            buf.write(str(exc))
+    if prog is None:
+        if os.environ.get("MIL_VERBOSE") == "2":
+            print(buf.getvalue())
+        elif os.environ.get("MIL_VERBOSE"):
+            hit = [l for l in buf.getvalue().splitlines()
+                   if "rror" in l or "nvalid" in l]
+            print("  MIL multi: " + (hit[-1] if hit else buf.getvalue()[-400:]))
+        return None
+    n_state = max(len(c["slots"]) for c in caught)
+    prog.conv_out_width = conv_cache_width()
+    prog.input_elems = [HC_W * S, 3 * QKV * S, 3 * HV * DK, 640 * 32, HV * DV * DK]
+    prog.output_elems = ([HV * DV * DK] * n_state
+                         + [H * S, H * S, HC_W * S, HC * S,
+                            QKV * prog.conv_out_width])
+    tail = list(range(n_state, n_state + 5))
+    prog.proc_out_map = {}
+    prog.proc_states = {}
+    for n, c in enumerate(caught):
+        ns = len(c["slots"])
+        prog.proc_out_map[n] = list(range(n_state - ns, n_state)) + tail
+        prog.proc_states[n] = ns
+    prog.n_state_surfs = n_state
+    if not eng._ensure_io(prog):
+        return None
+    return prog, caught[0]["param"], caught[0]["hcn"]

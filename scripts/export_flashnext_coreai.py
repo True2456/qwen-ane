@@ -3081,8 +3081,11 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 for i in sorted(pure_assets):
                     lw = layer_w(i)
                     try:
-                        mil_gdn[i] = MilGdnLayer(i, lw, _MTS(lw, 1).eval().half(),
-                                                 k=max(1, spec_k))
+                        mil_gdn[i] = MilGdnLayer(
+                            i, lw, _MTS(lw, 1).eval().half(),
+                            k=max(1, spec_k),
+                            prefill_k=(prefill_mil_k
+                                       if prefill_mil_k > max(1, spec_k) else 0))
                     except Exception as exc:  # noqa: BLE001
                         print(f"  MIL L{i} failed ({exc}); falling back to Core AI",
                               flush=True)
@@ -3097,11 +3100,11 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 if mil_gdn and mil_qsa and prefill_mil_k > max(1, spec_k):
                     t_pf = time.perf_counter()
                     try:
+                        # The GDN layers already carry the wide unroll as a
+                        # second procedure of the same program, so there is
+                        # nothing more to build and no weights to duplicate.
                         for i in sorted(mil_gdn):
-                            lw = layer_w(i)
-                            mil_gdn_pf[i] = MilGdnLayer(
-                                i, lw, _MTS(lw, 1).eval().half(),
-                                k=prefill_mil_k, single_state=True)
+                            mil_gdn_pf[i] = mil_gdn[i]
                         # Prefill only ever sees the widest rung, so it needs
                         # one program a layer plus the front, not the ladder.
                         for i in sorted(mil_qsa):
@@ -3119,7 +3122,8 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                         mil_qsa_pf.clear()
                     if mil_gdn_pf:
                         print(f"  MIL prefill k={prefill_mil_k}: "
-                              f"{len(mil_gdn_pf)} GDN + {len(mil_qsa_pf)} QSA "
+                              f"{len(mil_gdn_pf)} GDN (a second procedure of "
+                              f"the decode program) + {len(mil_qsa_pf)} QSA "
                               f"in {time.perf_counter() - t_pf:.1f}s", flush=True)
                 if mil_gdn:
                     pure_assets.clear()
@@ -4268,6 +4272,11 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     return
                 for i2, pf in mil_gdn_pf.items():
                     dec = mil_gdn[i2]
+                    if dec is pf:
+                        # Same program, same surfaces: the chunk's state and
+                        # conv window are already where decode reads them.
+                        dec.select(0)
+                        continue
                     dec.set_state(pf.current_state())
                     dec._conv[:] = pf._conv
                     dec._conv_surface_current = False
@@ -4275,6 +4284,9 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 _pf_w = spec_k
 
             if mil_gdn_pf and _pf_w > 1 and prefill_steps >= prefill_mil_k:
+                for lay_pf in mil_gdn_pf.values():
+                    if hasattr(lay_pf, "select"):
+                        lay_pf.select(1)
                 _active["gdn"], _active["qsa"] = mil_gdn_pf, mil_qsa_pf
                 _pf_w = prefill_mil_k
             while _pf_at < prefill_steps:
