@@ -85,6 +85,31 @@ bool test_q4(RindiSmeEngine& engine) {
     return true;
 }
 
+bool test_q8_rowwise(RindiSmeEngine& engine) {
+    constexpr size_t rows = 41, cols = 256;
+    std::vector<uint16_t> x(cols), scales(rows);
+    std::vector<int8_t> weights(rows * cols);
+    for (size_t c = 0; c < cols; ++c)
+        x[c] = to_fp16((static_cast<int>(c % 255) - 127) * 0.01f);
+    for (auto& scale : scales) scale = to_fp16(0.02f);
+    for (size_t i = 0; i < weights.size(); ++i)
+        weights[i] = static_cast<int8_t>(static_cast<int>(i % 255) - 127);
+
+    std::vector<float> got(rows), reference(rows);
+    if (!engine.gemv_q8_rowwise_f32(x.data(), weights.data(), scales.data(),
+                                    got.data(), rows, cols)) return false;
+    for (size_t row = 0; row < rows; ++row) {
+        int32_t dot = 0;
+        for (size_t c = 0; c < cols; ++c)
+            dot += (static_cast<int>(c % 255) - 127) * weights[row * cols + c];
+        reference[row] = static_cast<float>(dot) * 0.01f * from_fp16(scales[row]);
+    }
+    for (size_t row = 0; row < rows; ++row)
+        if (std::fabs(got[row] - reference[row]) >
+            0.002f * std::max(1.0f, std::fabs(reference[row]))) return false;
+    return true;
+}
+
 bool test_async(RindiSmeEngine& engine) {
     constexpr int N = 9, K = 65;
     std::vector<uint16_t> x(K), weights(N * K), sync(N), async(N);
@@ -105,9 +130,11 @@ int main(int argc, char** argv) {
               << " workers=" << engine.worker_count() << '\n';
     const bool int8_ok = test_int8(engine);
     const bool q4_ok = test_q4(engine);
+    const bool q8_rowwise_ok = test_q8_rowwise(engine);
     const bool async_ok = test_async(engine);
     std::cout << "SME2_INT8=" << (int8_ok ? "PASS" : "FAIL") << '\n'
               << "SME2_Q4=" << (q4_ok ? "PASS" : "FAIL") << '\n'
+              << "SME2_Q8_ROWWISE=" << (q8_rowwise_ok ? "PASS" : "FAIL") << '\n'
               << "SME2_ASYNC=" << (async_ok ? "PASS" : "FAIL") << '\n';
-    return int8_ok && q4_ok && async_ok ? 0 : 1;
+    return int8_ok && q4_ok && q8_rowwise_ok && async_ok ? 0 : 1;
 }

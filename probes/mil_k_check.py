@@ -51,6 +51,7 @@ def main() -> None:
 
     g_mixed = lay(x.reshape(1, HC_W, 1, S), n=k)[0].reshape(H, k)
     g_state = lay.state_at(k - 1).astype(np.float32)
+    lay.commit(k - 1)
     g_conv = lay._conv.astype(np.float32)[:, :1]
 
     def rel(a, b_):

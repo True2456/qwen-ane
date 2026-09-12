@@ -938,3 +938,76 @@ columns, took another 6 ms a token off both backends.
   tokens per pass, not a faster pass.
 * Quality evaluation across the three arms (fp16 ANE, int8 MIL, MLX).
 * Prefill still falls back to the Core AI multi-token graphs.
+
+## WIRED: MTP speculative decoding — 8.1 to 14.7 tok/s
+
+`FLASHNEXT_SPEC=4` with the two MIL backends and `FLASHNEXT_HEAD=mlx`.
+
+The drafter is the checkpoint's own MTP head, ported from the production Swift
+backend to MLX (`runtime/flashnext_mtp.py`). It runs on the GPU at 2.3 ms a
+draft. The backbone verifies the whole block in one ANE pass.
+
+### Why a wider block is nearly free
+
+A MIL layer's mixers, projections, depthwise conv and shared expert already ran
+across all 32 slots; only the GDN recurrence and the QSA attention were
+single-token. Widening those costs almost nothing because **the pass is
+weight-bandwidth-bound, not compute-bound**: 94 MB of weights per GDN layer at
+about 70 GB/s, whatever K is.
+
+    GDN layer   K=1 1.367 ms   K=2 1.616   K=4 1.841   K=8 2.466
+    QSA layer   K=1 0.973 ms   K=2 0.956   K=4 0.950
+
+So the whole speculative gain comes for free on the ANE side.
+
+### Results (32-token prompt, 48 new tokens)
+
+| | K=2 | **K=4** | K=8 |
+|---|---|---|---|
+| tokens/pass | 1.85 | **2.53** | 2.46 |
+| drafts accepted | 92% | 54% | 24% |
+| **tok/s** | 12.4 | **14.7** | 10.9 |
+
+K=8 loses to K=4 because the chain is serial: seven drafts cost 16 ms and the
+last four are almost never right. Per draft position at K=4: d1 94%, d2 39%,
+d3 56%.
+
+Per pass at K=4, 160 ms: GDN ANE 72, QSA 44 (of which 16 ANE, 12 host mixer, 13
+MoE), GDN MoE 27, router 6, commit 5, head 4.
+
+### Two things that cost a day
+
+**The drafter needs the prompt.** With a one-token prompt d1 matched 40% of the
+time and the whole thing looked broken. Walking the MTP head over the prompt —
+each position's hidden state paired with the token that actually follows it —
+took d1 to 94%. The drafter was correct all along; it had no context.
+
+**The drafter's memory comes out of the expert bank's.** The bank is 69 GB on a
+137 GB machine, and MLX wires it. Adding 3.8 GB of drafter tables took active
+memory from 77.1 to 80.9 GB, free RAM to 0.1 GB, and the compressor to 73 GB —
+at which point every routed MoE call decompressed pages and the MoE went from
+25 ms a block to 860. Nothing reported an error; it just ran 20x slower, and
+`gdn_route`, a plain NumPy matmul, slowed down with it, which is what gave it
+away.
+
+Three changes brought the drafter to 1.6 GB and the MoE back to 31 ms:
+
+  * `FLASHNEXT_MOE_DTYPE=float16` — the bank's scales and biases were fp32,
+    which is 15 GB of the 76 GB. This is also the faster pair.
+  * embedding rows dequantized from the mmap on demand instead of holding the
+    packed table on the GPU (0.7 GB).
+  * the drafter's own experts requantized 8-bit to 4-bit at load (1.25 GB). It
+    only has to guess well enough to be accepted.
+
+Raising or lowering the wired limit did not help in either direction, and
+neither did a lower MLX cache limit. Only shrinking the total did.
+
+### Remaining
+
+* The GDN half is 72 ms of the 160 ms pass and it is weight-bound. Taking the
+  mixers and the shared expert from fp16 to int8 removes about 18 MB of the
+  94 MB per layer.
+* About 25 ms a pass is host work that could move to the GPU: the QSA attention
+  mixer (12 ms), the MoE router (6 ms), the state commit (5 ms).
+* Tree drafting would exploit the free width, but the GDN recurrence is a
+  chain and cannot verify a branch.

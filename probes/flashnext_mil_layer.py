@@ -206,14 +206,14 @@ def build_mil(offs):
     emit(f'tensor<fp16, [1, {QKV}, 1, {S + 3}]> fseq = concat(values=(fc0, fc1, fc2, fqkv), axis=int32(-1), interleave=bool(false))[name=string("fseq")];')
     emit(f'tensor<fp16, [{QKV}, 1, 1, 4]> TAP = const()[name=string("TAP"), val=tensor<fp16, [{QKV}, 1, 1, 4]>(BLOBFILE(path=string("@model_path/weights/weight_scale.bin"), offset=uint64({offs["taps"]})))];')
     emit(f'tensor<fp16, [1, {QKV}, 1, {S}]> fpre = conv(dilations=dl, groups=gq, pad=pd, pad_type=pt, strides=st, weight=TAP, x=fseq)[name=string("fpre")];')
-    # New conv cache: fseq is [c0, c1, c2, x_0 .. x_{S-1}], so after K tokens
-    # the three retained taps are exactly fseq at K, K+1, K+2. True for K=1 too.
+    # The conv window itself is the output, not the post-K cache. fseq is
+    # [c0, c1, c2, x_0 .. x_{S-1}], so the three taps after j tokens are fseq at
+    # j, j+1, j+2 — and speculation needs every prefix, not just the last.
+    # It is also smaller than the (3*QKV, S) cache it replaces.
+    # Padded to 64 because an I/O last dim must be a multiple of 32.
     k = K[0]
-    for j in range(3):
-        sl4(f"nc{j}", "fseq", (0, 0, 0, k + j), (1, QKV, 1, k + j + 1), (1, QKV, 1, 1))
-        emit(f'tensor<int32, [4]> nt{j} = const()[name=string("nt{j}"), val=tensor<int32, [4]>([1,1,1,{S}])];')
-        emit(f'tensor<fp16, [1, {QKV}, 1, {S}]> nw{j} = tile(x=nc{j}, reps=nt{j})[name=string("nw{j}")];')
-    emit(f'tensor<fp16, [1, {3 * QKV}, 1, {S}]> y_conv = concat(values=(nw0, nw1, nw2), axis=int32(1), interleave=bool(false))[name=string("y_conv")];')
+    sl4("fpad", "fseq", (0, 0, 0, 0), (1, QKV, 1, 64 - (S + 3)), (1, QKV, 1, 64 - (S + 3)))
+    emit(f'tensor<fp16, [1, {QKV}, 1, 64]> y_fseq = concat(values=(fseq, fpad), axis=int32(-1), interleave=bool(false))[name=string("y_fseq")];')
     emit(f'tensor<fp16, [1, {IN_O}, 1, {S}]> fyin = concat(values=(fpre, frest), axis=int32(1), interleave=bool(false))[name=string("fyin")];')
 
     # --- GDN core, unrolled over the K live slots
@@ -270,7 +270,7 @@ def build_mil(offs):
             f"tensor<fp16, [1, {HV}, {DV}, {DK}]> e_state) {{\n"
             + "\n".join(B) +
             f"\n  }} -> ({', '.join(f'q_state{t}' for t in range(K[0]))}, "
-            f"u_shared, v_mixed, w_hyper, x_inj, y_conv);\n}}\n")
+            f"u_shared, v_mixed, w_hyper, x_inj, y_fseq);\n}}\n")
 
 
 def build_layer(w, ref):
@@ -330,7 +330,7 @@ def build_layer(w, ref):
         return None
     prog.input_elems = [HC_W * S, 3 * QKV * S, 3 * HV * DK, 640 * 32, HV * DV * DK]
     prog.output_elems = ([HV * DV * DK] * K[0]
-                         + [H * S, H * S, HC_W * S, HC * S, 3 * QKV * S])
+                         + [H * S, H * S, HC_W * S, HC * S, QKV * 64])
     eng._ensure_io(prog)
     return prog, np.ascontiguousarray(param.astype(np.float16)), np.ascontiguousarray(hcn.astype(np.float16))
 

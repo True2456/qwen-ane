@@ -104,8 +104,6 @@ class MilGdnLayer:
         for j, shape in enumerate(((H, S), (H, S), (HC_W, S), (HC, S))):
             with _iosurface_view(p._out_surfs[kk + j], shape, np.float16) as o:
                 out.append(np.array(o[:, :w], np.float32).reshape(1, shape[0], 1, w))
-        with _iosurface_view(p._out_surfs[kk + 4], (3 * QKV, S), np.float16) as o:
-            np.copyto(self._conv, np.asarray(o, np.float16))
         shared, mixed, hyper, inj = out
         return mixed, hyper, inj, shared
 
@@ -116,14 +114,19 @@ class MilGdnLayer:
             return np.array(o, np.float16)
 
     def commit(self, j: int) -> None:
-        """Advance the layer's state to the `j + 1`-token boundary.
+        """Advance the layer's state and conv window to the `j + 1` boundary.
 
         Speculation needs every prefix, not just the last: the graph emits a
-        state per token so a partially accepted block costs no extra pass.
+        state per token and the whole conv window, so a partially accepted
+        block costs no extra pass.
         """
-        with _iosurface_view(self._prog._out_surfs[int(j)], (HV, DV, DK),
-                             np.float16) as o:
+        j = int(j)
+        p = self._prog
+        with _iosurface_view(p._out_surfs[j], (HV, DV, DK), np.float16) as o:
             np.copyto(self._state, np.asarray(o, np.float16))
+        with _iosurface_view(p._out_surfs[self.k + 4], (QKV, 64), np.float16) as o:
+            for t in range(3):
+                self._conv[t * QKV:(t + 1) * QKV, 0] = o[:, j + 1 + t]
 
 
 def build_layers(layer_indices, loader_fn, step_fn, engine=None):

@@ -206,6 +206,13 @@ int main(int argc, char** argv) {
         {"dense_down", 5120, 17408},
         {"ling_expert_gate_up", 1024, 1536},
         {"ling_expert_down", 1536, 512},
+        // Qwen3.8-Flash-Next routes ten 640-wide experts per token.
+        // The stacked shapes model assigning complete selected experts to
+        // Metal and SME2 without synchronizing inside an expert projection.
+        {"qwen38_expert_gate_up", 640, 2560},
+        {"qwen38_selected_gate_up", 6400, 2560},
+        {"qwen38_selected_fused_gate_up", 12800, 2560},
+        {"qwen38_selected_down", 25600, 640},
     };
     for (const auto& shape : shapes)
         if (selected == shape.name) return run(shape, workers, iterations);

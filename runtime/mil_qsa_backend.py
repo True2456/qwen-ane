@@ -43,12 +43,13 @@ for _p in (str(_ROOT), str(_ROOT / "scripts"), str(_ROOT / "probes")):
 from runtime.q38_ane_engine import AneEngine, _iosurface_view
 
 from export_flashnext_coreai import (  # noqa: E402
-    H, HC, HC_W, SEQ_DEFAULT, QSA_HD, QSA_HKV, QSA_ROTARY, QSA_MASK,
+    H, HC, HC_W, SEQ_DEFAULT, QSA_HD, QSA_HKV, QSA_HQ, QSA_ROTARY, QSA_MASK,
 )
 
 S = SEQ_DEFAULT
 HALF = QSA_ROTARY // 2
 KVC = QSA_HKV * QSA_HD
+G = QSA_HQ // QSA_HKV
 
 
 class MilQsaLayer:
@@ -59,12 +60,15 @@ class MilQsaLayer:
     is enough, since the indexer caps selection at the budget anyway.
     """
 
-    __slots__ = ("layer", "_progs", "_hcn", "_eng", "_bufs")
+    __slots__ = ("layer", "k", "_progs", "_hcn", "_eng", "_bufs")
 
-    def __init__(self, layer: int, weights, ref, qsa, rungs, engine: AneEngine | None = None):
+    def __init__(self, layer: int, weights, ref, qsa, rungs, k: int = 1,
+                 engine: AneEngine | None = None):
         import flashnext_mil_qsa_layer as QL
         self._eng = engine or QL.eng
         QL.LAYER[0] = int(layer)
+        QL.KTOK[0] = int(k)
+        self.k = int(k)
         self.layer = int(layer)
         self._progs: dict[int, object] = {}
         self._hcn = None
@@ -78,7 +82,7 @@ class MilQsaLayer:
         self._bufs = {
             m: {"k": np.zeros((KVC, m), np.float16),
                 "v": np.zeros((KVC, m), np.float16),
-                "mask": np.full(m + S, QSA_MASK, np.float16)}
+                "mask": np.full((G * self.k, m + S), QSA_MASK, np.float16)}
             for m in self._progs
         }
 
@@ -89,22 +93,30 @@ class MilQsaLayer:
     def rung_for(self, need: int) -> int:
         return next((m for m in self.rungs if m >= need), self.rungs[-1])
 
-    def __call__(self, x_bc1s, keys, values, cos, sin, nsel: int, m: int):
+    def __call__(self, x_bc1s, keys, values, cos, sin, nsel: int, m: int,
+                 n: int | None = None):
         """x is (1, HC_W, 1, S); keys/values (KVC, nsel); cos/sin (HALF, S).
 
-        `nsel` keys are live at the head of the window and the new token sits at
-        index `m`. Returns (mixed, hyper, inj, shared, new_k, new_v), the first
-        four BC1S and the last two (KVC, 1).
+        `nsel` selected keys sit at the head of the window and this pass's own
+        tokens at m, m+1, ... Returns (mixed, hyper, inj, shared, new_k, new_v),
+        the first four BC1S over n slots and the last two (KVC, n).
         """
         prog = self._progs[m]
         b = self._bufs[m]
+        w = self.k if n is None else int(n)
         b["k"][:, :nsel] = keys
         b["k"][:, nsel:] = 0
         b["v"][:, :nsel] = values
         b["v"][:, nsel:] = 0
-        b["mask"][:] = QSA_MASK
-        b["mask"][:nsel] = 0
-        b["mask"][m] = 0
+        # One mask row per (query head group, token): a token attends to the
+        # selected prefix and to this block's own tokens up to itself.
+        row = b["mask"][:self.k]
+        row[:] = QSA_MASK
+        row[:, :nsel] = 0
+        for t in range(self.k):
+            row[t, m:m + t + 1] = 0
+        for g in range(1, G):
+            b["mask"][g * self.k:(g + 1) * self.k] = row
         x = np.ascontiguousarray(np.asarray(x_bc1s, np.float16).reshape(HC_W, S))
         for surf, val in zip(prog._in_surfs, (x, cos, sin, self._hcn,
                                               b["k"], b["v"], b["mask"])):
@@ -119,14 +131,14 @@ class MilQsaLayer:
                                (2, "mixed", (H, S)), (3, "hyper", (HC_W, S)),
                                (4, "inj", (HC, S)), (5, "new_v", (KVC, S))):
             with _iosurface_view(prog._out_surfs[idx], shape, np.float16) as o:
-                out[nm] = np.array(o[:, :1], np.float32)
+                out[nm] = np.array(o[:, :w], np.float32)
         def bc(nm, c):
-            return out[nm].reshape(1, c, 1, 1)
+            return out[nm].reshape(1, c, 1, w)
         return (bc("mixed", H), bc("hyper", HC_W), bc("inj", HC), bc("shared", H),
                 out["new_k"], out["new_v"])
 
 
-def build_layers(layer_indices, loader_fn, rungs, engine=None):
+def build_layers(layer_indices, loader_fn, rungs, k: int = 1, engine=None):
     """Compile a MIL QSA layer per index. Returns {index: MilQsaLayer}."""
     from export_flashnext_coreai import FlashNextQSADecode
     from flashnext_mil_qsa_layer import _Ref
@@ -137,7 +149,7 @@ def build_layers(layer_indices, loader_fn, rungs, engine=None):
         try:
             qsa = FlashNextQSADecode(max_s=max(rungs)).eval().half()
             qsa.load_from_layer(w)
-            out[li] = MilQsaLayer(li, w, _Ref(w), qsa, rungs, engine)
+            out[li] = MilQsaLayer(li, w, _Ref(w), qsa, rungs, k, engine)
         finally:
             loader.close()
     return out

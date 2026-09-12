@@ -2765,6 +2765,9 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
     _pk = int(os.environ.get("FLASHNEXT_PREFILL_K", "0") or 0)
     _pm = int(os.environ.get("FLASHNEXT_PREFILL_MAX_S", "2048"))
     _wide = (OUT_DIR / f"flashnext_multitoken_qsa_L3_m{_pm}.aimodel").is_dir()
+    # MIL QSA is built per rung at run time, so it has no baked max_S to cap.
+    _wide = _wide or os.environ.get("FLASHNEXT_MIL_QSA", "0") not in ("0", "false", "")
+    _pk = _pk or (1 if _wide else 0)
     _host_ctx = len(prompt_ids) + max_new
     if not no_ane and not (_pk and _wide) and _host_ctx - 2 > seq:
         raise ValueError(
@@ -2974,6 +2977,12 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
         mil_qsa: dict[int, object] = {}
         use_mil = os.environ.get("FLASHNEXT_MIL_GDN", "0") not in ("0", "false", "")
         use_mil_qsa = os.environ.get("FLASHNEXT_MIL_QSA", "0") not in ("0", "false", "")
+        # Speculation width: the MIL graphs are baked at this many live slots
+        # and are used for plain decode too, which just leaves the extra slots
+        # unread. One set of programs, not two — the ANE ceiling is ~80.
+        spec_k = int(os.environ.get("FLASHNEXT_SPEC", "0") or 0)
+        spec_kv_base: dict[int, int] = {}
+        drafter = None
         fn_qsa_rung: dict[tuple, dict] = {}
         qsa_rungs = [int(v) for v in os.environ.get(
             "FLASHNEXT_QSA_RUNGS", "256").split(",") if v.strip()]
@@ -3025,7 +3034,8 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     try:
                         qd = FlashNextQSADecode(max_s=max(mq_rungs)).eval().half()
                         qd.load_from_layer(lw)
-                        mil_qsa[i] = MilQsaLayer(i, lw, _QRef(lw), qd, mq_rungs)
+                        mil_qsa[i] = MilQsaLayer(i, lw, _QRef(lw), qd, mq_rungs,
+                                                 k=max(1, spec_k))
                     except Exception as exc:  # noqa: BLE001
                         print(f"  MIL QSA L{i} failed ({exc}); falling back to Core AI",
                               flush=True)
@@ -3056,7 +3066,8 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 for i in sorted(pure_assets):
                     lw = layer_w(i)
                     try:
-                        mil_gdn[i] = MilGdnLayer(i, lw, _MTS(lw, 1).eval().half())
+                        mil_gdn[i] = MilGdnLayer(i, lw, _MTS(lw, 1).eval().half(),
+                                                 k=max(1, spec_k))
                     except Exception as exc:  # noqa: BLE001
                         print(f"  MIL L{i} failed ({exc}); falling back to Core AI",
                               flush=True)
@@ -3559,14 +3570,16 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 pt["recombine"] += time.perf_counter() - _t6
             return out
 
-        def mil_qsa_step_layer(i: int, hidden: np.ndarray, bc1s: bool = False):
-            """One QSA layer on the MIL int8 backend, decode (one live slot).
+        def mil_qsa_step_layer(i: int, hidden: np.ndarray, bc1s: bool = False,
+                               n: int = 1, commit: bool = True):
+            """One QSA layer on the MIL int8 backend over n live token slots.
 
             The host still runs the attention mixer, because the indexer picks
             keys from it and that has to happen before the ANE call; the graph
             runs its own copy. What the graph folds in is everything after the
             selection: attention, recombine, the MLP mixer and the shared
-            expert.
+            expert. `commit=False` leaves the cache offset for the caller to
+            rewind, which is how a partly accepted speculative block unwinds.
             """
             hl = host_layers[i]
             lay = mil_qsa[i]
@@ -3574,7 +3587,7 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             tq = mil_qsa_ms
             _t0 = time.perf_counter()
             off = int(cache.offset)
-            m = lay.rung_for(off + 1)
+            m = lay.rung_for(off + n)
             x_bc = (np.asarray(hidden, np.float32) if bc1s
                     else _bsh_to_bc1s(np.asarray(hidden, np.float32)))
             mixed, _, _ = host_gated_residual_cached(x_bc, hl.attn)
@@ -3594,23 +3607,24 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                   if nsel else np.zeros((kv_c, 0), np.float16))
             vs = (cache.values[:, keep].transpose(0, 2, 1).reshape(kv_c, nsel)
                   if nsel else np.zeros((kv_c, 0), np.float16))
-            pos = np.float32(off) * mil_qsa_inv
+            pos = (np.arange(n, dtype=np.float32) + np.float32(off))[:, None] \
+                * mil_qsa_inv[None, :]
             cos_b = np.zeros((QSA_ROTARY // 2, seq), np.float16)
             sin_b = np.zeros((QSA_ROTARY // 2, seq), np.float16)
-            cos_b[:, 0] = np.cos(pos).astype(np.float16)
-            sin_b[:, 0] = np.sin(pos).astype(np.float16)
+            cos_b[:, :n] = np.cos(pos).T.astype(np.float16)
+            sin_b[:, :n] = np.sin(pos).T.astype(np.float16)
             xb = np.zeros((HC_W, seq), np.float16)
-            xb[:, :1] = np.asarray(x_bc[0, :, 0, :1], np.float16)
+            xb[:, :n] = np.asarray(x_bc[0, :, 0, :n], np.float16)
             _t3 = time.perf_counter()
             tq["feed"] += _t3 - _t2
             m_mix, m_hyp, m_inj, m_sh, nk, nv = lay(
                 xb, np.asarray(ks, np.float16), np.asarray(vs, np.float16),
-                cos_b, sin_b, nsel, m)
+                cos_b, sin_b, nsel, m, n=n)
             _t4 = time.perf_counter()
             tq["ane"] += _t4 - _t3
-            cache.keys[:, off] = nk.reshape(QSA_HKV, QSA_HD)
-            cache.values[:, off] = nv.reshape(QSA_HKV, QSA_HD)
-            cache.offset = off + 1
+            cache.keys[:, off:off + n] = nk.reshape(QSA_HKV, QSA_HD, n).transpose(0, 2, 1)
+            cache.values[:, off:off + n] = nv.reshape(QSA_HKV, QSA_HD, n).transpose(0, 2, 1)
+            cache.offset = off + n
             mixed_bsh2 = _bc1s_to_bsh(m_mix)
             inds, sc = hl.moe._route(np.asarray(mixed_bsh2, np.float32).reshape(-1, H))
             routed = hl.moe._resident.routed_multi(mixed_bsh2, inds, sc)
@@ -3746,6 +3760,158 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                           f"{elapsed / pos * 1e3:.1f} ms/token", flush=True)
             return full
 
+        _moe_split = os.environ.get("FLASHNEXT_MOE_SPLIT") == "1"
+        spec_pos = [[0, 0] for _ in range(max(1, spec_k))]
+        _spec_n1 = os.environ.get("FLASHNEXT_SPEC_N1") == "1"
+        spec_ms = {"embed": 0.0, "gdn_ane": 0.0, "gdn_route": 0.0, "gdn_moe": 0.0,
+                   "gdn_rec": 0.0, "qsa": 0.0, "head": 0.0, "commit": 0.0,
+                   "gdn_uniq": 0.0}
+
+        def _block_forward(ids):
+            """One K-slot backbone pass. Returns (hidden BSH, logits per slot).
+
+            No state is committed: speculation only knows how many tokens the
+            block confirmed after it sees the logits, so every layer holds a
+            state per prefix until `_block_commit` picks one.
+            """
+            n = len(ids)
+            _b = spec_ms
+            _t = time.perf_counter()
+            hid = real_embedding_hidden(loader, list(ids))
+            _b["embed"] += time.perf_counter() - _t
+            for i in range(n_layers):
+                if i in ple_layers:
+                    for j in range(n):
+                        hid[:, j:j + 1, :] = ple_layers[i].step(hid[:, j:j + 1, :], ids[j])
+                hl = host_layers[i]
+                if i in mil_gdn:
+                    _t = time.perf_counter()
+                    xb = np.zeros((1, HC_W, 1, seq), np.float16)
+                    bc = _bsh_to_bc1s(np.asarray(hid, np.float32))
+                    xb[..., :n] = np.asarray(bc[..., :n], np.float16)
+                    m_mix, m_hyp, m_inj, m_sh = mil_gdn[i](xb, n=n)
+                    _t2 = time.perf_counter()
+                    _b["gdn_ane"] += _t2 - _t
+                    mixed_bsh = _bc1s_to_bsh(m_mix)
+                    inds, sc = hl.moe._route(
+                        np.asarray(mixed_bsh, np.float32).reshape(-1, H))
+                    _tr = time.perf_counter()
+                    _b["gdn_route"] += _tr - _t2
+                    if _moe_split:
+                        routed = np.concatenate([
+                            hl.moe._resident.routed_multi(
+                                mixed_bsh[:, t:t + 1], inds[t:t + 1], sc[t:t + 1])
+                            for t in range(n)], axis=1)
+                    else:
+                        routed = hl.moe._resident.routed_multi(mixed_bsh, inds, sc)
+                    _b["gdn_uniq"] += len(np.unique(inds))
+                    y = routed + _bc1s_to_bsh(m_sh)
+                    _t3 = time.perf_counter()
+                    _b["gdn_moe"] += _t3 - _tr
+                    hid = _bc1s_to_bsh(host_recombine(_bsh_to_bc1s(y), m_hyp, m_inj))
+                    _b["gdn_rec"] += time.perf_counter() - _t3
+                elif i in mil_qsa:
+                    _t = time.perf_counter()
+                    hid = mil_qsa_step_layer(i, hid, n=n, commit=False)
+                    _b["qsa"] += time.perf_counter() - _t
+                else:
+                    raise RuntimeError(f"speculation: layer {i} has no K-slot graph")
+            _t = time.perf_counter()
+            mixed = gated_residual(mix_w, "hyper_connection_mixer", hid, False)
+            lg = q_head(mixed) if q_head is not None else lm_logits(mixed, lm_w)
+            _b["head"] += time.perf_counter() - _t
+            return hid, np.asarray(lg, np.float32).reshape(n, -1)
+
+        def _block_commit(j: int) -> None:
+            """Adopt the prefix of length j + 1 across every layer."""
+            _t = time.perf_counter()
+            for i, lay in mil_gdn.items():
+                lay.commit(j)
+            for i in mil_qsa:
+                cache = attn_state[i]
+                cache.offset = spec_kv_base[i] + j + 1
+                qsa_idx_state[i].trim(cache.offset, qsa_idx[i].compress_ratio)
+            spec_ms["commit"] += time.perf_counter() - _t
+
+        async def speculate() -> None:
+            """Draft with the MTP head, verify the whole block on the ANE."""
+            nonlocal generated, cur
+            kk = spec_k
+            tid_l = cur[-1]
+            chain = None
+            blocks = accepted = proposed = 0
+            t_draft = t_verify = 0.0
+            drafter_base = drafter.offset if drafter is not None else 0
+            while len(generated) < max_new:
+                _t0 = time.perf_counter()
+                drafts = (drafter.draft(chain, tid_l, kk - 1)
+                          if chain is not None and not _spec_n1 and drafter else [])
+                t_draft += time.perf_counter() - _t0
+                ids = [tid_l] + drafts
+                proposed += len(drafts)
+                for i in mil_qsa:
+                    spec_kv_base[i] = int(attn_state[i].offset)
+                _t1 = time.perf_counter()
+                hid, lg = _block_forward(ids)
+                preds = [int(v) for v in np.argmax(lg, axis=-1)]
+                t_verify += time.perf_counter() - _t1
+                blocks += 1
+                m = 0
+                while m < len(drafts) and preds[m] == drafts[m]:
+                    m += 1
+                for t in range(len(drafts)):
+                    spec_pos[t][1] += 1
+                    spec_pos[t][0] += int(preds[t] == drafts[t])
+                accepted += m
+                _block_commit(m)
+                emit = drafts[:m] + [preds[m]]
+                for tok in emit:
+                    if len(generated) >= max_new:
+                        break
+                    generated.append(tok)
+                    cur.append(tok)
+                tid_l = preds[m]
+                chain = mx.array(np.ascontiguousarray(
+                    np.asarray(hid, np.float32)[:, m:m + 1, :]))
+                # Drafter positions past the accepted prefix were conditioned
+                # on a token the backbone rejected.
+                if drafter is not None:
+                    drafter.trim_to(drafter_base + m)
+                    drafter_base = drafter.offset
+            print(f"  speculation: {blocks} blocks, {len(generated)} tokens, "
+                  f"{accepted}/{proposed} drafts accepted "
+                  f"({accepted / max(proposed, 1):.0%}), "
+                  f"{len(generated) / blocks:.2f} tokens/pass", flush=True)
+            print(f"    draft {t_draft * 1e3:.0f} ms  "
+                  f"verify {t_verify * 1e3:.0f} ms", flush=True)
+            print("    draft position top-1 match  " + "  ".join(
+                f"d{t + 1}={a}/{b}" for t, (a, b) in enumerate(spec_pos) if b),
+                flush=True)
+            print("    per block ms  " + "  ".join(
+                f"{k2}={v2 * (1 if k2 == 'gdn_uniq' else 1e3) / max(blocks, 1):.1f}"
+                for k2, v2 in spec_ms.items()), flush=True)
+            print("    qsa(MIL) ms/block  " + "  ".join(
+                f"{k2}={v2 * 1e3 / max(blocks, 1):.1f}"
+                for k2, v2 in mil_qsa_ms.items()), flush=True)
+
+        if spec_k > 1:
+            if not (mil_gdn and mil_qsa and q_head is not None):
+                raise RuntimeError("FLASHNEXT_SPEC needs MIL GDN + MIL QSA + "
+                                   "FLASHNEXT_HEAD=mlx")
+            import mlx.core as mx
+            from runtime.flashnext_mtp import MtpDrafter
+            _t = time.perf_counter()
+            _a0 = mx.get_active_memory()
+            drafter = None if os.environ.get("FLASHNEXT_NO_DRAFTER") == "1" \
+                else MtpDrafter(q_head)
+            _info = mx.metal.device_info()
+            print(f"  MTP drafter loaded in {time.perf_counter() - _t:.1f}s  "
+                  f"active {_a0 / 1e9:.1f} -> {mx.get_active_memory() / 1e9:.1f} GB  "
+                  f"peak {mx.get_peak_memory() / 1e9:.1f} GB  "
+                  f"max working set "
+                  f"{_info['max_recommended_working_set_size'] / 1e9:.1f} GB",
+                  flush=True)
+
         t_all = time.perf_counter()
         prefill_steps = len(prompt_ids) - 1
         pf_ids = list(prompt_ids)
@@ -3766,7 +3932,36 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 pf_ids = prompt_ids[done:]
                 prefill_steps = len(pf_ids) - 1
         t_decode = t_all
-        for input_step in range(prefill_steps + max_new):
+        if spec_k > 1:
+            # Serial prefix first, so the block loop starts from a real state.
+            # One token through the K-slot graph: the other slots are computed
+            # and thrown away, which is exactly what a one-token commit does.
+            if drafter is not None:
+                drafter.reset()
+            for input_step in range(prefill_steps):
+                for i in mil_qsa:
+                    spec_kv_base[i] = int(attn_state[i].offset)
+                _pre_hid, _ = _block_forward([pf_ids[input_step]])
+                _block_commit(0)
+                # The drafter is conditioned on each position's hidden state
+                # paired with the token that actually follows it, so it has to
+                # walk the prompt too or it drafts from an empty cache.
+                if drafter is not None and input_step + 1 < len(pf_ids):
+                    drafter.advance(
+                        mx.array(np.ascontiguousarray(
+                            np.asarray(_pre_hid, np.float32))),
+                        [[pf_ids[input_step + 1]]])
+            t_decode = time.perf_counter()
+            if prefill_steps:
+                print(f"  serial prefix prefill: {prefill_steps} tokens in "
+                      f"{t_decode - t_all:.3f}s", flush=True)
+            for _k in spec_ms:
+                spec_ms[_k] = 0.0
+            for _k in mil_qsa_ms:
+                mil_qsa_ms[_k] = 0.0
+            await speculate()
+        else:
+          for input_step in range(prefill_steps + max_new):
             step = input_step - prefill_steps
             tid = pf_ids[input_step] if input_step < len(pf_ids) else cur[-1]
             if step == 0:

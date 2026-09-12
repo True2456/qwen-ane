@@ -38,10 +38,18 @@ class QuantizedHead:
         mx.eval(self.w, self.scales, self.biases)
         self.nbytes = self.w.nbytes + self.scales.nbytes + self.biases.nbytes
 
+    def logits_mx(self, x):
+        """Logits for an MLX activation, left on the GPU.
+
+        The drafter chains several passes before anything needs to reach the
+        host, so keep the round trip out of the inner loop.
+        """
+        return mx.quantized_matmul(x.astype(mx.float16).reshape(-1, self.w.shape[0] * 0 + x.shape[-1]),
+                                   self.w, self.scales, self.biases, transpose=True,
+                                   group_size=self.group_size, bits=self.bits)
+
     def __call__(self, hidden: np.ndarray) -> np.ndarray:
         x = mx.array(np.ascontiguousarray(hidden, np.float32))
-        x = x.astype(mx.float16).reshape(1, -1)
-        y = mx.quantized_matmul(x, self.w, self.scales, self.biases, transpose=True,
-                                group_size=self.group_size, bits=self.bits)
+        y = self.logits_mx(x)
         mx.eval(y)
-        return np.array(y.astype(mx.float32)).ravel()
+        return np.array(y.astype(mx.float32)).reshape(-1, y.shape[-1]).squeeze()
