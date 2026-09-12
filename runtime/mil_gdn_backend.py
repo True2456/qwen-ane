@@ -59,20 +59,28 @@ class MilGdnLayer:
 
     __slots__ = ("layer", "k", "_prog", "_param", "_hcn", "_conv", "_eng",
                  "_conv_out_width", "_conv_surface_current",
-                 "_fut", "_prefix_state", "_prefix_fseq")
+                 "_fut", "_prefix_state", "_prefix_fseq", "_ns")
 
     def __init__(self, layer: int, weights, ref_step, k: int = 1,
-                 engine: AneEngine | None = None):
+                 engine: AneEngine | None = None, single_state: bool = False):
         import flashnext_mil_layer as _ML
         self._eng = engine or _ML.eng
         _ML.LAYER[0] = int(layer)
         _ML.K[0] = int(k)
+        _ML.SINGLE_STATE[0] = bool(single_state)
         self.k = int(k)
-        built = _ML.build_layer(weights, ref_step)
+        try:
+            built = _ML.build_layer(weights, ref_step)
+        finally:
+            _ML.SINGLE_STATE[0] = False
         if built is None:
             raise RuntimeError(f"MIL layer {layer} failed to compile")
         self.layer = int(layer)
         self._prog, self._param, self._hcn = built
+        # Prefix states exported. One means only the last slot's state is
+        # readable, which is all a prompt chunk needs; everything after the
+        # states shifts down by that much.
+        self._ns = int(getattr(self._prog, "n_states", self.k))
         self._conv_out_width = int(getattr(self._prog, "conv_out_width", 64))
         # These immutable arrays are MIL inputs only because the frontend
         # rejects their constant spelling.  Copy them to their IOSurfaces once.
@@ -132,16 +140,38 @@ class MilGdnLayer:
             self.commit(kk - 1)
         out = []
         for j, shape in enumerate(((H, S), (H, S), (HC_W, S), (HC, S))):
-            with _iosurface_view(p._out_surfs[kk + j], shape, np.float16) as o:
+            with _iosurface_view(p._out_surfs[self._ns + j], shape, np.float16) as o:
                 out.append(np.array(o[:, :w], np.float32).reshape(1, shape[0], 1, w))
         shared, mixed, hyper, inj = out
         return mixed, hyper, inj, shared
 
     def state_at(self, j: int) -> np.ndarray:
         """The recurrent state having consumed `j + 1` of this pass's tokens."""
-        with _iosurface_view(self._prog._out_surfs[int(j)], (HV, DV, DK),
+        with _iosurface_view(self._prog._out_surfs[self._state_slot(j)],
+                             (HV, DV, DK),
                              np.float16) as o:
             return np.array(o, np.float16)
+
+    def _state_slot(self, j: int) -> int:
+        """Output index holding the state after slot j."""
+        if self._ns == self.k:
+            return int(j)
+        if int(j) != self.k - 1:
+            raise RuntimeError(
+                f"MIL layer {self.layer}: only the last of {self.k} slots has "
+                f"a state in this graph, asked for {j}")
+        return 0
+
+    def current_state(self) -> np.ndarray:
+        """The committed recurrent state, read out of its input surface.
+
+        Handing a prompt from a wide prefill graph to a narrow decode graph is
+        a copy of this plus the conv window; nothing else in the layer carries
+        across a pass.
+        """
+        with _iosurface_view(self._prog._in_surfs[4], (HV, DV, DK),
+                             np.float16) as src:
+            return np.array(src, np.float16)
 
     def set_state(self, value) -> None:
         """Seed the recurrent state; the surface is the only copy."""
@@ -163,7 +193,7 @@ class MilGdnLayer:
             self._commit_saved(j)
             return
         p = self._prog
-        with _iosurface_view(p._out_surfs[j], (HV, DV, DK), np.float16) as o:
+        with _iosurface_view(p._out_surfs[self._state_slot(j)], (HV, DV, DK), np.float16) as o:
             with _iosurface_view(p._in_surfs[4], (HV, DV, DK), np.float16) as d:
                 np.copyto(d, o)
         self._apply_conv_from_fseq(self._read_fseq(), j)
@@ -189,14 +219,14 @@ class MilGdnLayer:
         kk = self.k
         out = []
         for j, shape in enumerate(((H, S), (H, S), (HC_W, S), (HC, S))):
-            with _iosurface_view(p._out_surfs[kk + j], shape, np.float16) as o:
+            with _iosurface_view(p._out_surfs[self._ns + j], shape, np.float16) as o:
                 out.append(np.array(o[:, :w], np.float32).reshape(1, shape[0], 1, w))
         shared, mixed, hyper, inj = out
         return mixed, hyper, inj, shared
 
     def _read_fseq(self) -> np.ndarray:
         p = self._prog
-        with _iosurface_view(p._out_surfs[self.k + 4],
+        with _iosurface_view(p._out_surfs[self._ns + 4],
                              (QKV, self._conv_out_width), np.float16) as o:
             return np.array(o, np.float16)
 
@@ -235,7 +265,7 @@ class MilGdnLayer:
             return
         p = self._prog
         j = int(n) - 1
-        with _iosurface_view(p._out_surfs[j], (HV, DV, DK), np.float16) as o:
+        with _iosurface_view(p._out_surfs[self._state_slot(j)], (HV, DV, DK), np.float16) as o:
             with _iosurface_view(p._in_surfs[4], (HV, DV, DK), np.float16) as d:
                 np.copyto(d, o)
         self._apply_conv_from_fseq(self._read_fseq(), j)

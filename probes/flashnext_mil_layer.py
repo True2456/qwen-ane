@@ -222,17 +222,23 @@ def build_mil(offs):
     # runtime can observe.  The legacy form is retained for reproducible A/Bs.
     k = K[0]
     cache_elems = S + 3 if FULL_CACHE_OUTPUT else k + 3
-    cache_width = int(os.environ.get("MIL_CACHE_WIDTH", "0")) or (
-        64 if cache_elems > 32 else 32)
+    cache_width = conv_cache_width()
     cache_src = "fseq"
     if cache_elems != S + 3:
         sl4("fkeep", "fseq", (0, 0, 0, 0), (1, QKV, 1, cache_elems),
             (1, QKV, 1, cache_elems))
         cache_src = "fkeep"
-    pad_elems = cache_width - cache_elems
-    sl4("fpad", "fseq", (0, 0, 0, 0), (1, QKV, 1, pad_elems),
-        (1, QKV, 1, pad_elems))
-    emit(f'tensor<fp16, [1, {QKV}, 1, {cache_width}]> y_fseq = concat(values=({cache_src}, fpad), axis=int32(-1), interleave=bool(false))[name=string("y_fseq")];')
+    # Pad out of fseq itself, which is only S + 3 wide, so wide targets need
+    # more than one slice. The padding is never read.
+    pads = []
+    rem = cache_width - cache_elems
+    while rem > 0:
+        take = min(rem, S + 3)
+        nm = f"fpad{len(pads)}"
+        sl4(nm, "fseq", (0, 0, 0, 0), (1, QKV, 1, take), (1, QKV, 1, take))
+        pads.append(nm)
+        rem -= take
+    emit(f'tensor<fp16, [1, {QKV}, 1, {cache_width}]> y_fseq = concat(values=({cache_src}, {", ".join(pads)}), axis=int32(-1), interleave=bool(false))[name=string("y_fseq")];')
     emit(f'tensor<fp16, [1, {IN_O}, 1, {S}]> fyin = concat(values=(fpre, frest), axis=int32(1), interleave=bool(false))[name=string("fyin")];')
 
     # --- GDN core, unrolled over the K live slots
@@ -291,7 +297,7 @@ def build_mil(offs):
             f"tensor<fp16, [1, 640, 1, 32]> d_hcn, "
             f"tensor<fp16, [1, {HV}, {DV}, {DK}]> e_state) {{\n"
             + "\n".join(B) +
-            f"\n  }} -> ({', '.join(f'q_state{t:02d}' for t in range(K[0]))}, "
+            f"\n  }} -> ({', '.join(f'q_state{t:02d}' for t in state_slots())}, "
             f"u_shared, v_mixed, w_hyper, x_inj, y_fseq);\n}}\n")
 
 
@@ -352,17 +358,9 @@ def build_layer(w, ref):
             print("  MIL compile: " + (hit[-1] if hit else buf.getvalue()[-400:]))
         return None
     prog.input_elems = [HC_W * S, 3 * QKV * S, 3 * HV * DK, 640 * 32, HV * DV * DK]
-    cache_elems = S + 3 if FULL_CACHE_OUTPUT else K[0] + 3
-    prog.conv_out_width = 64 if cache_elems > 32 else 32
-    # k is capped at 8 by the conv cache output, not by the unroll. At k=16
-    # the evaluate fails with "IOSurface smaller than the model expects" and
-    # allocating y_fseq at twice its declared width makes the submit succeed
-    # with the window read back wrong (conv rel 1.26), so the ANE is writing
-    # that output at a stride this formula does not predict. Everything else
-    # at k=16 is correct once the state names are zero padded: per-slot mixed
-    # error 0.027-0.034 and final state 0.0048, the same as k=8, at 0.224
-    # ms/token against 0.287. Worth about 1.3x on prefill to whoever fixes it.
-    prog.output_elems = ([HV * DV * DK] * K[0]
+    prog.conv_out_width = conv_cache_width()
+    prog.n_states = len(state_slots())
+    prog.output_elems = ([HV * DV * DK] * prog.n_states
                          + [H * S, H * S, HC_W * S, HC * S,
                             QKV * prog.conv_out_width])
     eng._ensure_io(prog)
@@ -371,6 +369,37 @@ def build_layer(w, ref):
 
 LAYER = [0]
 K = [1]          # live token slots; must divide S
+# Speculation needs the recurrent state at every prefix so a partly accepted
+# block can unwind. Prefill accepts the whole chunk, so it only needs the last
+# one -- and at k=32 that is the difference between 50 MB and 1.6 MB of output
+# surface a layer, which decides whether a second graph set fits in RAM
+# alongside the expert bank.
+SINGLE_STATE = [False]
+
+
+def state_slots() -> list[int]:
+    """Which prefix states the graph exports."""
+    return [K[0] - 1] if SINGLE_STATE[0] else list(range(K[0]))
+
+
+def conv_cache_width() -> int:
+    """Row width to declare for the conv-window output.
+
+    The ANE does not always write this output at the width the graph declares.
+    Measured by reading the surface back and looking for the stride that puts
+    the first conv tap in column 0:
+
+        k+3 elements kept   4    5    7   11   19   35
+        declared           32   32   32   32   32   64
+        actually written   32   32   32   32   64   64
+
+    so a declared 32 is honoured only while the kept window is 16 or fewer,
+    and k=16 wrote 64 into a surface sized for 32 — an evaluate failure, or
+    silently wrong numbers if the surface happened to be large enough.
+    Declaring 64 is always honoured, costs QKV * 64 * 2 = 1.3 MB a layer, and
+    makes the runtime's stride right by construction at every k.
+    """
+    return int(os.environ.get("MIL_CACHE_WIDTH", "64"))
 
 
 def main() -> None:

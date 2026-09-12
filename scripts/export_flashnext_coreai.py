@@ -2977,6 +2977,17 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
         fn_qsa_step1: dict[int, object] = {}
         mil_gdn: dict[int, object] = {}
         mil_qsa: dict[int, object] = {}
+        # A second, wider set of the same graphs, used only to walk the prompt.
+        # Decode wants a narrow graph because a block confirms two or three
+        # tokens; prefill wants the widest that compiles, because every slot
+        # carries a real token and the ~1.1 ms a submit costs amortises. The
+        # two sets are independent programs and coexist: 132 of them load.
+        mil_gdn_pf: dict[int, object] = {}
+        mil_qsa_pf: dict[int, object] = {}
+        prefill_mil_k = int(os.environ.get("FLASHNEXT_PREFILL_MIL_K", "0") or 0)
+        # Which set the block path is currently driving. Swapped for the
+        # prompt and swapped back before the first drafted block.
+        _active = {"gdn": mil_gdn, "qsa": mil_qsa}
         use_mil = os.environ.get("FLASHNEXT_MIL_GDN", "0") not in ("0", "false", "")
         use_mil_qsa = os.environ.get("FLASHNEXT_MIL_QSA", "0") not in ("0", "false", "")
         _idx_host = os.environ.get("FLASHNEXT_IDX_HOST", "0") not in (
@@ -3083,6 +3094,34 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 if mil_gdn:
                     print(f"  MIL int8 GDN: {len(mil_gdn)} layers in "
                           f"{time.perf_counter() - t_mil:.1f}s", flush=True)
+                if mil_gdn and mil_qsa and prefill_mil_k > max(1, spec_k):
+                    t_pf = time.perf_counter()
+                    try:
+                        for i in sorted(mil_gdn):
+                            lw = layer_w(i)
+                            mil_gdn_pf[i] = MilGdnLayer(
+                                i, lw, _MTS(lw, 1).eval().half(),
+                                k=prefill_mil_k, single_state=True)
+                        # Prefill only ever sees the widest rung, so it needs
+                        # one program a layer plus the front, not the ladder.
+                        for i in sorted(mil_qsa):
+                            lw = layer_w(i)
+                            qd = FlashNextQSADecode(
+                                max_s=max(mq_rungs)).eval().half()
+                            qd.load_from_layer(lw)
+                            mil_qsa_pf[i] = MilQsaLayer(
+                                i, lw, _QRef(lw), qd, [max(mq_rungs)],
+                                k=prefill_mil_k)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"  MIL prefill k={prefill_mil_k} failed ({exc}); "
+                              f"prompt walks the decode graphs", flush=True)
+                        mil_gdn_pf.clear()
+                        mil_qsa_pf.clear()
+                    if mil_gdn_pf:
+                        print(f"  MIL prefill k={prefill_mil_k}: "
+                              f"{len(mil_gdn_pf)} GDN + {len(mil_qsa_pf)} QSA "
+                              f"in {time.perf_counter() - t_pf:.1f}s", flush=True)
+                if mil_gdn:
                     pure_assets.clear()
             for i, pp in sorted(list(pure_assets.items())):
                 print(f"  loading ANE pure_step L{i} (mix+GDN+mlp mix)…", flush=True)
@@ -3588,7 +3627,7 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             caller can overlap GPU MoE with the next ANE submit.
             """
             hl = host_layers[i]
-            lay = mil_qsa[i]
+            lay = _active["qsa"][i]
             cache = attn_state[i]
             tq = mil_qsa_ms
             _t0 = time.perf_counter()
@@ -3821,7 +3860,7 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     _t = time.perf_counter()
                     bc = _bsh_to_bc1s(np.asarray(hid, np.float32))
                     _spec_xb[..., :n] = np.asarray(bc[..., :n], np.float16)
-                    m_mix, m_hyp, m_inj, m_sh = mil_gdn[i](_spec_xb, n=n)
+                    m_mix, m_hyp, m_inj, m_sh = _active["gdn"][i](_spec_xb, n=n)
                     _t2 = time.perf_counter()
                     _b["gdn_ane"] += _t2 - _t
                     hid = _moe_from_ane(hl, m_mix, m_hyp, m_inj, m_sh, _b)
@@ -3966,7 +4005,7 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
         def _block_commit(j: int) -> None:
             """Adopt the prefix of length j + 1 across every layer."""
             _t = time.perf_counter()
-            for i, lay in mil_gdn.items():
+            for i, lay in _active["gdn"].items():
                 lay.commit(j)
             for i in mil_qsa:
                 cache = attn_state[i]
@@ -4214,7 +4253,34 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             _pf_at = 0
             _pf_w = 1 if os.environ.get("FLASHNEXT_PREFILL_SERIAL") == "1" \
                 else spec_k
+            def _hand_over():
+                """Move the prompt from the wide graphs to the decode ones.
+
+                A GDN layer carries exactly the recurrent state and the conv
+                window across a pass; the QSA cache and the indexer's blocks
+                were host side all along.
+                """
+                nonlocal _pf_w
+                if _active["gdn"] is not mil_gdn_pf:
+                    return
+                for i2, pf in mil_gdn_pf.items():
+                    dec = mil_gdn[i2]
+                    dec.set_state(pf.current_state())
+                    dec._conv[:] = pf._conv
+                    dec._conv_surface_current = False
+                _active["gdn"], _active["qsa"] = mil_gdn, mil_qsa
+                _pf_w = spec_k
+
+            if mil_gdn_pf and _pf_w > 1 and prefill_steps >= prefill_mil_k:
+                _active["gdn"], _active["qsa"] = mil_gdn_pf, mil_qsa_pf
+                _pf_w = prefill_mil_k
             while _pf_at < prefill_steps:
+                # The wide graphs only export the last slot's state, so they
+                # can only run chunks of exactly their width. The tail goes
+                # through the decode graphs.
+                if (_active["gdn"] is mil_gdn_pf
+                        and prefill_steps - _pf_at < _pf_w):
+                    _hand_over()
                 n = min(_pf_w, prefill_steps - _pf_at)
                 chunk = pf_ids[_pf_at:_pf_at + n]
                 for i in mil_qsa:
@@ -4232,10 +4298,19 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                                 np.asarray(_pre_hid, np.float32)[:, :len(nxt), :])),
                             [list(nxt)])
                 _pf_at += n
+            _hand_over()
             t_decode = time.perf_counter()
             if prefill_steps:
                 print(f"  serial prefix prefill: {prefill_steps} tokens in "
-                      f"{t_decode - t_all:.3f}s", flush=True)
+                      f"{t_decode - t_all:.3f}s "
+                      f"({prefill_steps / max(t_decode - t_all, 1e-9):.1f} tok/s)",
+                      flush=True)
+                print("    prefill ms/token  " + "  ".join(
+                    f"{k2}={v2 * 1e3 / prefill_steps:.2f}"
+                    for k2, v2 in spec_ms.items() if v2), flush=True)
+                print("    prefill qsa ms/token  " + "  ".join(
+                    f"{k2}={v2 * 1e3 / prefill_steps:.2f}"
+                    for k2, v2 in mil_qsa_ms.items() if v2), flush=True)
             for _k in spec_ms:
                 spec_ms[_k] = 0.0
             for _k in mil_qsa_ms:
