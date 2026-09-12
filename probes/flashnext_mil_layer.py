@@ -222,7 +222,8 @@ def build_mil(offs):
     # runtime can observe.  The legacy form is retained for reproducible A/Bs.
     k = K[0]
     cache_elems = S + 3 if FULL_CACHE_OUTPUT else k + 3
-    cache_width = 64 if cache_elems > 32 else 32
+    cache_width = int(os.environ.get("MIL_CACHE_WIDTH", "0")) or (
+        64 if cache_elems > 32 else 32)
     cache_src = "fseq"
     if cache_elems != S + 3:
         sl4("fkeep", "fseq", (0, 0, 0, 0), (1, QKV, 1, cache_elems),
@@ -240,8 +241,11 @@ def build_mil(offs):
     sl("nw", "c_param", 2 * HV, 3 * HV, HV, 1, DK, 1, DK)
     prev = "e_state"
     for t in range(k):
-        gdn_core(t, prev, f"q_state{t}")
-        prev = f"q_state{t}"
+        # Surfaces bind in alphabetical symbol order, so the index has to be
+        # zero padded: at k=16 "q_state10" sorts before "q_state2" and every
+        # prefix state comes back under the wrong slot.
+        gdn_core(t, prev, f"q_state{t:02d}")
+        prev = f"q_state{t:02d}"
     if k == 1:
         emit(f'tensor<fp16, [1, {HV}, {DV}, 1]> ystk = transpose(x=g0yo, perm=pm)[name=string("ystk")];')
     else:
@@ -287,7 +291,7 @@ def build_mil(offs):
             f"tensor<fp16, [1, 640, 1, 32]> d_hcn, "
             f"tensor<fp16, [1, {HV}, {DV}, {DK}]> e_state) {{\n"
             + "\n".join(B) +
-            f"\n  }} -> ({', '.join(f'q_state{t}' for t in range(K[0]))}, "
+            f"\n  }} -> ({', '.join(f'q_state{t:02d}' for t in range(K[0]))}, "
             f"u_shared, v_mixed, w_hyper, x_inj, y_fseq);\n}}\n")
 
 
@@ -350,6 +354,14 @@ def build_layer(w, ref):
     prog.input_elems = [HC_W * S, 3 * QKV * S, 3 * HV * DK, 640 * 32, HV * DV * DK]
     cache_elems = S + 3 if FULL_CACHE_OUTPUT else K[0] + 3
     prog.conv_out_width = 64 if cache_elems > 32 else 32
+    # k is capped at 8 by the conv cache output, not by the unroll. At k=16
+    # the evaluate fails with "IOSurface smaller than the model expects" and
+    # allocating y_fseq at twice its declared width makes the submit succeed
+    # with the window read back wrong (conv rel 1.26), so the ANE is writing
+    # that output at a stride this formula does not predict. Everything else
+    # at k=16 is correct once the state names are zero padded: per-slot mixed
+    # error 0.027-0.034 and final state 0.0048, the same as k=8, at 0.224
+    # ms/token against 0.287. Worth about 1.3x on prefill to whoever fixes it.
     prog.output_elems = ([HV * DV * DK] * K[0]
                          + [H * S, H * S, HC_W * S, HC * S,
                             QKV * prog.conv_out_width])
