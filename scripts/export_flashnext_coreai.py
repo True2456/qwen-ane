@@ -3823,7 +3823,8 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
         _spec_xb = np.zeros((1, HC_W, 1, seq), np.float16)
         spec_pos = [[0, 0] for _ in range(max(1, spec_k))]
         _spec_n1 = os.environ.get("FLASHNEXT_SPEC_N1") == "1"
-        spec_ms = {"embed": 0.0, "gdn_ane": 0.0, "gdn_route": 0.0, "gdn_moe": 0.0,
+        spec_ms = {"embed": 0.0, "gdn_stage": 0.0,
+                   "gdn_ane": 0.0, "gdn_route": 0.0, "gdn_moe": 0.0,
                    "gdn_rec": 0.0, "qsa": 0.0, "head": 0.0, "commit": 0.0,
                    "overlap": 0.0}
         _spec_pipe = os.environ.get("FLASHNEXT_PIPE", "0") not in ("0", "false", "")
@@ -3860,9 +3861,11 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     _t = time.perf_counter()
                     bc = _bsh_to_bc1s(np.asarray(hid, np.float32))
                     _spec_xb[..., :n] = np.asarray(bc[..., :n], np.float16)
+                    _ts = time.perf_counter()
                     m_mix, m_hyp, m_inj, m_sh = _active["gdn"][i](_spec_xb, n=n)
                     _t2 = time.perf_counter()
-                    _b["gdn_ane"] += _t2 - _t
+                    _b["gdn_stage"] += _ts - _t
+                    _b["gdn_ane"] += _t2 - _ts
                     hid = _moe_from_ane(hl, m_mix, m_hyp, m_inj, m_sh, _b)
                 elif i in mil_qsa:
                     _t = time.perf_counter()
