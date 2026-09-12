@@ -2755,7 +2755,8 @@ def stage_moe(seq: int, reuse: bool, prompt_ids: list[int]) -> None:
 
 
 def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
-                   no_ane: bool = False, host_front: bool = False) -> None:
+                   no_ane: bool = False, host_front: bool = False,
+                   ppl_ids: list[int] | None = None) -> None:
     """48-layer greedy decode. ANE every layer that has a compiled asset."""
     if not prompt_ids or max_new < 1:
         raise ValueError("generate requires a nonempty prompt and max_new >= 1")
@@ -3966,6 +3967,48 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
         _spec_eager = os.environ.get("FLASHNEXT_EAGER", "1") not in (
             "0", "false", "")
 
+        async def evaluate_ppl(eval_ids) -> None:
+            """Teacher-forced negative log likelihood over `eval_ids`.
+
+            The same K-slot graphs the speculator verifies with, driven with
+            the true continuation instead of drafts, so every slot is accepted
+            and the measurement runs at the block rate rather than the token
+            rate. Slot j predicts the token after ids[j], so a block of n slots
+            scores n targets.
+            """
+            kk = spec_k
+            tid = cur[-1]
+            pos = 0
+            total = 0.0
+            n_scored = 0
+            t0 = time.perf_counter()
+            while pos < len(eval_ids):
+                n = min(kk, len(eval_ids) - pos)
+                ids = [tid] + list(eval_ids[pos:pos + n - 1])
+                for i in mil_qsa:
+                    spec_kv_base[i] = int(attn_state[i].offset)
+                _hid, lg = _block_forward(ids)
+                lg = np.asarray(lg, np.float64)
+                mx_ = lg.max(axis=-1, keepdims=True)
+                lse = mx_[:, 0] + np.log(np.exp(lg - mx_).sum(axis=-1))
+                for j in range(n):
+                    total += lse[j] - lg[j, int(eval_ids[pos + j])]
+                n_scored += n
+                _block_commit(n - 1)
+                tid = int(eval_ids[pos + n - 1])
+                pos += n
+                if n_scored % 256 < kk:
+                    el = time.perf_counter() - t0
+                    print(f"    {n_scored}/{len(eval_ids)} tokens  "
+                          f"ppl {np.exp(total / n_scored):.4f}  "
+                          f"{n_scored / max(el, 1e-9):.1f} tok/s", flush=True)
+            el = time.perf_counter() - t0
+            print(f"  ppl over {n_scored} tokens: "
+                  f"nll {total / max(n_scored, 1):.6f}  "
+                  f"ppl {np.exp(total / max(n_scored, 1)):.4f}  "
+                  f"in {el:.1f}s ({n_scored / max(el, 1e-9):.1f} tok/s)",
+                  flush=True)
+
         async def speculate() -> None:
             """Draft with the MTP head, verify the whole block on the ANE."""
             nonlocal generated, cur
@@ -4026,6 +4069,17 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 # Drafter positions past the accepted prefix were conditioned
                 # on a token the backbone rejected. Trim first, then overlap
                 # the next MTP chain with GDN/QSA commit (different engines).
+                #
+                # These rows are approximate in two ways and neither matters.
+                # Step i writes the row for ids[i], so keeping m of them leaves
+                # no row for the last accepted token, and every row pairs its
+                # token with a state the drafter invented rather than the
+                # backbone's. Keeping the extra row changed which drafts were
+                # proposed and not how many were accepted (37/81 either way),
+                # and replaying the accepted prefix against the backbone's own
+                # hidden states was worse: 2.21 tokens a pass against 2.29, for
+                # an extra MTP forward a block. The head's prediction is
+                # carried by the front, not by its own short attention.
                 if drafter is not None:
                     drafter.trim_to(drafter_base + m)
                     drafter_base = drafter.offset
@@ -4147,6 +4201,9 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 spec_ms[_k] = 0.0
             for _k in mil_qsa_ms:
                 mil_qsa_ms[_k] = 0.0
+            if ppl_ids:
+                await evaluate_ppl(ppl_ids)
+                return
             await speculate()
         else:
           for input_step in range(prefill_steps + max_new):
@@ -4448,6 +4505,18 @@ def main() -> None:
         help="layers: comma-separated decoder indices (default: all 48)",
     )
     p.add_argument(
+        "--ppl-file",
+        default=None,
+        help="generate: score this text file's tokens instead of generating, "
+             "and report negative log likelihood and perplexity",
+    )
+    p.add_argument(
+        "--ppl-tokens",
+        type=int,
+        default=2048,
+        help="generate: how many tokens of --ppl-file to score",
+    )
+    p.add_argument(
         "--prompt-ids",
         default="760",
         help="generate: comma-separated prompt token ids (default 760 = The)",
@@ -4504,8 +4573,21 @@ def main() -> None:
             ids = ids + extra.tolist()
             print(f"  padded prompt to {len(ids)} tokens "
                   f"(prefix {ids[:len(ids) - extra.size]})", flush=True)
+        ppl_ids = None
+        if args.ppl_file:
+            from tokenizers import Tokenizer
+            tk = Tokenizer.from_file(str(BASE / "tokenizer.json"))
+            text = Path(args.ppl_file).read_text()
+            all_ids = tk.encode(text, add_special_tokens=False).ids
+            all_ids = all_ids[:args.ppl_tokens + 1]
+            # The first token is the prompt; everything after it is scored.
+            ids = all_ids[:1]
+            ppl_ids = all_ids[1:]
+            print(f"  ppl: {len(ppl_ids)} tokens from {args.ppl_file}")
+            # Cache sizing follows max_new, and scoring walks the whole file.
+            args.max_new = len(ppl_ids) + 8
         stage_generate(args.seq, args.max_new, ids, no_ane=args.no_ane,
-                       host_front=args.host_front)
+                       host_front=args.host_front, ppl_ids=ppl_ids)
     elif args.stage == "fuse":
         from export_flashnext_gdn_fuse import stage_fuse
         stage_fuse(args.seq, args.skip_bench, args.reuse, args.export_layers)

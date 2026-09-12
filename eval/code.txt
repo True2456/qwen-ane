@@ -1,0 +1,700 @@
+"""MTP drafter on the GPU, ported from the production Swift backend.
+
+`Qwen4ExpMTPHead` in `Rindi-NativeMLX/Sources/RindiInference/Qwen4Exp.swift` is
+two grouped RMS norms, two 2560x2560 projections, one full sparse-attention
+decoder layer with its own 512-expert MoE, and a final mixer. Drafting one
+token costs roughly one forty-eighth of a backbone pass, so a chain of four
+drafts is cheap next to the block it proposes.
+
+It runs on the GPU and stays there: the backbone's hidden state is the only
+thing that crosses the NumPy boundary, once per block. The ANE never sees it.
+
+Two details that silently produce a useless drafter rather than an error:
+
+  * `pre_fc_norm_embedding` and `pre_fc_norm_hidden` are zero-centred like
+    every other norm in this checkpoint, so their weights load as w + 1. The
+    Swift loader calls this out for exactly this reason — miss it and the
+    accept rate is zero with no other symptom.
+  * `mtp_front_end` is `per_branch` here: `fc_hidden` applies to each of the
+    four hyper-connection branches separately and the embedding broadcasts
+    across them. The `mean` / `sum` / first-branch variants all produce
+    plausible numbers and a drafter that never agrees with the backbone.
+
+The MTP layer has no indexer weights in this checkpoint, so its attention is
+dense over its own KV cache. Drafts are verified by the backbone regardless,
+so the accept rate is the test that matters.
+"""
+from __future__ import annotations
+
+import os
+
+import numpy as np
+import mlx.core as mx
+
+from runtime.expert_bank import MlxSafe, MLX4_DEFAULT
+
+H = 2560
+HC = 4
+HC_W = H * HC
+HC_LOWRANK = 320
+HQ, HKV, HD = 24, 2, 256
+ROTARY = 64
+THETA = 10_000_000.0
+K_PIN = 10
+EPS = 1e-6
+_PLUS_ONE = ("hc_norm.weight", "q_norm.weight", "k_norm.weight",
+             "pre_fc_norm_embedding.weight", "pre_fc_norm_hidden.weight")
+
+
+def _silu(x):
+    return x * mx.sigmoid(x)
+
+
+def _grouped_rms(x, w, group: int):
+    lead = list(x.shape[:-1])
+    d = x.shape[-1]
+    g = x.reshape(*lead, d // group, group)
+    g = g * mx.rsqrt(mx.mean(g * g, axis=-1, keepdims=True) + EPS)
+    return w * g.reshape(*lead, d)
+
+
+class _Mix:
+    """One hyper-connection mixer. `inj` is None for the head's final mixer."""
+
+    def __init__(self, src, prefix: str, combine: bool):
+        self.hc_n = mx.array(src.f32(f"{prefix}.hc_norm.weight") + 1.0)
+        self.down = mx.array(src.f32(f"{prefix}.input_mix_weight_down.weight"))
+        self.up = mx.array(src.f32(f"{prefix}.input_mix_weight_up.weight"))
+        self.inj = (mx.array(src.f32(f"{prefix}.block_inject_weight.weight"))
+                    if combine else None)
+
+    def __call__(self, x_hc):
+        n = _grouped_rms(x_hc, self.hc_n, H)
+        w = mx.sigmoid((_silu((n @ self.down.T) * 0.25)) @ self.up.T)
+        lead = list(n.shape[:-1])
+        mixed = mx.mean(w.reshape(*lead, HC, H) * n.reshape(*lead, HC, H), axis=-2)
+        if self.inj is None:
+            return mixed, None
+        return mixed, 2.0 * mx.sigmoid((n @ self.inj.T) * 0.25)
+
+
+def _recombine(out_h, hyper, inj):
+    lead = list(out_h.shape[:-1])
+    parts = mx.expand_dims(out_h, -2) * mx.expand_dims(inj, -1)
+    return hyper + parts.reshape(*lead, HC_W)
+
+
+class _Q:
+    """A quantized projection kept packed; only activations are materialized."""
+
+    def __init__(self, src, prefix: str, in_dim: int):
+        self.w = mx.array(src.raw(f"{prefix}.weight"))
+        scales = src.f32(f"{prefix}.scales")
+        self.s = mx.array(scales, dtype=mx.float16)
+        self.b = mx.array(src.f32(f"{prefix}.biases"), dtype=mx.float16)
+        # Bit width follows from the row: a packed row holds `in_dim` values in
+        # `cols` uint32 words. Guessing it from the scale count is ambiguous —
+        # 4-bit/group-128 and 8-bit/group-64 pack to the same size.
+        self.bits = 32 * self.w.shape[-1] // int(in_dim)
+        self.group = int(in_dim) // scales.shape[-1]
+
+    def __call__(self, x):
+        return mx.quantized_matmul(x, self.w, self.s, self.b, transpose=True,
+                                   group_size=self.group, bits=self.bits)
+
+    def rows(self, ids):
+        """Dequantized rows — the embedding table is a lookup, not a matmul."""
+        return mx.dequantize(mx.take(self.w, ids, axis=0),
+                             mx.take(self.s, ids, axis=0),
+                             mx.take(self.b, ids, axis=0),
+                             group_size=self.group, bits=self.bits)
+
+
+def _rope(x, offset: int):
+    """Partial rotary over the first ROTARY dims, rotate-half convention."""
+    l = x.shape[2]
+    pos = mx.arange(offset, offset + l, dtype=mx.float32).reshape(-1, 1)
+    inv = 1.0 / (THETA ** (mx.arange(0, ROTARY, 2, dtype=mx.float32) / ROTARY))
+    f = pos * inv.reshape(1, -1)
+    cos = mx.concatenate([mx.cos(f), mx.cos(f)], axis=-1).reshape(1, 1, l, ROTARY)
+    sin = mx.concatenate([mx.sin(f), mx.sin(f)], axis=-1).reshape(1, 1, l, ROTARY)
+    r, rest = x[..., :ROTARY], x[..., ROTARY:]
+    half = ROTARY // 2
+    rot = mx.concatenate([-r[..., half:], r[..., :half]], axis=-1)
+    return mx.concatenate([r * cos + rot * sin, rest], axis=-1)
+
+
+class _Embed:
+    """Embedding rows dequantized from the mmap on demand.
+
+    Keeping the packed table on the GPU costs 0.7 GB, which is 0.7 GB the
+    expert bank does not get. A decode step needs one row.
+    """
+
+    def __init__(self, path, prefix: str = "model.embed_tokens"):
+        self.src = MlxSafe(path)
+        self.w = self.src.raw(f"{prefix}.weight")
+        self.sc = self.src.raw(f"{prefix}.scales")
+        self.bi = self.src.raw(f"{prefix}.biases")
+        self.bits = 32 * self.w.shape[-1] // H
+        self.group = H // self.sc.shape[-1]
+
+    def close(self):
+        self.src.close()
+
+    def __call__(self, ids):
+        rows = np.asarray(ids, np.int64).ravel()
+        packed = self.w[rows]
+        per = 32 // self.bits
+        q = np.right_shift(
+            packed[:, :, None].astype(np.uint32),
+            (np.arange(per, dtype=np.uint32) * self.bits)[None, None, :])
+        q = (q & np.uint32((1 << self.bits) - 1)).reshape(len(rows), -1)
+        sc = _bf16(self.sc[rows])[:, :, None]
+        bi = _bf16(self.bi[rows])[:, :, None]
+        v = q.reshape(len(rows), -1, self.group).astype(np.float32) * sc + bi
+        return v.reshape(len(rows), H)
+
+
+def _bf16(a):
+    if a.dtype == np.float32:
+        return a
+    if a.dtype.itemsize == 2 and a.dtype.kind == "V" or a.dtype == np.uint16:
+        u = np.asarray(a, np.uint16).astype(np.uint32) << 16
+        return u.view(np.float32)
+    return np.asarray(a, np.float32)
+
+
+class MtpDrafter:
+    """Chained greedy drafting off the backbone's hyper-connection state."""
+
+    def __init__(self, head, path=MLX4_DEFAULT, max_kv: int = 4096,
+                 routed: bool | None = None):
+        # Every gigabyte here comes out of the expert bank's residency. The
+        # bank is 69 GB on a 137 GB machine and the whole run falls off a cliff
+        # when the total stops fitting, so the drafter is kept small: scales in
+        # fp16, and its routed experts optional.
+        if routed is None:
+            routed = os.environ.get("FLASHNEXT_MTP_SHARED_ONLY") != "1"
+        self.routed = bool(routed)
+        src = MlxSafe(os.environ.get("FLASHNEXT_MLX4") or path)
+        try:
+            self.emb = _Embed(os.environ.get("FLASHNEXT_MLX4") or path)
+            self.pre_e = mx.array(src.f32("mtp.pre_fc_norm_embedding.weight") + 1.0)
+            self.pre_h = mx.array(src.f32("mtp.pre_fc_norm_hidden.weight") + 1.0)
+            self.fc_e = mx.array(src.f32("mtp.fc_embedding.weight"))
+            self.fc_h = mx.array(src.f32("mtp.fc_hidden.weight"))
+            lp = "mtp.layers.0"
+            self.amix = _Mix(src, f"{lp}.attn_hyper_connection", True)
+            self.mmix = _Mix(src, f"{lp}.mlp_hyper_connection", True)
+            self.out_mix = _Mix(src, "mtp.hyper_connection_mixer", False)
+            self.q = _Q(src, f"{lp}.self_attn.q_proj", H)
+            self.k = _Q(src, f"{lp}.self_attn.k_proj", H)
+            self.v = _Q(src, f"{lp}.self_attn.v_proj", H)
+            self.o = _Q(src, f"{lp}.self_attn.o_proj", HQ * HD)
+            self.qn = mx.array(src.f32(f"{lp}.self_attn.q_norm.weight") + 1.0)
+            self.kn = mx.array(src.f32(f"{lp}.self_attn.k_norm.weight") + 1.0)
+            self.router = _Q(src, f"{lp}.mlp.gate", H)
+            self.sh_g = _Q(src, f"{lp}.mlp.shared_expert.gate_proj", H)
+            self.sh_u = _Q(src, f"{lp}.mlp.shared_expert.up_proj", H)
+            self.sh_d = _Q(src, f"{lp}.mlp.shared_expert.down_proj", 640)
+            self.sh_gate = _Q(src, f"{lp}.mlp.shared_expert_gate", H)
+            # The MTP head's experts are 8-bit here while the backbone's are
+            # 4-bit, so the packing is read off the shapes rather than assumed.
+            self.experts = []
+            self.expert_q = []
+            for name, in_dim in ((("gate_proj", H), ("up_proj", H), ("down_proj", 640))
+                                 if self.routed else ()):
+                p = f"{lp}.mlp.switch_mlp.{name}"
+                w = mx.array(src.raw(p + ".weight"))
+                sc = mx.array(src.f32(p + ".scales"), dtype=mx.float16)
+                bi = mx.array(src.f32(p + ".biases"), dtype=mx.float16)
+                gs = in_dim // sc.shape[-1]
+                bits = 32 * w.shape[-1] // in_dim
+                if bits > 4:
+                    # 8-bit drafter experts cost 2.5 GB. Requantizing to 4 bits
+                    # halves that; the drafter only has to guess well enough to
+                    # be accepted, and the backbone checks every token anyway.
+                    w, sc, bi = mx.quantize(
+                        mx.dequantize(w, sc, bi, group_size=gs, bits=bits),
+                        group_size=64, bits=4)
+                    sc, bi, gs, bits = sc.astype(mx.float16), bi.astype(mx.float16), 64, 4
+                    mx.eval(w, sc, bi)
+                self.experts.append((w, sc, bi))
+                self.expert_q.append((gs, bits))
+        finally:
+            src.close()
+        self.head = head
+        self.nbytes = sum(a.nbytes for p_ in self.experts for a in p_)
+        self.max_kv = int(max_kv)
+        self.kc = None
+        self.vc = None
+        self.offset = 0
+        mx.eval(self.pre_e, self.pre_h, self.fc_e, self.fc_h)
+
+    def reset(self) -> None:
+        self.kc = self.vc = None
+        self.offset = 0
+
+    def trim_to(self, n: int) -> None:
+        """Drop cache rows past `n`, which is how a rejected draft is undone."""
+        n = max(0, int(n))
+        if self.kc is not None and n < self.offset:
+            self.kc = self.kc[:, :, :n] if n else None
+            self.vc = self.vc[:, :, :n] if n else None
+        self.offset = n
+
+    def _front(self, hidden_hc, token_ids):
+        tok = np.asarray(token_ids, np.int64)
+        e = _grouped_rms(mx.array(self.emb(tok).reshape(*tok.shape, H)), self.pre_e, H)
+        e = e @ self.fc_e.T
+        hh = _grouped_rms(hidden_hc, self.pre_h, H)
+        lead = list(hh.shape[:-1])
+        hh = hh.reshape(*lead, HC, H)
+        y = (hh @ self.fc_h.T) + mx.expand_dims(e, -2)
+        return y.reshape(*lead, HC_W)
+
+    def _attn(self, x):
+        b, l = x.shape[0], x.shape[1]
+        qg = self.q(x).reshape(b, l, HQ, 2 * HD)
+        q, gate = qg[..., :HD], qg[..., HD:].reshape(b, l, HQ * HD)
+        k = self.k(x).reshape(b, l, HKV, HD)
+        v = self.v(x).reshape(b, l, HKV, HD)
+        q = (self.qn * (q * mx.rsqrt(mx.mean(q * q, -1, keepdims=True) + EPS))).transpose(0, 2, 1, 3)
+        k = (self.kn * (k * mx.rsqrt(mx.mean(k * k, -1, keepdims=True) + EPS))).transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+        q = _rope(q, self.offset)
+        k = _rope(k, self.offset)
+        if self.kc is None:
+            self.kc, self.vc = k, v
+        else:
+            self.kc = mx.concatenate([self.kc, k], axis=2)
+            self.vc = mx.concatenate([self.vc, v], axis=2)
+        if self.kc.shape[2] > self.max_kv:
+            self.kc = self.kc[:, :, -self.max_kv:]
+            self.vc = self.vc[:, :, -self.max_kv:]
+        self.offset += l
+        mask = "causal" if l > 1 else None
+        out = mx.fast.scaled_dot_product_attention(
+            q, self.kc, self.vc, scale=HD ** -0.5, mask=mask)
+        out = out.transpose(0, 2, 1, 3).reshape(b, l, HQ * HD)
+        return self.o(out * mx.sigmoid(gate))
+
+    def _moe(self, x):
+        sg = _silu(self.sh_g(x))
+        shared = self.sh_d(sg * self.sh_u(x)) * mx.sigmoid(self.sh_gate(x))
+        if not self.routed:
+            return shared
+        logits = self.router(x).reshape(-1, 512)
+        probs = mx.softmax(logits.astype(mx.float32), axis=-1)
+        ids = mx.argpartition(-probs, K_PIN - 1, axis=-1)[:, :K_PIN]
+        sc = mx.take_along_axis(probs, ids, axis=-1)
+        sc = sc / mx.sum(sc, axis=-1, keepdims=True)
+        k = ids.shape[0]
+        t = mx.expand_dims(x.reshape(1, k, -1), (-2, -3))
+        rid = ids.astype(mx.uint32).reshape(1, k, -1)
+
+        def project(u, j):
+            gs, bits = self.expert_q[j]
+            return mx.gather_qmm(u, *self.experts[j], rhs_indices=rid,
+                                 transpose=True, group_size=gs, bits=bits)
+
+        g = project(t, 0)
+        y = project(g * mx.sigmoid(g) * project(t, 1), 2)
+        y = mx.sum(y.squeeze(-2) * sc.reshape(1, k, -1, 1), axis=-2)
+        return y.reshape(x.shape) + shared
+
+    def _layer(self, x_hc):
+        mixed, inj = self.amix(x_hc)
+        h = _recombine(self._attn(mixed), x_hc, inj)
+        mixed2, inj2 = self.mmix(h)
+        return _recombine(self._moe(mixed2), h, inj2)
+
+    def step(self, hidden_hc, token_ids):
+        """One MTP pass. Returns (logits, pre-mix state to chain from)."""
+        pre = self._layer(self._front(hidden_hc, token_ids))
+        mixed, _ = self.out_mix(pre)
+        return self.head.logits_mx(mixed), pre
+
+    def draft(self, hidden_hc, token_id: int, n: int, lookup=None) -> list[int]:
+        """Chain `n` greedy drafts. Each one is a serialized round trip.
+
+        `lookup` is an optional `ContextLookup`: when the drafted suffix has
+        occurred before, the token that followed it then replaces the head's
+        own argmax and is fed back into the chain. The head still runs every
+        step, because the drafter's attention cache needs a row per drafted
+        position for a partly accepted block to unwind.
+        """
+        out: list[int] = []
+        h = hidden_hc
+        tok = int(token_id)
+        for _ in range(n):
+            logits, h = self.step(h, [[tok]])
+            nxt = mx.argmax(logits.reshape(-1))
+            mx.eval(nxt, h)
+            tok = int(nxt.item())
+            if lookup is not None:
+                hit = lookup.next_token(out)
+                if hit is not None:
+                    tok = int(hit)
+            out.append(tok)
+        return out
+
+    def advance(self, hidden_hc, token_ids) -> None:
+        """Replay confirmed tokens so the drafter's cache stays aligned."""
+        self._layer(self._front(hidden_hc, token_ids))
+"""MIL int8 GDN layer backend — an alternative to the Core AI `pure_step` graph.
+
+Separate module on purpose. The two paths cannot both be resident (the ANE
+ceiling is ~80 models and the Core AI configuration already loads 72), so this
+is selected instead of `pure_step`, never alongside it. Nothing here edits the
+Core AI path.
+
+Measured against the Core AI graph it replaces (`probes/flashnext_mil_layer.py`):
+
+    MIL int8 + shared expert   1.265 ms
+    Core AI fp16 + shared      2.020 ms      1.60x
+
+    mixed  rel 0.027   state rel 0.0056   vs MultiTokenStep
+
+Error is bounded in depth (~0.06 across 16 stacked layers, plateauing after
+about six — each mixer's grouped RMS renormalizes the stream) and stable in
+time across tokens. For calibration the shipping MLX 4-bit build measures
+0.102 per tensor.
+
+Six MIL spellings this depends on, each replacing something the compiler
+rejects — see docs/W8A8-PROJECTIONS.md:
+  * `rsqrt` -> `pow(x, -0.5)`
+  * rank-4 consts -> runtime input rows (`param`, `hcn`)
+  * `pow` with a const tensor exponent -> a runtime tensor exponent
+  * `repeat_interleave` -> `concat(axis=2)` + `reshape`
+  * the 4-tap -> a real depthwise `conv`, weights being a rank-4 blob const
+  * multi-IO surfaces bind in ALPHABETICAL symbol order
+"""
+from __future__ import annotations
+
+import contextlib
+import io
+import sys
+from pathlib import Path
+
+import numpy as np
+
+_ROOT = Path(__file__).resolve().parents[1]
+for _p in (str(_ROOT), str(_ROOT / "scripts"), str(_ROOT / "probes")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import runtime.q38_ane_engine as _E
+from runtime.q38_ane_engine import AneEngine, _iosurface_view
+
+from export_flashnext_coreai import (  # noqa: E402
+    H, I, HC, HC_W, HV, DK, DV, QKV, GDN_Y, IN_O, SEQ_DEFAULT,
+)
+
+S = SEQ_DEFAULT
+
+
+class MilGdnLayer:
+    """One GDN layer: mixer, in_proj int8, conv, GDN, out_proj int8, mixer, shared.
+
+    State (recurrent + conv cache) lives in host buffers and is fed each call,
+    matching the Core AI graph's contract so decode can swap between them.
+    """
+
+    __slots__ = ("layer", "k", "_prog", "_param", "_hcn", "_conv", "_eng",
+                 "_conv_out_width", "_conv_surface_current",
+                 "_fut", "_prefix_state", "_prefix_fseq")
+
+    def __init__(self, layer: int, weights, ref_step, k: int = 1,
+                 engine: AneEngine | None = None):
+        import flashnext_mil_layer as _ML
+        self._eng = engine or _ML.eng
+        _ML.LAYER[0] = int(layer)
+        _ML.K[0] = int(k)
+        self.k = int(k)
+        built = _ML.build_layer(weights, ref_step)
+        if built is None:
+            raise RuntimeError(f"MIL layer {layer} failed to compile")
+        self.layer = int(layer)
+        self._prog, self._param, self._hcn = built
+        self._conv_out_width = int(getattr(self._prog, "conv_out_width", 64))
+        # These immutable arrays are MIL inputs only because the frontend
+        # rejects their constant spelling.  Copy them to their IOSurfaces once.
+        for surf, val in zip(self._prog._in_surfs[2:4],
+                             (self._param, self._hcn)):
+            with _iosurface_view(surf, val.shape, np.float16) as dst:
+                np.copyto(dst, val)
+        # Only column 0 of the conv cache is read (the three taps are stacked
+        # on the channel axis), so the surface is written a column at a time
+        # rather than 1.97 MB a layer.
+        self._conv = np.zeros((3 * QKV,), np.float16)
+        self._conv_surface_current = False
+        self._fut = None
+        self._prefix_state = None
+        self._prefix_fseq = None
+        # The recurrent state lives in its input surface and never visits a
+        # host array: it is 1.57 MB a layer, 56 MB a pass across 36 layers, and
+        # staging it through NumPy copied that twice.
+        # Two in-flight micro-batches cannot share that surface: either a
+        # second slot or a fence before overwrite. The pipeline fences.
+        with _iosurface_view(self._prog._in_surfs[4], (HV, DV, DK),
+                             np.float16) as dst:
+            dst[:] = 0
+
+    def reset(self) -> None:
+        self._conv[:] = 0
+        with _iosurface_view(self._prog._in_surfs[1], (3 * QKV, S),
+                             np.float16) as dst:
+            dst[:] = 0
+        self._conv_surface_current = True
+        with _iosurface_view(self._prog._in_surfs[4], (HV, DV, DK),
+                             np.float16) as dst:
+            dst[:] = 0
+
+    def __call__(self, x_bc1s: np.ndarray, n: int | None = None):
+        """x is (1, HC_W, 1, S). Returns (mixed, hyper, inj, shared) over n slots.
+
+        The recurrent state and conv cache advance in place, as `pure_step` does.
+        """
+        x = np.asarray(x_bc1s, np.float16).reshape(HC_W, S)
+        p = self._prog
+        with _iosurface_view(p._in_surfs[0], (HC_W, S), np.float16) as dst:
+            np.copyto(dst, x)
+        if not self._conv_surface_current:
+            with _iosurface_view(p._in_surfs[1], (3 * QKV, S), np.float16) as dst:
+                dst[:, 0] = self._conv
+            self._conv_surface_current = True
+        if not self._eng.submit(p, procedure_index=0):
+            raise RuntimeError(f"MIL layer {self.layer}: submit failed")
+        # Surfaces bind alphabetically: q_state0 .. q_state{k-1}, then
+        # u_shared, v_mixed, w_hyper, x_inj, y_conv.
+        kk = self.k
+        w = kk if n is None else int(n)
+        if n is None:
+            # Plain decode consumes the whole block; speculation calls commit()
+            # itself once it knows how many tokens the backbone confirmed.
+            self.commit(kk - 1)
+        out = []
+        for j, shape in enumerate(((H, S), (H, S), (HC_W, S), (HC, S))):
+            with _iosurface_view(p._out_surfs[kk + j], shape, np.float16) as o:
+                out.append(np.array(o[:, :w], np.float32).reshape(1, shape[0], 1, w))
+        shared, mixed, hyper, inj = out
+        return mixed, hyper, inj, shared
+
+    def state_at(self, j: int) -> np.ndarray:
+        """The recurrent state having consumed `j + 1` of this pass's tokens."""
+        with _iosurface_view(self._prog._out_surfs[int(j)], (HV, DV, DK),
+                             np.float16) as o:
+            return np.array(o, np.float16)
+
+    def set_state(self, value) -> None:
+        """Seed the recurrent state; the surface is the only copy."""
+        with _iosurface_view(self._prog._in_surfs[4], (HV, DV, DK),
+                             np.float16) as dst:
+            np.copyto(dst, np.asarray(value, np.float16).reshape(HV, DV, DK))
+
+    def commit(self, j: int) -> None:
+        """Advance the layer's state and conv window to the `j + 1` boundary.
+
+        Speculation needs every prefix, not just the last: the graph emits a
+        state per token and the whole conv window, so a partially accepted
+        block costs no extra pass. A pipelined two-half forward snapshots
+        prefixes on host because the second half overwrites the output
+        surfaces; `_block_commit` still calls this with the accepted j.
+        """
+        j = int(j)
+        if self._prefix_state is not None and self._prefix_state[j] is not None:
+            self._commit_saved(j)
+            return
+        p = self._prog
+        with _iosurface_view(p._out_surfs[j], (HV, DV, DK), np.float16) as o:
+            with _iosurface_view(p._in_surfs[4], (HV, DV, DK), np.float16) as d:
+                np.copyto(d, o)
+        self._apply_conv_from_fseq(self._read_fseq(), j)
+
+    def begin_block(self, n: int) -> None:
+        """Reset prefix snapshots for a K-slot verification pass of width n."""
+        self._prefix_state = [None] * int(n)
+        self._prefix_fseq = []
+        self._fut = None
+
+    def _write_x(self, x_bc1s: np.ndarray) -> None:
+        x = np.asarray(x_bc1s, np.float16).reshape(HC_W, S)
+        p = self._prog
+        with _iosurface_view(p._in_surfs[0], (HC_W, S), np.float16) as dst:
+            np.copyto(dst, x)
+        if not self._conv_surface_current:
+            with _iosurface_view(p._in_surfs[1], (3 * QKV, S), np.float16) as dst:
+                dst[:, 0] = self._conv
+            self._conv_surface_current = True
+
+    def _take(self, w: int):
+        p = self._prog
+        kk = self.k
+        out = []
+        for j, shape in enumerate(((H, S), (H, S), (HC_W, S), (HC, S))):
+            with _iosurface_view(p._out_surfs[kk + j], shape, np.float16) as o:
+                out.append(np.array(o[:, :w], np.float32).reshape(1, shape[0], 1, w))
+        shared, mixed, hyper, inj = out
+        return mixed, hyper, inj, shared
+
+    def _read_fseq(self) -> np.ndarray:
+        p = self._prog
+        with _iosurface_view(p._out_surfs[self.k + 4],
+                             (QKV, self._conv_out_width), np.float16) as o:
+            return np.array(o, np.float16)
+
+    def _apply_conv_from_fseq(self, fseq: np.ndarray, j: int) -> None:
+        p = self._prog
+        with _iosurface_view(p._in_surfs[1], (3 * QKV, S), np.float16) as d:
+            for t in range(3):
+                value = fseq[:, j + 1 + t]
+                self._conv[t * QKV:(t + 1) * QKV] = value
+                d[t * QKV:(t + 1) * QKV, 0] = value
+        self._conv_surface_current = True
+
+    def _commit_saved(self, j: int) -> None:
+        self.set_state(self._prefix_state[j])
+        for off, w, fseq in self._prefix_fseq:
+            if off <= j < off + w:
+                self._apply_conv_from_fseq(fseq, j - off)
+                return
+        raise RuntimeError(f"MIL layer {self.layer}: no fseq snapshot for j={j}")
+
+    def snapshot(self, offset: int, n: int) -> None:
+        """Keep prefix states so a later half can overwrite the output surfaces."""
+        if self._prefix_state is None:
+            return
+        for j in range(int(n)):
+            self._prefix_state[int(offset) + j] = self.state_at(j)
+        self._prefix_fseq.append((int(offset), int(n), self._read_fseq()))
+
+    def fence_state(self, n: int) -> None:
+        """Copy the last live slot's recurrent state into the input surface.
+
+        The next micro-batch of this layer reads that surface. Must not run
+        while an evaluate on this program is in flight.
+        """
+        if int(n) <= 0:
+            return
+        p = self._prog
+        j = int(n) - 1
+        with _iosurface_view(p._out_surfs[j], (HV, DV, DK), np.float16) as o:
+            with _iosurface_view(p._in_surfs[4], (HV, DV, DK), np.float16) as d:
+                np.copyto(d, o)
+        self._apply_conv_from_fseq(self._read_fseq(), j)
+
+    def run(self, x_bc1s: np.ndarray, n: int, *, async_: bool = False):
+        """Write inputs and evaluate. Async returns a future; caller must finish()."""
+        self._write_x(x_bc1s)
+        if async_:
+            self._fut = self._eng.submit_async(self._prog, procedure_index=0)
+            return self._fut
+        if not self._eng.submit(self._prog, procedure_index=0):
+            raise RuntimeError(f"MIL layer {self.layer}: submit failed")
+        self._fut = None
+        return None
+
+    def finish(self, n: int, *, offset: int = 0, fence: bool = False):
+        """Wait for an in-flight evaluate, take outputs, snapshot, maybe fence."""
+        if self._fut is not None:
+            ok = self._fut.wait()
+            self._fut = None
+            if not ok:
+                raise RuntimeError(f"MIL layer {self.layer}: async submit failed")
+        out = self._take(int(n))
+        self.snapshot(int(offset), int(n))
+        if fence:
+            self.fence_state(int(n))
+        return out
+
+
+def build_layers(layer_indices, loader_fn, step_fn, engine=None):
+    """Compile a MIL layer per index. Returns {index: MilGdnLayer}.
+
+    Budget the model count: the ANE runs out of resources near 80 resident
+    programs, and each of these is one.
+    """
+    out = {}
+    for li in layer_indices:
+        loader, w = loader_fn(li)
+        try:
+            out[li] = MilGdnLayer(li, w, step_fn(w))
+        finally:
+            loader.close()
+    return out
+"""Suffix-match drafting over the tokens already in play.
+
+The MTP head predicts the first draft position at about 92%, and then falls
+off a cliff: 40% at the second and below that at the third. It is a one-layer
+module being fed its own output where it was trained on a forty-eight layer
+state, so chaining it compounds the mismatch, and widening the block does not
+help — K=8 accepts 24% of its drafts against 52% at K=4.
+
+Text that repeats itself does not need the head at all. When the last few
+tokens have occurred before, the token that followed them last time is a very
+good guess, and it costs a dictionary lookup. That covers the case this model
+is actually used for: editing code, quoting a file back, filling a structure.
+
+The chain is still driven through the MTP head one step at a time, because the
+drafter's attention cache needs a row per drafted position for a partly
+accepted block to unwind. A lookup hit replaces the head's argmax and is then
+fed back in, so the head continues along the matched path instead of its own.
+"""
+from __future__ import annotations
+
+import os
+
+__all__ = ["ContextLookup"]
+
+
+class ContextLookup:
+    """Last-occurrence index over n-grams of the tokens seen so far."""
+
+    __slots__ = ("ids", "g", "index", "hits", "calls")
+
+    def __init__(self, g: int | None = None):
+        # Three is the shortest match that is worth trusting. Two fires
+        # constantly on common bigrams and proposes noise; four rarely fires
+        # on anything the head was not already going to get right.
+        if g is None:
+            g = int(os.environ.get("FLASHNEXT_NGRAM_G", "3"))
+        self.g = max(1, int(g))
+        self.ids: list[int] = []
+        self.index: dict[tuple, int] = {}
+        self.hits = 0
+        self.calls = 0
+
+    def extend(self, tokens) -> None:
+        """Append confirmed tokens and index the n-grams they complete."""
+        g = self.g
+        ids = self.ids
+        start = len(ids)
+        ids.extend(int(t) for t in tokens)
+        # An n-gram ending at position p - 1 points at p. Re-index from g
+        # positions back, because the tail of the previous call only became a
+        # complete n-gram once these tokens arrived.
+        for p in range(max(g, start), len(ids)):
+            self.index[tuple(ids[p - g:p])] = p
+
+    def next_token(self, drafted) -> int | None:
+        """The token that last followed this suffix, or None."""
+        self.calls += 1
+        g = self.g
+        d = len(drafted)
+        if d >= g:
+            key = tuple(int(t) for t in drafted[d - g:])
+        else:
+            tail = self.ids[len(self.ids) - (g - d):] if g > d else []
+            if len(tail) < g - d:
+                return None
+            key = tuple(tail) + tuple(int(t) for t in drafted)
+        p = self.index.get(key)
+        if p is None or p >= len(self.ids):
+            return None
+        self.hits += 1
+        return self.ids[p]
+
+    def stats(self) -> str:
+        return f"{self.hits}/{self.calls}"
