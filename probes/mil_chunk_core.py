@@ -22,6 +22,7 @@ def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--tap', default='all',choices=['all','cdecay','ci4','cdelta','cy','q_state31'])
     ap.add_argument('--repeats',type=int,default=301)
+    ap.add_argument('--case', choices=['random', 'correlated', 'zero'], default='random')
     args=ap.parse_args()
     h,c,d=48,32,128
     m.B.clear()
@@ -65,6 +66,13 @@ def main():
     state=rng.normal(0,.02,size=(1,h,d,d)).astype(np.float32)
     gates=rng.uniform(.1,1,size=(1,h,c,1)).astype(np.float32)
     beta=rng.uniform(0,1,size=gates.shape).astype(np.float32)
+    if args.case == 'correlated':
+        k[:] = 1 / np.sqrt(d)
+        q[:] = 1 / d
+        gates[:] = 1
+        beta[:] = 1
+    elif args.case == 'zero':
+        gates[:,:,c//2,:] = 0
     arrays=[q,k,v,np.broadcast_to(gates,q.shape),state,np.broadcast_to(beta,q.shape)]
     arrays=[np.asarray(x,np.float16) for x in arrays]
     for surf,arr in zip(prog._in_surfs,arrays):
@@ -74,7 +82,7 @@ def main():
     ts=[]
     for _ in range(args.repeats):
         t0=time.perf_counter();assert m.eng.submit(prog,procedure_index=0);ts.append((time.perf_counter()-t0)*1e3)
-    print(f'tap={tap} median_ms={np.median(ts):.6f} p10={np.percentile(ts,10):.6f} p90={np.percentile(ts,90):.6f}')
+    print(f'tap={tap} case={args.case} median_ms={np.median(ts):.6f} p10={np.percentile(ts,10):.6f} p90={np.percentile(ts,90):.6f}')
     for name,surf in zip(sorted(names),prog._out_surfs):
         with _iosurface_view(surf,shapes[name],np.float16) as src: got=np.array(src,np.float64)
         if name in ['cy','q_state31']:

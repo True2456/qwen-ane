@@ -251,7 +251,7 @@ def build_mil(offs):
     sl("gam", "c_param", 0, HV, HV, 1, DK, 1, DK)
     sl("dtb", "c_param", HV, 2 * HV, HV, 1, DK, 1, DK)
     sl("nw", "c_param", 2 * HV, 3 * HV, HV, 1, DK, 1, DK)
-    chunk = SINGLE_STATE[0] and os.environ.get("MIL_GDN_CHUNK", "0") == "1"
+    chunk = SINGLE_STATE[0] and os.environ.get("MIL_GDN_CHUNK", "1") != "0"
     if chunk:
         from flashnext_mil_chunk import gdn_chunk
         gdn_chunk(sys.modules[__name__], k, offs)
@@ -342,7 +342,7 @@ def build_layer(w, ref):
                             ("sh_down", sd_, H, I), ("sh_sg", sgate_, 1, H)):
         offs[key] = dp.append(
             np.ascontiguousarray(wt).astype(np.float16).reshape(co, ci, 1, 1).tobytes()) + 64
-    if SINGLE_STATE[0] and os.environ.get("MIL_GDN_CHUNK", "0") == "1":
+    if SINGLE_STATE[0] and os.environ.get("MIL_GDN_CHUNK", "1") != "0":
         c = 32
         for name, mask in (("lower", np.tril(np.ones((c,c)))),
                            ("strict", np.tril(np.ones((c,c)), -1)),

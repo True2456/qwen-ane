@@ -32,7 +32,7 @@ def main() -> None:
     li = 0
     loader, w = _load_layer(li)
     ref = MultiTokenStep(w, k).eval().half()
-    lay = MilGdnLayer(li, w, MultiTokenStep(w, 1).eval().half(), k=k, single_state=os.environ.get("MIL_K_SINGLE_STATE") == "1")
+    lay = MilGdnLayer(li, w, MultiTokenStep(w, 1).eval().half(), k=k, single_state=os.environ.get("MIL_K_SINGLE_STATE", "1") == "1")
     loader.close()
 
     rng = np.random.default_rng(12)
