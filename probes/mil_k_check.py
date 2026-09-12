@@ -6,6 +6,7 @@ partially accepted block does not cost a second pass.
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -21,6 +22,7 @@ for _p in (str(ROOT), str(ROOT / "scripts"), str(ROOT / "probes")):
 from export_flashnext_coreai import _load_layer, H, HC_W, HV, DV, DK, QKV, SEQ_DEFAULT
 from flashnext_multitoken_step import MultiTokenStep
 from runtime.mil_gdn_backend import MilGdnLayer
+from runtime.q38_ane_engine import _iosurface_view
 
 S = SEQ_DEFAULT
 
@@ -59,15 +61,38 @@ def main() -> None:
     per = "  ".join(f"t{t}={rel(g_mixed[:, t], r_mixed[:, t]):.4f}" for t in range(k))
     print(f"  K={k}: mixed {per}   final state {rel(g_state, r_state):.5f}   "
           f"conv {rel(g_conv, r_conv):.5f}", flush=True)
+
+    def invoke():
+        # Reproduce the pre-optimization host staging in the timed region for
+        # a controlled A/B without keeping that work in the production path.
+        if os.environ.get("MIL_K_RESTAGE_INPUTS") == "1":
+            with _iosurface_view(lay._prog._in_surfs[1], (3 * QKV, S),
+                                 np.float16) as dst:
+                dst[:, 0] = lay._conv
+            for surf, value in zip(lay._prog._in_surfs[2:4],
+                                   (lay._param, lay._hcn)):
+                with _iosurface_view(surf, value.shape, np.float16) as dst:
+                    np.copyto(dst, value)
+        return lay(x.reshape(1, HC_W, 1, S), n=k)
+
     for _ in range(5):
-        lay(x.reshape(1, HC_W, 1, S), n=k)
+        invoke()
     ts = []
-    for _ in range(25):
+    repeats = int(os.environ.get("MIL_K_REPEATS", "25"))
+    for _ in range(repeats):
         t0 = time.perf_counter()
-        lay(x.reshape(1, HC_W, 1, S), n=k)
+        invoke()
         ts.append(time.perf_counter() - t0)
     ms = float(np.median(ts)) * 1e3
     print(f"  K={k}: {ms:.3f} ms/pass  =  {ms / k:.3f} ms/token", flush=True)
+    if os.environ.get("MIL_K_SUBMIT_ONLY") == "1":
+        ts = []
+        for _ in range(repeats):
+            t0 = time.perf_counter()
+            lay._eng.submit(lay._prog, procedure_index=0)
+            ts.append(time.perf_counter() - t0)
+        print(f"  K={k}: submit-only {float(np.median(ts)) * 1e3:.3f} ms",
+              flush=True)
 
 
 if __name__ == "__main__":

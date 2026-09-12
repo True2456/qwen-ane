@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import sys
 from pathlib import Path
 
@@ -44,6 +45,7 @@ from flashnext_multitoken_step import MultiTokenStep  # noqa: E402
 S = SEQ_DEFAULT
 NH = QKV // DK
 B: list[str] = []
+FULL_CACHE_OUTPUT = os.environ.get("MIL_GDN_FULL_CACHE_OUTPUT") == "1"
 
 
 def emit(line: str) -> None:
@@ -60,6 +62,10 @@ def sl(name, src, c0, c1, oc, d2=1, d3=S, o2=1, o3=None):
 def mixer(pfx, src, hcn_var, offs, out_mixed, out_inj):
     for i in range(HC):
         sl(f"{pfx}g{i}", src, i * H, (i + 1) * H, H)
+        # A three-op spelling — reduce_l2_norm, pow(-1), multiply, with the
+        # sqrt(H) folded into hc_norm — compiles and is numerically equivalent
+        # but is not faster (1.782 vs 1.770 ms). The compiler already fuses the
+        # square into the reduction, so there is no intermediate to remove.
         emit(f'tensor<fp16, [1, {H}, 1, {S}]> {pfx}p{i} = mul(x={pfx}g{i}, y={pfx}g{i})[name=string("{pfx}p{i}")];')
         emit(f'tensor<fp16, [1, 1, 1, {S}]> {pfx}m{i} = reduce_mean(x={pfx}p{i}, axes=ac, keep_dims=kd)[name=string("{pfx}m{i}")];')
         emit(f'tensor<fp16, [1, 1, 1, {S}]> {pfx}e{i} = add(x={pfx}m{i}, y=eps)[name=string("{pfx}e{i}")];')
@@ -210,10 +216,22 @@ def build_mil(offs):
     # [c0, c1, c2, x_0 .. x_{S-1}], so the three taps after j tokens are fseq at
     # j, j+1, j+2 — and speculation needs every prefix, not just the last.
     # It is also smaller than the (3*QKV, S) cache it replaces.
-    # Padded to 64 because an I/O last dim must be a multiple of 32.
+    # Only the first k+3 columns can ever be committed after this pass.  Do
+    # not export the other 32-S live-width columns: for k <= 29 this halves
+    # the cache IOSurface from QKV*64 to QKV*32 without changing a value the
+    # runtime can observe.  The legacy form is retained for reproducible A/Bs.
     k = K[0]
-    sl4("fpad", "fseq", (0, 0, 0, 0), (1, QKV, 1, 64 - (S + 3)), (1, QKV, 1, 64 - (S + 3)))
-    emit(f'tensor<fp16, [1, {QKV}, 1, 64]> y_fseq = concat(values=(fseq, fpad), axis=int32(-1), interleave=bool(false))[name=string("y_fseq")];')
+    cache_elems = S + 3 if FULL_CACHE_OUTPUT else k + 3
+    cache_width = 64 if cache_elems > 32 else 32
+    cache_src = "fseq"
+    if cache_elems != S + 3:
+        sl4("fkeep", "fseq", (0, 0, 0, 0), (1, QKV, 1, cache_elems),
+            (1, QKV, 1, cache_elems))
+        cache_src = "fkeep"
+    pad_elems = cache_width - cache_elems
+    sl4("fpad", "fseq", (0, 0, 0, 0), (1, QKV, 1, pad_elems),
+        (1, QKV, 1, pad_elems))
+    emit(f'tensor<fp16, [1, {QKV}, 1, {cache_width}]> y_fseq = concat(values=({cache_src}, fpad), axis=int32(-1), interleave=bool(false))[name=string("y_fseq")];')
     emit(f'tensor<fp16, [1, {IN_O}, 1, {S}]> fyin = concat(values=(fpre, frest), axis=int32(1), interleave=bool(false))[name=string("fyin")];')
 
     # --- GDN core, unrolled over the K live slots
@@ -312,7 +330,8 @@ def build_layer(w, ref):
         np.repeat(conn.dt.detach().float().numpy().reshape(HV, 1), DK, 1),
         conn.tail.norm_w.detach().float().numpy().reshape(HV, DV)], axis=0)
     hcn = np.concatenate([ref.attn.hc_n.detach().float().numpy().reshape(320, 32),
-                          ref.mlp.hc_n.detach().float().numpy().reshape(320, 32)], axis=0)
+                          ref.mlp.hc_n.detach().float().numpy().reshape(320, 32)],
+                         axis=0)
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         try:
@@ -329,8 +348,11 @@ def build_layer(w, ref):
             print("  MIL compile: " + (hit[-1] if hit else buf.getvalue()[-400:]))
         return None
     prog.input_elems = [HC_W * S, 3 * QKV * S, 3 * HV * DK, 640 * 32, HV * DV * DK]
+    cache_elems = S + 3 if FULL_CACHE_OUTPUT else K[0] + 3
+    prog.conv_out_width = 64 if cache_elems > 32 else 32
     prog.output_elems = ([HV * DV * DK] * K[0]
-                         + [H * S, H * S, HC_W * S, HC * S, QKV * 64])
+                         + [H * S, H * S, HC_W * S, HC * S,
+                            QKV * prog.conv_out_width])
     eng._ensure_io(prog)
     return prog, np.ascontiguousarray(param.astype(np.float16)), np.ascontiguousarray(hcn.astype(np.float16))
 
@@ -350,7 +372,8 @@ def main() -> None:
         np.repeat(conn.dt.detach().float().numpy().reshape(HV, 1), DK, 1),
         conn.tail.norm_w.detach().float().numpy().reshape(HV, DV)], axis=0)
     hcn = np.concatenate([ref.attn.hc_n.detach().float().numpy().reshape(320, 32),
-                          ref.mlp.hc_n.detach().float().numpy().reshape(320, 32)], axis=0)
+                          ref.mlp.hc_n.detach().float().numpy().reshape(320, 32)],
+                         axis=0)
 
     with torch.no_grad():
         r = ref(torch.from_numpy(x).reshape(1, HC_W, 1, S),

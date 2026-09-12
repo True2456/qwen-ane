@@ -57,7 +57,8 @@ class MilGdnLayer:
     matching the Core AI graph's contract so decode can swap between them.
     """
 
-    __slots__ = ("layer", "k", "_prog", "_param", "_hcn", "_conv", "_eng")
+    __slots__ = ("layer", "k", "_prog", "_param", "_hcn", "_conv", "_eng",
+                 "_conv_out_width", "_conv_surface_current")
 
     def __init__(self, layer: int, weights, ref_step, k: int = 1,
                  engine: AneEngine | None = None):
@@ -71,10 +72,18 @@ class MilGdnLayer:
             raise RuntimeError(f"MIL layer {layer} failed to compile")
         self.layer = int(layer)
         self._prog, self._param, self._hcn = built
+        self._conv_out_width = int(getattr(self._prog, "conv_out_width", 64))
+        # These immutable arrays are MIL inputs only because the frontend
+        # rejects their constant spelling.  Copy them to their IOSurfaces once.
+        for surf, val in zip(self._prog._in_surfs[2:4],
+                             (self._param, self._hcn)):
+            with _iosurface_view(surf, val.shape, np.float16) as dst:
+                np.copyto(dst, val)
         # Only column 0 of the conv cache is read (the three taps are stacked
         # on the channel axis), so the surface is written a column at a time
         # rather than 1.97 MB a layer.
         self._conv = np.zeros((3 * QKV,), np.float16)
+        self._conv_surface_current = False
         # The recurrent state lives in its input surface and never visits a
         # host array: it is 1.57 MB a layer, 56 MB a pass across 36 layers, and
         # staging it through NumPy copied that twice.
@@ -87,6 +96,7 @@ class MilGdnLayer:
         with _iosurface_view(self._prog._in_surfs[1], (3 * QKV, S),
                              np.float16) as dst:
             dst[:] = 0
+        self._conv_surface_current = True
         with _iosurface_view(self._prog._in_surfs[4], (HV, DV, DK),
                              np.float16) as dst:
             dst[:] = 0
@@ -100,11 +110,10 @@ class MilGdnLayer:
         p = self._prog
         with _iosurface_view(p._in_surfs[0], (HC_W, S), np.float16) as dst:
             np.copyto(dst, x)
-        with _iosurface_view(p._in_surfs[1], (3 * QKV, S), np.float16) as dst:
-            dst[:, 0] = self._conv
-        for surf, val in zip(p._in_surfs[2:], (self._param, self._hcn)):
-            with _iosurface_view(surf, val.shape, np.float16) as dst:
-                np.copyto(dst, val)
+        if not self._conv_surface_current:
+            with _iosurface_view(p._in_surfs[1], (3 * QKV, S), np.float16) as dst:
+                dst[:, 0] = self._conv
+            self._conv_surface_current = True
         if not self._eng.submit(p, procedure_index=0):
             raise RuntimeError(f"MIL layer {self.layer}: submit failed")
         # Surfaces bind alphabetically: q_state0 .. q_state{k-1}, then
@@ -146,9 +155,14 @@ class MilGdnLayer:
         with _iosurface_view(p._out_surfs[j], (HV, DV, DK), np.float16) as o:
             with _iosurface_view(p._in_surfs[4], (HV, DV, DK), np.float16) as d:
                 np.copyto(d, o)
-        with _iosurface_view(p._out_surfs[self.k + 4], (QKV, 64), np.float16) as o:
-            for t in range(3):
-                self._conv[t * QKV:(t + 1) * QKV] = o[:, j + 1 + t]
+        with _iosurface_view(p._out_surfs[self.k + 4],
+                             (QKV, self._conv_out_width), np.float16) as o:
+            with _iosurface_view(p._in_surfs[1], (3 * QKV, S), np.float16) as d:
+                for t in range(3):
+                    value = o[:, j + 1 + t]
+                    self._conv[t * QKV:(t + 1) * QKV] = value
+                    d[t * QKV:(t + 1) * QKV, 0] = value
+        self._conv_surface_current = True
 
 
 def build_layers(layer_indices, loader_fn, step_fn, engine=None):
