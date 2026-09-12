@@ -4203,24 +4203,35 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 prefill_steps = len(pf_ids) - 1
         t_decode = t_all
         if spec_k > 1:
-            # Serial prefix first, so the block loop starts from a real state.
-            # One token through the K-slot graph: the other slots are computed
-            # and thrown away, which is exactly what a one-token commit does.
+            # Walk the prompt through the same K-slot graphs, full width. A
+            # submit costs about 1.13 ms that does not depend on how many
+            # slots carry a token, so feeding one token at a time paid it once
+            # per token: 7.4 tok/s against 22 at K=4 and more at K=8. Every
+            # slot holds a real token here, so committing the last one adopts
+            # the whole chunk.
             if drafter is not None:
                 drafter.reset()
-            for input_step in range(prefill_steps):
+            _pf_at = 0
+            _pf_w = 1 if os.environ.get("FLASHNEXT_PREFILL_SERIAL") == "1" \
+                else spec_k
+            while _pf_at < prefill_steps:
+                n = min(_pf_w, prefill_steps - _pf_at)
+                chunk = pf_ids[_pf_at:_pf_at + n]
                 for i in mil_qsa:
                     spec_kv_base[i] = int(attn_state[i].offset)
-                _pre_hid, _ = _block_forward([pf_ids[input_step]])
-                _block_commit(0)
+                _pre_hid, _ = _block_forward(chunk)
+                _block_commit(n - 1)
                 # The drafter is conditioned on each position's hidden state
                 # paired with the token that actually follows it, so it has to
                 # walk the prompt too or it drafts from an empty cache.
-                if drafter is not None and input_step + 1 < len(pf_ids):
-                    drafter.advance(
-                        mx.array(np.ascontiguousarray(
-                            np.asarray(_pre_hid, np.float32))),
-                        [[pf_ids[input_step + 1]]])
+                if drafter is not None:
+                    nxt = pf_ids[_pf_at + 1:_pf_at + n + 1]
+                    if nxt:
+                        drafter.advance(
+                            mx.array(np.ascontiguousarray(
+                                np.asarray(_pre_hid, np.float32)[:, :len(nxt), :])),
+                            [list(nxt)])
+                _pf_at += n
             t_decode = time.perf_counter()
             if prefill_steps:
                 print(f"  serial prefix prefill: {prefill_steps} tokens in "
@@ -4545,6 +4556,13 @@ def main() -> None:
         help="generate: how many tokens of --ppl-file to score",
     )
     p.add_argument(
+        "--ppl-prefill",
+        type=int,
+        default=1,
+        help="generate: how many leading tokens to prefill before scoring, "
+             "so the prefill path itself can be scored",
+    )
+    p.add_argument(
         "--prompt-ids",
         default="760",
         help="generate: comma-separated prompt token ids (default 760 = The)",
@@ -4607,10 +4625,11 @@ def main() -> None:
             tk = Tokenizer.from_file(str(BASE / "tokenizer.json"))
             text = Path(args.ppl_file).read_text()
             all_ids = tk.encode(text, add_special_tokens=False).ids
-            all_ids = all_ids[:args.ppl_tokens + 1]
-            # The first token is the prompt; everything after it is scored.
-            ids = all_ids[:1]
-            ppl_ids = all_ids[1:]
+            pre = max(1, int(args.ppl_prefill))
+            all_ids = all_ids[:args.ppl_tokens + pre]
+            # The leading tokens are prefilled; everything after is scored.
+            ids = all_ids[:pre]
+            ppl_ids = all_ids[pre:]
             print(f"  ppl: {len(ppl_ids)} tokens from {args.ppl_file}")
             # Cache sizing follows max_new, and scoring walks the whole file.
             args.max_new = len(ppl_ids) + 8
