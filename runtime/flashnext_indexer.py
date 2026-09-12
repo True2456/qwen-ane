@@ -143,9 +143,22 @@ class QSAIndexer:
     #: attention; only the block keys are updated, for later decode steps.
     DENSE_PREFILL_L = 16
 
-    def update_and_select(self, x: np.ndarray, offset: int, state: IndexerState):
-        """Returns selected token indices, or None while the context fits the budget."""
-        q, k_raw = self._project(x)
+    def split_qk(self, qk: np.ndarray):
+        """Split an already-projected q|k block, as the ANE front program emits."""
+        qk = np.asarray(qk, np.float32).reshape(-1, self.qk.shape[0])
+        cut = self.n_heads * self.head_dim
+        return (qk[:, :cut].reshape(-1, self.n_heads, self.head_dim),
+                np.ascontiguousarray(qk[:, cut:].reshape(-1, self.head_dim)))
+
+    def update_and_select(self, x: np.ndarray, offset: int, state: IndexerState,
+                          projected=None):
+        """Returns selected token indices, or None while the context fits the budget.
+
+        `projected` is the (q, k) pair when the caller already has the
+        projection — the MIL front program computes it on the ANE, which is why
+        the host no longer runs the attention mixer for these layers.
+        """
+        q, k_raw = projected if projected is not None else self._project(x)
         L = k_raw.shape[0]
 
         if not state.covers_prefix:

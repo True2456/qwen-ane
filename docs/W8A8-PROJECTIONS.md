@@ -1060,3 +1060,54 @@ The QSA host mixer is the largest remaining piece of host work. It exists only
 because the indexer selects keys from the mixed state and has to run before the
 ANE call, while the ANE graph computes its own copy. Splitting the QSA layer
 into two programs would remove it at the cost of 12 more resident models.
+
+## The QSA layer split in two: 13.7 to 15.4 tok/s
+
+The largest remaining piece of host work was the attention mixer for the 12 QSA
+layers, 1.2 ms a layer and 14 ms a speculative pass. It existed only because
+the indexer selects this layer's keys from the mixed state and has to run
+before the layer's ANE call, while the ANE graph computed its own copy anyway.
+
+So the mixer moved into a small front program that also runs the indexer's
+`index_qk_proj`, and the big graph now takes `mixed` and `inj` as inputs
+instead of recomputing them. Total ANE work is about the same — the big graph
+loses 55 ops and 13 MB of weights, the front gains them — but the host does
+none of it and no longer needs the indexer's projection either.
+
+| | before | after |
+|---|---|---|
+| QSA, per block | 46.8 ms | **31.4 ms** |
+| host mixer | 14.1 | 5.5 (now the front submit) |
+| big graph, ANE | 15.9 | 13.2 |
+| **tok/s**, 32-token prompt | 13.7 | **15.4** |
+| **tok/s**, free prose | 11.1 | **12.3** |
+
+Output is unchanged and plain decode still matches BF16 greedy. Resident models
+go to 72 of the ~80 the ANE allows: 36 GDN, 12 QSA at two key rungs, 12 fronts.
+
+## Where this leaves the port
+
+From about 1 tok/s at the start of this work to **15.4 tok/s** on predictable
+text and **12.3** on free prose, with output matching BF16 greedy.
+
+Per speculative pass, now about 148 ms for 2.0-2.5 tokens:
+
+| | ms |
+|---|---|
+| 36 GDN layers, ANE | 70 |
+| 12 QSA layers (front + main + MoE) | 31 |
+| GDN MoE, GPU | 28 |
+| router, commit, head, embed | 16 |
+
+The 20-30 tok/s target is not reached and the remaining gap is structural. The
+pass is a strictly serial alternation of ANE and GPU work — every layer's MoE
+depends on that layer's ANE output and the next layer depends on the MoE — so
+neither engine can overlap the other. Closing it needs one of:
+
+* **the routed MoE on the ANE**, which would remove 28 ms and let layers fuse.
+  This is the blocked problem: Apple's compiler assigns GatherMM to the GPU and
+  rejects every fused form tried so far.
+* **a better drafter.** Tokens per pass is 2.46 on predictable text and 1.96 on
+  prose; the first draft is right 92% of the time and the second 40%. Tree
+  drafting would exploit the free block width, but the GDN recurrence is a
+  chain and cannot verify a branch.

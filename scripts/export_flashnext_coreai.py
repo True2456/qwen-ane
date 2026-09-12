@@ -3590,12 +3590,14 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             m = lay.rung_for(off + n)
             x_bc = (np.asarray(hidden, np.float32) if bc1s
                     else _bsh_to_bc1s(np.asarray(hidden, np.float32)))
-            mixed, _, _ = host_gated_residual_cached(x_bc, hl.attn)
+            xb = np.zeros((HC_W, seq), np.float16)
+            xb[:, :n] = np.asarray(x_bc[0, :, 0, :n], np.float16)
+            a_mixed, a_inj, a_qk = lay.front(xb, n)
             _t1 = time.perf_counter()
             tq["mix"] += _t1 - _t0
             sel = qsa_idx[i].update_and_select(
-                np.asarray(_bc1s_to_bsh(mixed), np.float32).reshape(-1, H),
-                off, qsa_idx_state[i])
+                None, off, qsa_idx_state[i],
+                projected=qsa_idx[i].split_qk(a_qk))
             keep = (np.asarray(sel, np.int64) if sel is not None
                     else np.arange(off, dtype=np.int64))
             keep = clip_to_budget(keep, off, m)
@@ -3613,13 +3615,13 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             sin_b = np.zeros((QSA_ROTARY // 2, seq), np.float16)
             cos_b[:, :n] = np.cos(pos).T.astype(np.float16)
             sin_b[:, :n] = np.sin(pos).T.astype(np.float16)
-            xb = np.zeros((HC_W, seq), np.float16)
-            xb[:, :n] = np.asarray(x_bc[0, :, 0, :n], np.float16)
             _t3 = time.perf_counter()
             tq["feed"] += _t3 - _t2
             m_mix, m_hyp, m_inj, m_sh, nk, nv = lay(
                 xb, np.asarray(ks, np.float16), np.asarray(vs, np.float16),
-                cos_b, sin_b, nsel, m, n=n)
+                cos_b, sin_b, nsel, m, n=n,
+                mixed=np.asarray(a_mixed, np.float16),
+                inj=np.asarray(a_inj, np.float16))
             _t4 = time.perf_counter()
             tq["ane"] += _t4 - _t3
             cache.keys[:, off:off + n] = nk.reshape(QSA_HKV, QSA_HD, n).transpose(0, 2, 1)

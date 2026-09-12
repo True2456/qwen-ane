@@ -50,6 +50,7 @@ S = SEQ_DEFAULT
 HALF = QSA_ROTARY // 2
 KVC = QSA_HKV * QSA_HD
 G = QSA_HQ // QSA_HKV
+IDX_W = 640
 
 
 class MilQsaLayer:
@@ -60,7 +61,7 @@ class MilQsaLayer:
     is enough, since the indexer caps selection at the budget anyway.
     """
 
-    __slots__ = ("layer", "k", "_progs", "_hcn", "_eng", "_bufs")
+    __slots__ = ("layer", "k", "_progs", "_hcn", "_eng", "_bufs", "_front")
 
     def __init__(self, layer: int, weights, ref, qsa, rungs, k: int = 1,
                  engine: AneEngine | None = None):
@@ -79,6 +80,9 @@ class MilQsaLayer:
             prog, hcn = QL.build_layer(weights, ref, qsa)
             self._progs[m] = prog
             self._hcn = hcn
+        # One hc_norm row serves both programs: the front slices the attn half
+        # and the big graph the mlp half.
+        self._front, _ = QL.build_front_layer(weights, ref)
         self._bufs = {
             m: {"k": np.zeros((KVC, m), np.float16),
                 "v": np.zeros((KVC, m), np.float16),
@@ -93,8 +97,27 @@ class MilQsaLayer:
     def rung_for(self, need: int) -> int:
         return next((m for m in self.rungs if m >= need), self.rungs[-1])
 
+    def front(self, x_bc1s, n: int):
+        """Attention mixer plus the indexer's projection, on the ANE.
+
+        Returns (mixed, inj, qk) over n slots. `mixed` and `inj` are handed
+        straight back to `__call__`, so nothing is computed twice.
+        """
+        p = self._front
+        x = np.asarray(x_bc1s, np.float16).reshape(HC_W, S)
+        for surf, val in zip(p._in_surfs, (x, self._hcn)):
+            with _iosurface_view(surf, val.shape, np.float16) as dst:
+                np.copyto(dst, val)
+        if not self._eng.submit(p, procedure_index=0):
+            raise RuntimeError(f"QSA MIL front {self.layer}: submit failed")
+        out = []
+        for idx, c in ((0, H), (1, HC), (2, IDX_W)):
+            with _iosurface_view(p._out_surfs[idx], (c, S), np.float16) as o:
+                out.append(np.array(o[:, :n], np.float32))
+        return out[0], out[1], out[2].T
+
     def __call__(self, x_bc1s, keys, values, cos, sin, nsel: int, m: int,
-                 n: int | None = None):
+                 n: int | None = None, mixed=None, inj=None):
         """x is (1, HC_W, 1, S); keys/values (KVC, nsel); cos/sin (HALF, S).
 
         `nsel` selected keys sit at the head of the window and this pass's own
@@ -118,8 +141,13 @@ class MilQsaLayer:
         for g in range(1, G):
             b["mask"][g * self.k:(g + 1) * self.k] = row
         x = np.ascontiguousarray(np.asarray(x_bc1s, np.float16).reshape(HC_W, S))
+        mx_ = np.zeros((H, S), np.float16)
+        ij_ = np.zeros((HC, S), np.float16)
+        mx_[:, :w] = mixed
+        ij_[:, :w] = inj
         for surf, val in zip(prog._in_surfs, (x, cos, sin, self._hcn,
-                                              b["k"], b["v"], b["mask"])):
+                                              b["k"], b["v"], b["mask"],
+                                              mx_, ij_)):
             with _iosurface_view(surf, val.shape, np.float16) as dst:
                 np.copyto(dst, val)
         if not self._eng.submit(prog, procedure_index=0):

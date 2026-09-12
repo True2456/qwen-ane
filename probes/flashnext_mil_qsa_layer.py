@@ -110,16 +110,16 @@ def build_mil(offs):
     _em('tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];')
     _em('int32 gr = const()[name=string("gr"), val=int32(1)];')
     _em(f'tensor<int32, [4]> hs = const()[name=string("hs"), val=tensor<int32, [4]>([1,{HC_W},1,1])];')
-    _sl4("hca", "d_hcn", (0, 0, 0, 0), (1, 320, 1, 32), (1, 320, 1, 32))
     _sl4("hcm", "d_hcn", (0, 320, 0, 0), (1, 640, 1, 32), (1, 320, 1, 32))
-    _em(f'tensor<fp16, [1, {HC_W}, 1, 1]> hcnA = reshape(x=hca, shape=hs)[name=string("hcnA")];')
     _em(f'tensor<fp16, [1, {HC_W}, 1, 1]> hcnM = reshape(x=hcm, shape=hs)[name=string("hcnM")];')
-
-    ML.mixer("A", "a_x", "hcnA", offs["attn"], "amixed", "ainj")
+    # The attention mixer runs in the front program, whose output the indexer
+    # also needs; taking it as an input keeps the total ANE work the same and
+    # removes 13 MB of weights from this graph.
+    amixed, ainj = "h_mixed", "i_inj"
 
     # --- QSA core over the K live slots
     kt_ = KTOK[0]
-    _sl4("h0", "amixed", (0, 0, 0, 0), (1, H, 1, kt_), (1, H, 1, kt_))
+    _sl4("h0", amixed, (0, 0, 0, 0), (1, H, 1, kt_), (1, H, 1, kt_))
     _proj("WQ", offs, "q", H, QW, ("h0", kt_), "qflat")
     _proj("WG", offs, "g", H, QW, ("h0", kt_), "gflat")
     _proj("WK", offs, "k", H, KVC, ("h0", kt_), "kp")
@@ -188,7 +188,7 @@ def build_mil(offs):
     _proj("WO", offs, "o", QW, H, ("ox", S), "attn")
 
     for i in range(HC):
-        _sl4(f"ij{i}", "ainj", (0, i, 0, 0), (1, i + 1, 1, S), (1, 1, 1, S))
+        _sl4(f"ij{i}", ainj, (0, i, 0, 0), (1, i + 1, 1, S), (1, 1, 1, S))
         _em(f'tensor<fp16, [1, {H}, 1, {S}]> rc{i} = mul(x=attn, y=ij{i})[name=string("rc{i}")];')
     _em(f'tensor<fp16, [1, {HC_W}, 1, {S}]> rcat = concat(values=(rc0, rc1, rc2, rc3), axis=int32(1), interleave=bool(false))[name=string("rcat")];')
     _em(f'tensor<fp16, [1, {HC_W}, 1, {S}]> w_hyper = add(x=a_x, y=rcat)[name=string("w_hyper")];')
@@ -215,7 +215,9 @@ def build_mil(offs):
             f"tensor<fp16, [1, 640, 1, 32]> d_hcn, "
             f"tensor<fp16, [1, {KVC}, 1, {M}]> e_kc, "
             f"tensor<fp16, [1, {KVC}, 1, {M}]> f_vc, "
-            f"tensor<fp16, [1, 1, {G * KTOK[0]}, {KV}]> g_mask) {{\n"
+            f"tensor<fp16, [1, 1, {G * KTOK[0]}, {KV}]> g_mask, "
+            f"tensor<fp16, [1, {H}, 1, {S}]> h_mixed, "
+            f"tensor<fp16, [1, {HC}, 1, {S}]> i_inj) {{\n"
             + "\n".join(ML.B) +
             f"\n  }} -> (t_newk, u_shared, v_mixed, w_hyper, x_inj, y_newv);\n}}\n")
 
@@ -242,7 +244,7 @@ def build_layer(w, ref, qsa):
     _pack_proj(dp, sp, offs, "o", qsa.o_proj.op.weight.detach().numpy(), H, QW)
     offs["qn"] = dp.append(qsa.q_norm.detach().float().numpy().reshape(1, 1, 1, QSA_HD).astype(np.float16).tobytes()) + 64
     offs["kn"] = dp.append(qsa.k_norm.detach().float().numpy().reshape(1, 1, 1, QSA_HD).astype(np.float16).tobytes()) + 64
-    for key, mod in (("attn", ref.attn), ("mlp", ref.mlp)):
+    for key, mod in (("mlp", ref.mlp),):
         d = {}
         for nm, m2, co, ci in (("down", mod.down, MIX_H, HC_W), ("up", mod.up, HC_W, MIX_H),
                                ("inj", mod.inj, HC, HC_W)):
@@ -279,10 +281,89 @@ def build_layer(w, ref, qsa):
         raise RuntimeError(f"QSA MIL layer {LAYER[0]} failed: {(hit[-1] if hit else '')[:200]}")
     M = KVM[0]
     prog.input_elems = [HC_W * S, HALF * S, HALF * S, 640 * 32,
-                        KVC * M, KVC * M, G * KTOK[0] * (M + S)]
+                        KVC * M, KVC * M, G * KTOK[0] * (M + S),
+                        H * S, HC * S]
     prog.output_elems = [KVC * S, H * S, H * S, HC_W * S, HC * S, KVC * S]
     if not eng._ensure_io(prog):
         raise RuntimeError("QSA MIL: IO alloc failed")
+    return prog, np.ascontiguousarray(hcn.astype(np.float16))
+
+
+# --- the front program: attn mixer + the indexer's projection -----------------
+#
+# The indexer picks this layer's keys from the mixed state, and that has to
+# happen before the layer's own ANE call, so the host used to recompute the
+# mixer in fp32 NumPy: 1.2 ms a layer, 14 ms a speculative pass, on top of the
+# copy the big graph already computes internally. Splitting the mixer into its
+# own program moves that work to the ANE and lets the big graph take `mixed`
+# as an input instead of recomputing it, so the total ANE work barely changes.
+#
+# Outputs (alphabetical): x_mixed [1, H, 1, S], y_inj [1, HC, 1, S],
+# z_qk [1, IDX_W, 1, S] — the indexer's raw q|k, which the host then norms,
+# RoPEs and pools exactly as before.
+
+IDX_W = 640          # (indexer_n_heads + indexer_kv_heads) * indexer_head_dim
+
+
+def build_front(offs):
+    ML.B.clear()
+    _em('tensor<bool, [4]> mm = const()[name=string("mm"), val=tensor<bool, [4]>([false,false,false,false])];')
+    for c, v in (("eps", 0.000001), ("ivh", 0.25), ("hlf", 0.5), ("two", 2.0),
+                 ("mh", -0.5)):
+        _em(f'fp16 {c} = const()[name=string("{c}"), val=fp16({v})];')
+    _em('tensor<int32, [1]> ac = const()[name=string("ac"), val=tensor<int32, [1]>([1])];')
+    _em('bool kd = const()[name=string("kd"), val=bool(true)];')
+    _em('string pt = const()[name=string("pt"), val=string("valid")];')
+    _em('tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];')
+    _em('tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];')
+    _em('tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];')
+    _em('int32 gr = const()[name=string("gr"), val=int32(1)];')
+    _em(f'tensor<int32, [4]> hs = const()[name=string("hs"), val=tensor<int32, [4]>([1,{HC_W},1,1])];')
+    _sl4("hca", "b_hcn", (0, 0, 0, 0), (1, 320, 1, 32), (1, 320, 1, 32))
+    _em(f'tensor<fp16, [1, {HC_W}, 1, 1]> hcnA = reshape(x=hca, shape=hs)[name=string("hcnA")];')
+    ML.mixer("A", "a_x", "hcnA", offs["attn"], "x_mixed", "y_inj")
+    _em(f'tensor<fp16, [{IDX_W}, {H}, 1, 1]> WX = const()[name=string("WX"), val=tensor<fp16, [{IDX_W}, {H}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/weight_data.bin"), offset=uint64({offs["idx"]})))];')
+    _em(f'tensor<fp16, [1, {IDX_W}, 1, {S}]> z_qk = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=WX, x=x_mixed)[name=string("z_qk")];')
+    return (f"program(1.3)\n{E._BUILD_INFO}\n{{\n"
+            f"  func main<ios18>(tensor<fp16, [1, {HC_W}, 1, {S}]> a_x, "
+            f"tensor<fp16, [1, 640, 1, 32]> b_hcn) {{\n"
+            + "\n".join(ML.B) +
+            f"\n  }} -> (x_mixed, y_inj, z_qk);\n}}\n")
+
+
+def build_front_layer(w, ref):
+    dp, sp = E._BlobPacker(), E._BlobPacker()
+    offs = {}
+    d = {}
+    for nm, m2, co, ci in (("down", ref.attn.down, MIX_H, HC_W),
+                           ("up", ref.attn.up, HC_W, MIX_H),
+                           ("inj", ref.attn.inj, HC, HC_W)):
+        wt = m2.op.weight.detach().float().numpy().reshape(co, ci, 1, 1)
+        d[nm] = dp.append(wt.astype(np.float16).tobytes()) + 64
+    offs["attn"] = d
+    qk = np.ascontiguousarray(
+        np.asarray(w["self_attn.indexer.index_qk_proj.weight"], np.float32))
+    offs["idx"] = dp.append(
+        qk.reshape(IDX_W, H, 1, 1).astype(np.float16).tobytes()) + 64
+    hcn = np.concatenate([ref.attn.hc_n.detach().float().numpy().reshape(320, 32),
+                          np.zeros((320, 32), np.float32)], axis=0)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        try:
+            prog = eng.compile_multiproc(build_front(offs),
+                                         {"weight_data.bin": dp.getvalue()},
+                                         HC_W, H, S,
+                                         raw_weight_files=frozenset({"weight_data.bin"}))
+        except Exception as exc:  # noqa: BLE001
+            prog = None
+            buf.write(str(exc))
+    if prog is None:
+        hit = [l for l in buf.getvalue().splitlines() if "rror" in l or "nvalid" in l]
+        raise RuntimeError(f"QSA front {LAYER[0]} failed: {(hit[-1] if hit else '')[:200]}")
+    prog.input_elems = [HC_W * S, 640 * 32]
+    prog.output_elems = [H * S, HC * S, IDX_W * S]
+    if not eng._ensure_io(prog):
+        raise RuntimeError("QSA front: IO alloc failed")
     return prog, np.ascontiguousarray(hcn.astype(np.float16))
 
 
