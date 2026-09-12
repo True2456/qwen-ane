@@ -220,3 +220,45 @@ Chunked GDN prefill on the ANE is completely validated, strictly conforms to all
 - Zero regression in perplexity ($6.5865 \to 6.5943$, well within the 6.58 gate).
 
 The chunked implementation is enabled by default for all `single_state=True` prefill graphs (`MIL_GDN_CHUNK=1` default), while decode graphs continue to use the prefix unroll required for speculative verification.
+
+## Independent verification
+
+Re-run on a clean machine with no other process holding ANE resources, which
+matters: the `no ANE resources` failure in the negative results above also
+explains a wide-graph build that failed at layer 20 here earlier, right after
+two runs had been killed by a full disk.
+
+**Prefill, alternating, 511 tokens.** Chunked 59.7 and 65.2 tok/s against 53.4
+recurrent, with the GDN term at 6.10 and 6.17 ms a token against 9.15. The
+document claims 9.00 to 6.17, a 31% cut; measured here it is 33%. End to end
+the claim is +13.2% and the two runs here average +17%, the spread coming from
+the host router, which wandered between 0.88 and 2.80 ms a token across runs.
+
+**Perplexity is digit-identical to the report**: 1.886208 / 6.5943 chunked and
+1.885022 / 6.5865 recurrent, scoring 1024 tokens after a 512-token prefill.
+
+**Correctness band**, `probes/mil_k_check.py` with the single-state graphs:
+
+| | mixed | final state | conv |
+| --- | --- | --- | --- |
+| chunked, K=8 | 0.0264-0.0322 | 0.00529 | 0.01171 |
+| chunked, K=32 | 0.0263-0.0340 | 0.00726 | 0.01129 |
+| recurrent, K=8 | 0.0266-0.0321 | 0.00505 | 0.01171 |
+| recurrent, K=32 | 0.0263-0.0344 | 0.00652 | 0.01129 |
+
+Inside the gate at every width. The chunked state error is a little higher at
+K=32, 0.00726 against 0.00652, which is the fp16 triangular inversion and is
+well under the 0.01 bound.
+
+**Decode is untouched.** Chunking only applies to the single-state graphs, so
+a decode run emits the same 64 token ids as before at 20.9 tok/s.
+
+## What is left in this term
+
+The per-token recurrence measured 5.2 ms a token across 36 layers before this
+change. It recovered 2.83 of that, so the chunk math now costs the other half
+— the triangular inversion, the decay scan and the 32x32 matmuls. A cheaper
+inversion is worth roughly another 10 tok/s on prefill.
+
+Note also that none of this is on by default: `FLASHNEXT_PREFILL_MIL_K` is
+still 0, so the wide graphs that carry the chunked path are opt-in.
