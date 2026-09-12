@@ -4323,6 +4323,10 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 print("    prefill ms/token  " + "  ".join(
                     f"{k2}={v2 * 1e3 / prefill_steps:.2f}"
                     for k2, v2 in spec_ms.items() if v2), flush=True)
+                from runtime.mil_gdn_backend import TIMERS as _GT
+                print("    prefill gdn call ms/token  " + "  ".join(
+                    f"{k2}={v2 * 1e3 / prefill_steps:.2f}"
+                    for k2, v2 in _GT.items()), flush=True)
                 print("    prefill qsa ms/token  " + "  ".join(
                     f"{k2}={v2 * 1e3 / prefill_steps:.2f}"
                     for k2, v2 in mil_qsa_ms.items() if v2), flush=True)

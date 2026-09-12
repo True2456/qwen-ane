@@ -121,3 +121,47 @@ plans around it.
 Prefill across this whole sequence: 7.4, then 25.6 filling every slot, 40 at
 K=8, 58 with a second graph set, 65 with the chunked delta rule, and 82 with
 both unrolls in one program.
+
+## Where prefill stands at 83 tok/s
+
+Per token, k=32, on a 511-token prompt. Total 11.98 ms.
+
+| | ms a token |
+| --- | --- |
+| GDN submit | 4.33 |
+| QSA (1.45 ANE, 1.11 experts, 0.32 mixer) | 3.09 |
+| routed experts after a GDN layer | 2.81 |
+| router | 0.49 |
+| recombine, head, commit, embed, staging | 1.26 |
+
+Splitting the GDN call settles where its time goes: writing the input surface
+is 0.06 ms a token and reading the four outputs back is 0.11, so the remaining
+4.33 is the evaluate. There is no host slack left in that path.
+
+Roughly half the pass is ANE submits and a third is the experts on the GPU.
+
+Three things worth trying next, in order.
+
+**QSA still builds two programs.** The GDN layers share one program between the
+two unrolls; QSA does not, so its weights are resident twice. Doing the same
+for QSA should pay what it paid for GDN, which was 23% off the submit, plus
+the memory.
+
+**The experts cost 3.92 ms a token across both layer types.** The resident bank
+is close to flat in the token count, so most of that is per-call: 48 host to
+device copies, evaluates and syncs a chunk. Keeping the hidden state on the GPU
+across route, experts, shared and recombine instead of returning to NumPy each
+layer is the obvious thing to try.
+
+**The submit is slower in the run than on the bench.** One layer's chunked k=32
+submit is 2.37 ms in isolation and 3.85 ms a layer inside the pass. That gap
+across 36 different layers is weight residency, not host code, and halving the
+resident weights already bought 23% once.
+
+### Ruled out: overlapping the experts with the ANE
+
+The wavefront that lost at decode widths also loses here, and now for a
+measured reason. Chunked submits cost 1.979 ms at k=16 and 2.367 at k=32,
+because the chunk arithmetic is fixed at 32x32 whatever the token count. So
+splitting a chunk in half to overlap costs 1.59 ms a layer and hides about
+1.25 ms of experts. It would need a chunk width that actually scales first.

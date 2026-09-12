@@ -33,6 +33,8 @@ import io
 import sys
 from pathlib import Path
 
+import time
+
 import numpy as np
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -48,6 +50,9 @@ from export_flashnext_coreai import (  # noqa: E402
 )
 
 S = SEQ_DEFAULT
+
+#: Where a GDN call's wall time goes, for the prefill breakdown.
+TIMERS = {"write": 0.0, "submit": 0.0, "take": 0.0}
 
 
 class MilGdnLayer:
@@ -136,6 +141,7 @@ class MilGdnLayer:
 
         The recurrent state and conv cache advance in place, as `pure_step` does.
         """
+        _t0 = time.perf_counter()
         x = np.asarray(x_bc1s, np.float16).reshape(HC_W, S)
         p = self._prog
         with _iosurface_view(p._in_surfs[0], (HC_W, S), np.float16) as dst:
@@ -144,8 +150,12 @@ class MilGdnLayer:
             with _iosurface_view(p._in_surfs[1], (3 * QKV, S), np.float16) as dst:
                 dst[:, 0] = self._conv
             self._conv_surface_current = True
+        _t = time.perf_counter()
+        TIMERS["write"] += _t - _t0
         if not self._eng.submit(p, procedure_index=self._proc):
             raise RuntimeError(f"MIL layer {self.layer}: submit failed")
+        _t2 = time.perf_counter()
+        TIMERS["submit"] += _t2 - _t
         # Surfaces bind alphabetically: q_state0 .. q_state{k-1}, then
         # u_shared, v_mixed, w_hyper, x_inj, y_conv.
         kk = self.k
@@ -159,6 +169,7 @@ class MilGdnLayer:
             with _iosurface_view(p._out_surfs[self._ob + j], shape, np.float16) as o:
                 out.append(np.array(o[:, :w], np.float32).reshape(1, shape[0], 1, w))
         shared, mixed, hyper, inj = out
+        TIMERS["take"] += time.perf_counter() - _t2
         return mixed, hyper, inj, shared
 
     def state_at(self, j: int) -> np.ndarray:
