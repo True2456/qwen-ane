@@ -15,11 +15,13 @@ def chunk(q, k, v, gates, beta, state):
             decay[..., i, j] = decay[..., i, j+1] * gates[..., j+1]
     gamma = np.cumprod(gates, axis=-1)[...,None]
     a = np.tril((k @ k.swapaxes(-1,-2)) * decay * beta[...,None], -1)
-    power = -a
-    inv = np.eye(c, dtype=q.dtype) + power
-    for _ in range(1,(c-1).bit_length()):
-        power = power @ power
-        inv = inv + power @ inv
+    inv = np.broadcast_to(np.eye(c, dtype=q.dtype), a.shape).copy()
+    row, col = np.arange(c)[:,None], np.arange(c)[None,:]
+    for stage in range((c-1).bit_length()):
+        half = 1 << stage
+        cross_mask = ((row//(2*half) == col//(2*half)) &
+                      ((row//half)%2 == 1) & ((col//half)%2 == 0))
+        inv = inv - (inv @ (a * cross_mask)) @ inv
     delta = inv @ (beta[...,None] * (v - gamma * (k @ state.swapaxes(-1,-2))))
     y = gamma * (q @ state.swapaxes(-1,-2)) + ((q @ k.swapaxes(-1,-2)) * decay) @ delta
     final = gamma[...,-1:, :] * state + delta.swapaxes(-1,-2) @ (k * decay[...,-1,:,None])

@@ -24,14 +24,23 @@ solve and output. State is only updated at the chunk boundary. There are
 three fixed initial-state consumers, independent of token count; this is not
 a claim that the compiler physically reads the state exactly once.
 
-The inverse uses a finite geometric series: P=-A, R=I+P; repeatedly P=P²,
-R=R+P R. For C=32 this is four pairs of matmuls after initialization (eight
-matmuls), not a claimed five total matmuls. It covers degree 31 exactly in
-real arithmetic because A is strictly lower triangular. Decay and prefix
-products use a five-level product scan, avoiding reciprocal underflow and
-log(0). Matrix work is padded to C=32 for smaller live chunks; neutral tokens
-have gate 1, beta 0, and Q/K/V 0. I/O widths remain 32/64/128 and state output
-names are zero padded. Existing normalization reduces the 128-element axis.
+The inverse doubles independent diagonal blocks. At each stage, a mask selects
+A21 for every diagonal block; with the current block-diagonal inverse R, the
+correction is R A21 R and the next inverse is R minus that correction. The
+first 2x2 stage is I-A21, then four stages of two 32x32 matmuls produce the
+32x32 inverse (eight matmuls total). All blocks at a stage are batched by masks
+in one fixed-size tensor. This is a stable blocked triangular inverse; it
+avoids large alternating powers for correlated keys.
+
+Decay and prefix products use a five-level product scan, avoiding reciprocal
+underflow and log(0). Matrix work is padded to C=32 for smaller live chunks;
+neutral tokens have gate 1, beta 0, and Q/K/V 0. I/O widths remain 32/64/128
+and state output names are zero padded. Existing normalization reduces the
+128-element axis. Query scaling by 64 is undone before output normalization;
+`MIL_GDN_CHUNK_Q_SCALE=1` reproduces the failed unscaled experiment.
+
+The independent NumPy test checks nonzero initial states, gate 0/1/tiny,
+all five required widths, and correlated-key fp16 cases.
 
 ## Baseline measurements
 
@@ -49,6 +58,14 @@ controlled paired measurements are still required.
 |32|0.0344|0.00652|0.01129|5.847|5.745|
 
 ## Negative results and fixes so far
+
+- The first inverse used the finite geometric series of -A, with repeated
+  squaring. It passed the random layer check but failed correlated-key fp16
+  arithmetic: at C=32, identical unit keys and gates 1, inverse relative error
+  was 0.0048232 for beta=.25, 0.887908 for beta=.5, and NaN for beta=1.
+  Blocked inversion gives 0.00001505, 0.00000001367, and 0 respectively on
+  the same matrices. `MIL_GDN_CHUNK_INVERSE=series` preserves that rejected
+  implementation for reproduction; it is not the default inverse.
 
 - Raw, unscaled chunk matmuls at K=32: mixed 0.0583–0.1038 (FAIL), state
   0.00731, conv 0.01129, 2.375 ms/layer (25 repeats, uncontrolled timing).
@@ -73,6 +90,11 @@ controlled paired measurements are still required.
 
 ## Validation still pending
 
-All-width final chunk checks, isolated slope, full-model quality against
+All-width final blocked-inverse checks, isolated slope, full-model quality against
 6.58 ±0.01, MLX reference on the identical scored interval, and end-to-end
 511-token prefill with breakdown. No production default has been changed.
+
+The first successful isolated baseline full-model run loaded every wide MIL
+graph and scored 1024 targets after a 512-token prompt: **PPL 6.5865, NLL
+1.885022**. The requested 6.58-scale target matches the executable's perplexity
+metric, not its log likelihood / NLL. Both metrics will be reported.

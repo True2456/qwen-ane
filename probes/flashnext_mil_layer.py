@@ -348,6 +348,13 @@ def build_layer(w, ref):
                            ("strict", np.tril(np.ones((c,c)), -1)),
                            ("eye", np.eye(c))):
             offs["chunk_" + name] = sp.append(mask.astype(np.float16).tobytes()) + 64
+        if os.environ.get("MIL_GDN_CHUNK_INVERSE", "blocked") != "series":
+            row, col = np.arange(c)[:, None], np.arange(c)[None, :]
+            for stage in range(5):
+                half = 1 << stage
+                mask = ((row // (2*half) == col // (2*half)) &
+                        ((row // half) % 2 == 1) & ((col // half) % 2 == 0))
+                offs[f"chunk_block{stage}"] = sp.append(mask.astype(np.float16).tobytes()) + 64
     files = {"weight_data.bin": dp.getvalue(), "weight_scale.bin": sp.getvalue()}
     param = np.concatenate([
         np.repeat(conn.gamma.detach().float().numpy().reshape(HV, 1), DK, 1),

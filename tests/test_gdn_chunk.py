@@ -32,4 +32,21 @@ class ChunkTests(unittest.TestCase):
                 np.testing.assert_allclose(y,np.stack(ys,1),atol=2e-14,rtol=2e-12)
                 np.testing.assert_allclose(final,ref,atol=2e-14,rtol=2e-12)
 
+    def test_correlated_keys_fp16(self):
+        # Large alternating powers in a Neumann inverse lose precision here.
+        rng = np.random.default_rng(29)
+        q = np.full((1,32,16), .25, np.float16)
+        k = q.copy()
+        v = rng.normal(size=q.shape).astype(np.float16)
+        g = np.ones((1,32), np.float16)
+        state = rng.normal(size=(1,16,16)).astype(np.float16)
+        for strength in [.25,.5,1.]:
+            beta = np.full(g.shape,strength,np.float16)
+            y,final = chunk(q,k,v,g,beta,state)
+            ry,rs = chunk(*[a.astype(np.float64) for a in (q,k,v,g,beta,state)])
+            self.assertTrue(np.isfinite(y).all() and np.isfinite(final).all())
+            self.assertLess(np.linalg.norm(y-ry)/np.linalg.norm(ry),.005)
+            self.assertLess(np.linalg.norm(final-rs)/np.linalg.norm(rs),.005)
+
+
 if __name__=='__main__': unittest.main()

@@ -11,6 +11,7 @@ layer, and fp16 mixers.
 """
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -38,21 +39,32 @@ WINDOW = 256
 
 
 def main() -> int:
-    path = Path(sys.argv[1])
-    want = int(sys.argv[2]) if len(sys.argv) > 2 else 2048
+    parser = argparse.ArgumentParser()
+    parser.add_argument("file", type=Path)
+    parser.add_argument("tokens", type=int, nargs="?", default=2048)
+    parser.add_argument("--prefill", type=int, default=1,
+                        help="leading prompt length; score the following tokens")
+    args = parser.parse_args()
+    path, want = args.file, args.tokens
+    prefill = max(1, args.prefill)
     t0 = time.perf_counter()
     model, tokenizer = load(MODEL)
     print(f"loaded in {time.perf_counter() - t0:.1f}s  "
           f"active {mx.get_active_memory() / 1e9:.1f} GB", flush=True)
 
-    ids = tokenizer.encode(path.read_text(), add_special_tokens=False)[:want + 1]
-    print(f"scoring {len(ids) - 1} tokens of {path}", flush=True)
+    ids = tokenizer.encode(path.read_text(), add_special_tokens=False)[:want + prefill]
+    print(f"scoring {len(ids) - prefill} tokens of {path} after {prefill} prompt tokens", flush=True)
 
     total = 0.0
     n = 0
     cache = make_prompt_cache(model)
     t0 = time.perf_counter()
-    for lo in range(0, len(ids) - 1, WINDOW):
+    # Cache all but the last prompt token; its logits score the first target.
+    for lo in range(0, prefill - 1, WINDOW):
+        warm = model(mx.array([ids[lo:min(lo + WINDOW, prefill - 1)]]), cache=cache)
+        mx.eval(warm)
+        del warm
+    for lo in range(prefill - 1, len(ids) - 1, WINDOW):
         chunk = ids[lo:lo + WINDOW + 1]
         if len(chunk) < 2:
             break
