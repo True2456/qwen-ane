@@ -1,0 +1,47 @@
+"""Quantized lm_head on the GPU.
+
+The host path reads a 2.54 GB fp32 copy of `lm_head.weight` per token (~13 ms).
+The MLX 4-bit checkpoint stores this head 8-bit in 0.68 GB, and
+`mx.quantized_matmul` plus the numpy round trip costs 1.65 ms. It is also the
+head the MLX reference decode actually uses, so logits move toward that
+reference rather than away from it.
+"""
+from __future__ import annotations
+
+import os
+
+import numpy as np
+import mlx.core as mx
+
+from runtime.expert_bank import MlxSafe, MLX4_DEFAULT
+
+
+class QuantizedHead:
+    def __init__(self, path=MLX4_DEFAULT, key: str = "lm_head"):
+        source = MlxSafe(os.environ.get("FLASHNEXT_MLX4") or path)
+        try:
+            self.w = mx.array(source.raw(f"{key}.weight"))
+            scales = source.f32(f"{key}.scales")
+            self.scales = mx.array(scales).astype(mx.float16)
+            self.biases = mx.array(source.f32(f"{key}.biases")).astype(mx.float16)
+        finally:
+            source.close()
+        # uint32 packing: columns * (32 / bits) elements per row.
+        for bits in (8, 4, 6, 2):
+            if (self.w.shape[-1] * (32 // bits)) % scales.shape[-1] == 0:
+                group = (self.w.shape[-1] * (32 // bits)) // scales.shape[-1]
+                if group in (32, 64, 128):
+                    self.bits, self.group_size = bits, group
+                    break
+        else:
+            raise ValueError(f"cannot infer lm_head packing from {self.w.shape} / {scales.shape}")
+        mx.eval(self.w, self.scales, self.biases)
+        self.nbytes = self.w.nbytes + self.scales.nbytes + self.biases.nbytes
+
+    def __call__(self, hidden: np.ndarray) -> np.ndarray:
+        x = mx.array(np.ascontiguousarray(hidden, np.float32))
+        x = x.astype(mx.float16).reshape(1, -1)
+        y = mx.quantized_matmul(x, self.w, self.scales, self.biases, transpose=True,
+                                group_size=self.group_size, bits=self.bits)
+        mx.eval(y)
+        return np.array(y.astype(mx.float32)).ravel()

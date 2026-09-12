@@ -69,6 +69,32 @@ def _sel(name: str) -> ctypes.c_void_p:
     return _objc.sel_registerName(name.encode())
 
 
+_MSGSEND_ADDR = ctypes.cast(_objc.objc_msgSend, ctypes.c_void_p).value
+
+
+def _objc_call(restype, argtypes, obj, sel_name, *args):
+    """objc_msgSend with a fresh prototype (does not share ``_msg`` argtypes).
+
+    ``_msg`` writes ``_objc.objc_msgSend.argtypes``. A later
+    ``CFUNCTYPE(...)(("objc_msgSend", _objc))`` reuses that prototype, so a
+    leftover ``POINTER`` type makes the next integer argument raise
+    ``expected LP_c_void_p instance instead of int``. Binding the function
+    address avoids that.
+    """
+    proto = ctypes.CFUNCTYPE(
+        restype, ctypes.c_void_p, ctypes.c_void_p, *tuple(argtypes)
+    )
+    return proto(_MSGSEND_ADDR)(obj, _sel(sel_name), *args)
+
+
+def _as_void_p(p) -> ctypes.c_void_p:
+    if p is None:
+        return ctypes.c_void_p(0)
+    if isinstance(p, ctypes.c_void_p):
+        return p
+    return ctypes.c_void_p(int(p))
+
+
 def _cls(name: str) -> ctypes.c_void_p:
     return _objc.objc_getClass(name.encode())
 
@@ -329,18 +355,20 @@ def _indexset_to_nsarray(idxset) -> ctypes.c_void_p:
     """
     if not idxset:
         return None
-    count = _msg(idxset, "count", restype=ctypes.c_ulonglong)
+    count = _objc_call(ctypes.c_ulonglong, (), idxset, "count")
     if not count:
         return None
-    Step = ctypes.CFUNCTYPE(ctypes.c_ulonglong, ctypes.c_void_p,
-                            ctypes.c_void_p, ctypes.c_ulonglong)
-    next_sel = _sel("indexGreaterThanIndex:")
-    step = Step(("objc_msgSend", _objc))
-    cur = _msg(idxset, "firstIndex", restype=ctypes.c_ulonglong)
+    cur = _objc_call(ctypes.c_ulonglong, (), idxset, "firstIndex")
     out = []
     for _ in range(int(count)):
         out.append(_nsnumber_int(int(cur)))
-        cur = step(idxset, next_sel, cur)
+        cur = _objc_call(
+            ctypes.c_ulonglong,
+            [ctypes.c_ulonglong],
+            idxset,
+            "indexGreaterThanIndex:",
+            cur,
+        )
     return _nsarray(out)
 
 
@@ -363,12 +391,74 @@ def _make_blob(data: bytes) -> bytes:
 
     MIL ``offset=uint64(64)`` lands on the DEADBEEF sub-header; the 0x80
     field tells ANECCompile where the tensor bytes start.
+
+    NOTE: the byte-80 field is FILE-ABSOLUTE, so the hardcoded 0x80 is only
+    correct for a blob that sits at file offset 0 — i.e. one tensor per file.
+    Do NOT concatenate these chunks by hand; use ``_BlobPacker``, which
+    relocates the pointer per chunk.
     """
     header = bytearray(128)
     struct.pack_into("<II", header, 0, 1, 2)
     struct.pack_into("<IIII", header, 64, 0xDEADBEEF, 1, len(data), 0)
     struct.pack_into("<I", header, 80, 0x80)
     return bytes(header) + data
+
+
+class _BlobPacker:
+    """Accumulate several milinternal tensors into one packed weight file.
+
+    ``_make_blob`` alone cannot be concatenated: its payload pointer at header
+    byte 80 is a FILE-ABSOLUTE offset hardcoded to 0x80, so every chunk past
+    the first would claim its payload lives at file offset 128 — chunk 0's
+    payload. Everything then silently reads the FIRST tensor. This rewrites
+    that field to each chunk's own absolute payload offset, which is the same
+    spelling ``tools/pure_ane.py``'s ``append_blob`` uses and the layout
+    ``probes/ane_blob_header_recover.py`` measured as correct.
+
+    The other load-bearing fields already come from ``_make_blob``: uint32
+    1 / uint32 2 at file bytes 0 and 4 (without them every const is rejected
+    with ``InvalidMILProgram``), 0xDEADBEEF at chunk byte 0, and the payload
+    SIZE at chunk byte 8 — the size is specifically required by
+    ``constexpr_blockwise_shift_scale``, i.e. by any per-output-channel
+    dequant, and omitting it gives ``_ANECompiler Code=1``.
+
+    ``append`` returns the chunk's START offset. The MIL ``BLOBFILE`` offset
+    is that plus 64, since it must point at the DEADBEEF header rather than at
+    the repeated file header. Chunks are padded to 64 bytes so a tensor whose
+    payload is not a multiple of 64 (a per-channel scale, say) cannot push the
+    next chunk header off alignment.
+    """
+
+    __slots__ = ("_parts", "_size")
+
+    def __init__(self) -> None:
+        self._parts: list[bytes] = []
+        self._size = 0
+
+    def append(self, payload: bytes) -> int:
+        """Append one tensor; return its chunk start offset in the file."""
+        start = self._size
+        payload_offset = start + 128
+        if payload_offset > 0xFFFFFFFF:
+            raise ValueError(
+                f"packed weight file exceeds the 32-bit blob payload pointer "
+                f"({payload_offset} > 4 GiB); split the bank"
+            )
+        blob = bytearray(_make_blob(payload))
+        struct.pack_into("<I", blob, 80, payload_offset)
+        self._parts.append(bytes(blob))
+        self._size += len(blob)
+        pad = -self._size % 64
+        if pad:
+            self._parts.append(b"\0" * pad)
+            self._size += pad
+        return start
+
+    def __len__(self) -> int:
+        return self._size
+
+    def getvalue(self) -> bytes:
+        return b"".join(self._parts)
 
 
 # ============================================================================
@@ -502,36 +592,41 @@ def pack_procedure_weight_bin(
     """Pack many linear weights into one ``weight.bin`` for procedure banks.
 
     int8 / int4: ``[(data_off, scale_off), ...]`` per procedure.
-    fp16: ``[weight_off, ...]``. Offsets land on each blob's DEADBEEF header.
+    fp16: ``[weight_off, ...]``. Offsets are chunk STARTS; the caller adds 64
+    to land on each blob's DEADBEEF header (see generate_procedure_bank_mil).
+
+    Every tensor goes through ``_BlobPacker``, which fixes up the per-chunk
+    file-absolute payload pointer. Packing raw ``_make_blob`` output here used
+    to alias every procedure onto the first tensor.
     """
     fmt = resolve_ane_format(quantized, weight_format)
-    chunks: list[bytes] = []
+    packer = _BlobPacker()
     if fmt == "fp16":
         fp16_offsets: list[int] = []
         for weight in weights:
             o, i = weight.shape
-            w_blob = _make_blob(weight.astype(np.float16).reshape(o, i, 1, 1).tobytes())
-            fp16_offsets.append(sum(len(c) for c in chunks))
-            chunks.append(w_blob)
-        return b"".join(chunks), fp16_offsets
+            fp16_offsets.append(
+                packer.append(weight.astype(np.float16).reshape(o, i, 1, 1).tobytes())
+            )
+        return packer.getvalue(), fp16_offsets
 
     offsets: list[tuple[int, int]] = []
     for weight in weights:
         o, i = weight.shape
         if fmt == "int4":
             packed, scale_fp16 = quantize_linear_int4(weight)
-            data_blob = _make_blob(packed.reshape(o, i // 2, 1, 1).tobytes())
-            scale_blob = _make_blob(scale_fp16.reshape(o, 1, 1, 1).tobytes())
+            data_bytes = packed.reshape(o, i // 2, 1, 1).tobytes()
         else:
-            w_int8, scale_fp16 = quantize_linear_int8(weight)
-            data_blob = _make_blob(w_int8.reshape(o, i, 1, 1).tobytes())
-            scale_blob = _make_blob(scale_fp16.reshape(o, 1, 1, 1).tobytes())
-        data_off = sum(len(c) for c in chunks)
-        chunks.append(data_blob)
-        scale_off = sum(len(c) for c in chunks)
-        chunks.append(scale_blob)
+            packed, scale_fp16 = quantize_linear_int8(weight)
+            data_bytes = packed.reshape(o, i, 1, 1).tobytes()
+        # constexpr_blockwise_shift_scale rejects a scalar scale const: it has
+        # to be a rank-matched [O,1,1,1] tensor, which is what the MIL in
+        # generate_procedure_bank_mil declares.
+        scale_bytes = scale_fp16.reshape(o, 1, 1, 1).tobytes()
+        data_off = packer.append(data_bytes)
+        scale_off = packer.append(scale_bytes)
         offsets.append((data_off, scale_off))
-    return b"".join(chunks), offsets
+    return packer.getvalue(), offsets
 
 
 def generate_procedure_bank_mil(
@@ -643,6 +738,14 @@ class AneProgram:
     _compile_opts: ctypes.c_void_p = field(default=None, repr=False)
     _in_surf: ctypes.c_void_p = field(default=None, repr=False)
     _out_surf: ctypes.c_void_p = field(default=None, repr=False)
+    #: Multi-IO: element counts per input / output symbol, in compiled symbol
+    #: order. Empty means the single-surface path. A GDN layer needs 3 in and
+    #: 6 out, and _ANERequest already takes NSArrays, so only the allocation
+    #: and wrapping were single-tensor.
+    input_elems: list = field(default_factory=list, repr=False)
+    output_elems: list = field(default_factory=list, repr=False)
+    _in_surfs: list = field(default_factory=list, repr=False)
+    _out_surfs: list = field(default_factory=list, repr=False)
     _request: ctypes.c_void_p = field(default=None, repr=False)
     _proc_idx: int = field(default=-1, repr=False)
 
@@ -1181,7 +1284,32 @@ class AneEngine:
         )
 
     def _ensure_io(self, program: AneProgram) -> bool:
-        """Allocate IOSurfaces once per program."""
+        """Allocate IOSurfaces once per program.
+
+        With ``input_elems`` / ``output_elems`` set, allocates one surface per
+        symbol instead of a single in/out pair.
+        """
+        if program.input_elems or program.output_elems:
+            if program._in_surfs and program._out_surfs:
+                return True
+            _load_iosurface()
+            ins, outs = [], []
+            for n in (program.input_elems or [program.input_dim * program.seq_len]):
+                surf = _create_iosurface(_iosurface_alloc_size(int(n)))
+                if not surf:
+                    logger.error("multi-IO input surface alloc failed (%d elems)", n)
+                    return False
+                ins.append(surf)
+            for n in (program.output_elems or [program.output_dim * program.seq_len]):
+                surf = _create_iosurface(_iosurface_alloc_size(int(n)))
+                if not surf:
+                    logger.error("multi-IO output surface alloc failed (%d elems)", n)
+                    return False
+                outs.append(surf)
+            program._in_surfs, program._out_surfs = ins, outs
+            program._in_surf, program._out_surf = ins[0], outs[0]
+            program._keep_alive.extend(ins + outs)
+            return True
         if program._in_surf and program._out_surf:
             return True
         _load_iosurface()
@@ -1215,11 +1343,14 @@ class AneEngine:
             raw = _msg(surf_cls, "alloc")
             return InitSurf(("objc_msgSend", _objc))(raw, init_sel, surf, off0, True)
 
-        in_obj = wrap(program._in_surf)
-        out_obj = wrap(program._out_surf)
-        if not in_obj or not out_obj:
+        in_list = program._in_surfs or [program._in_surf]
+        out_list = program._out_surfs or [program._out_surf]
+        in_objs = [wrap(s_) for s_ in in_list]
+        out_objs = [wrap(s_) for s_ in out_list]
+        if not all(in_objs) or not all(out_objs):
             logger.error("IOSurface wrap failed")
             return False
+        in_obj, out_obj = in_objs[0], out_objs[0]
 
         inner = _msg(program.model, "model") or program.model
         SymSel = ctypes.CFUNCTYPE(
@@ -1244,9 +1375,9 @@ class AneEngine:
                 "weightsBuffer:perfStats:procedureIndex:sharedEvents:"
                 "transactionHandle:"
             ),
-            _nsarray([in_obj]),
+            _nsarray(in_objs),
             in_idx,
-            _nsarray([out_obj]),
+            _nsarray(out_objs),
             out_idx,
             None,
             None,
@@ -1259,7 +1390,8 @@ class AneEngine:
             return False
         program._request = request
         program._proc_idx = int(procedure_index)
-        program._keep_alive.extend([in_obj, out_obj, in_idx, out_idx, proc_num, request])
+        program._keep_alive.extend(
+            in_objs + out_objs + [in_idx, out_idx, proc_num, request])
         return True
 
     def evaluate(
@@ -1330,49 +1462,53 @@ class AneEngine:
 def _nsarray_strings(arr) -> list[str]:
     if not arr:
         return []
-    Count = ctypes.CFUNCTYPE(
-        ctypes.c_ulonglong, ctypes.c_void_p, ctypes.c_void_p
-    )
-    At = ctypes.CFUNCTYPE(
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulonglong
-    )
-    Utf = ctypes.CFUNCTYPE(ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p)
-    n = Count(("objc_msgSend", _objc))(arr, _sel("count"))
+    n = int(_objc_call(ctypes.c_ulonglong, (), arr, "count") or 0)
     out = []
-    for i in range(int(n)):
-        obj = At(("objc_msgSend", _objc))(arr, _sel("objectAtIndex:"), i)
-        cs = Utf(("objc_msgSend", _objc))(obj, _sel("UTF8String")) if obj else None
+    for i in range(n):
+        obj = _objc_call(
+            ctypes.c_void_p, [ctypes.c_ulonglong], arr, "objectAtIndex:", i
+        )
+        cs = (
+            _objc_call(ctypes.c_char_p, (), obj, "UTF8String") if obj else None
+        )
         out.append(cs.decode() if cs else "")
     return out
 
 
 def _ane_input_symbols(model) -> list[str]:
     """Compiled live-input names, in the order ANE binds IO indices."""
-    ForKey = ctypes.CFUNCTYPE(
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p
-    )
-    attrs = _msg(model, "modelAttributes")
-    desc = ForKey(("objc_msgSend", _objc))(
-        attrs, _sel("objectForKey:"), _nsstring("ANEFModelDescription")
+    attrs = _objc_call(ctypes.c_void_p, (), model, "modelAttributes")
+    if not attrs:
+        return []
+    desc = _objc_call(
+        ctypes.c_void_p,
+        [ctypes.c_void_p],
+        attrs,
+        "objectForKey:",
+        _nsstring("ANEFModelDescription"),
     )
     if not desc:
         return []
-    arr = ForKey(("objc_msgSend", _objc))(
-        desc, _sel("objectForKey:"), _nsstring("kANEFModelInputSymbolsArrayKey")
+    arr = _objc_call(
+        ctypes.c_void_p,
+        [ctypes.c_void_p],
+        desc,
+        "objectForKey:",
+        _nsstring("kANEFModelInputSymbolsArrayKey"),
     )
     return _nsarray_strings(arr)
 
 
 def _wrap_iosurface(surf) -> ctypes.c_void_p:
-    Init = ctypes.CFUNCTYPE(
+    raw = _objc_call(ctypes.c_void_p, (), _cls("_ANEIOSurfaceObject"), "alloc")
+    return _objc_call(
         ctypes.c_void_p,
-        ctypes.c_void_p, ctypes.c_void_p,
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool,
-    )
-    raw = _msg(_cls("_ANEIOSurfaceObject"), "alloc")
-    return Init(("objc_msgSend", _objc))(
-        raw, _sel("initWithIOSurface:startOffset:shouldRetain:"),
-        surf, _nsnumber_int(0), True,
+        [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool],
+        raw,
+        "initWithIOSurface:startOffset:shouldRetain:",
+        _as_void_p(surf),
+        _nsnumber_int(0),
+        True,
     )
 
 
