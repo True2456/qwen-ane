@@ -57,12 +57,15 @@ class MilGdnLayer:
     matching the Core AI graph's contract so decode can swap between them.
     """
 
-    __slots__ = ("layer", "_prog", "_param", "_hcn", "_conv", "_state", "_eng")
+    __slots__ = ("layer", "k", "_prog", "_param", "_hcn", "_conv", "_state", "_eng")
 
-    def __init__(self, layer: int, weights, ref_step, engine: AneEngine | None = None):
+    def __init__(self, layer: int, weights, ref_step, k: int = 1,
+                 engine: AneEngine | None = None):
         import flashnext_mil_layer as _ML
         self._eng = engine or _ML.eng
         _ML.LAYER[0] = int(layer)
+        _ML.K[0] = int(k)
+        self.k = int(k)
         built = _ML.build_layer(weights, ref_step)
         if built is None:
             raise RuntimeError(f"MIL layer {layer} failed to compile")
@@ -75,8 +78,8 @@ class MilGdnLayer:
         self._conv[:] = 0
         self._state[:] = 0
 
-    def __call__(self, x_bc1s: np.ndarray):
-        """x is (1, HC_W, 1, S). Returns (mixed, hyper, inj, shared) at slot 0.
+    def __call__(self, x_bc1s: np.ndarray, n: int | None = None):
+        """x is (1, HC_W, 1, S). Returns (mixed, hyper, inj, shared) over n slots.
 
         The recurrent state and conv cache advance in place, as `pure_step` does.
         """
@@ -89,20 +92,38 @@ class MilGdnLayer:
                 np.copyto(dst, val)
         if not self._eng.submit(p, procedure_index=0):
             raise RuntimeError(f"MIL layer {self.layer}: submit failed")
-        # surfaces bind alphabetically: u_shared, v_mixed, w_hyper, x_inj,
-        # y_conv, z_state
-        # Decode reads slot 0 only. Converting all 32 columns costs ~0.2 ms a
-        # layer in memory traffic for 31 columns nothing looks at.
+        # Surfaces bind alphabetically: q_state0 .. q_state{k-1}, then
+        # u_shared, v_mixed, w_hyper, x_inj, y_conv.
+        kk = self.k
+        w = kk if n is None else int(n)
+        if n is None:
+            # Plain decode consumes the whole block; speculation calls commit()
+            # itself once it knows how many tokens the backbone confirmed.
+            self.commit(kk - 1)
         out = []
-        for idx, shape in ((0, (H, S)), (1, (H, S)), (2, (HC_W, S)), (3, (HC, S))):
-            with _iosurface_view(p._out_surfs[idx], shape, np.float16) as o:
-                out.append(np.array(o[:, :1], np.float32).reshape(1, shape[0], 1, 1))
-        with _iosurface_view(p._out_surfs[4], (3 * QKV, S), np.float16) as o:
+        for j, shape in enumerate(((H, S), (H, S), (HC_W, S), (HC, S))):
+            with _iosurface_view(p._out_surfs[kk + j], shape, np.float16) as o:
+                out.append(np.array(o[:, :w], np.float32).reshape(1, shape[0], 1, w))
+        with _iosurface_view(p._out_surfs[kk + 4], (3 * QKV, S), np.float16) as o:
             np.copyto(self._conv, np.asarray(o, np.float16))
-        with _iosurface_view(p._out_surfs[5], (HV, DV, DK), np.float16) as o:
-            np.copyto(self._state, np.asarray(o, np.float16))
         shared, mixed, hyper, inj = out
         return mixed, hyper, inj, shared
+
+    def state_at(self, j: int) -> np.ndarray:
+        """The recurrent state having consumed `j + 1` of this pass's tokens."""
+        with _iosurface_view(self._prog._out_surfs[int(j)], (HV, DV, DK),
+                             np.float16) as o:
+            return np.array(o, np.float16)
+
+    def commit(self, j: int) -> None:
+        """Advance the layer's state to the `j + 1`-token boundary.
+
+        Speculation needs every prefix, not just the last: the graph emits a
+        state per token so a partially accepted block costs no extra pass.
+        """
+        with _iosurface_view(self._prog._out_surfs[int(j)], (HV, DV, DK),
+                             np.float16) as o:
+            np.copyto(self._state, np.asarray(o, np.float16))
 
 
 def build_layers(layer_indices, loader_fn, step_fn, engine=None):

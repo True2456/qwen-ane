@@ -93,6 +93,77 @@ def mixer(pfx, src, hcn_var, offs, out_mixed, out_inj):
     emit(f'tensor<fp16, [1, {HC}, 1, {S}]> {out_inj} = mul(x={pfx}ig, y=two)[name=string("{out_inj}")];')
 
 
+def sl4(name, src, beg, end, dims):
+    emit(f'tensor<int32, [4]> {name}b = const()[name=string("{name}b"), val=tensor<int32, [4]>([{",".join(map(str,beg))}])];')
+    emit(f'tensor<int32, [4]> {name}e = const()[name=string("{name}e"), val=tensor<int32, [4]>([{",".join(map(str,end))}])];')
+    emit(f'tensor<fp16, [{", ".join(map(str,dims))}]> {name} = slice_by_index(x={src}, begin={name}b, end={name}e, begin_mask=mm, end_mask=mm)[name=string("{name}")];')
+
+
+def gdn_core(t, state_in, state_out):
+    """One recurrence step over slot `t` of `fyin`. Emits `g{t}yf`, (1, GDN_Y, 1, 1).
+
+    Unrolling is what makes multi-token verification possible: everything else
+    in the layer (mixers, projections, the depthwise conv, the shared expert)
+    already runs across all 32 slots, so only this and the QSA attention were
+    ever single-token.
+    """
+    g = f"g{t}"
+    sl4(f"{g}one", "fyin", (0, 0, 0, t), (1, IN_O, 1, t + 1), (1, IN_O, 1, 1))
+    sl4(f"{g}qk1", f"{g}one", (0, 0, 0, 0), (1, QKV, 1, 1), (1, QKV, 1, 1))
+    emit(f'tensor<fp16, [1, {NH}, 1, {DK}]> {g}pk = reshape(x={g}qk1, shape=rs)[name=string("{g}pk")];')
+    emit(f'tensor<fp16, [1, {NH}, 1, {DK}]> {g}hx = mul(x={g}pk, y=hlf)[name=string("{g}hx")];')
+    emit(f'tensor<fp16, [1, {NH}, 1, {DK}]> {g}th = tanh(x={g}hx)[name=string("{g}th")];')
+    emit(f'tensor<fp16, [1, {NH}, 1, {DK}]> {g}hm = mul(x={g}hx, y={g}th)[name=string("{g}hm")];')
+    emit(f'tensor<fp16, [1, {NH}, 1, {DK}]> {g}cc = add(x={g}hx, y={g}hm)[name=string("{g}cc")];')
+    sl4(f"{g}qq", f"{g}cc", (0, 0, 0, 0), (1, HK, 1, DK), (1, HK, 1, DK))
+    sl4(f"{g}kk", f"{g}cc", (0, HK, 0, 0), (1, 2 * HK, 1, DK), (1, HK, 1, DK))
+    sl4(f"{g}vv", f"{g}cc", (0, 2 * HK, 0, 0), (1, NH, 1, DK), (1, HV, 1, DK))
+    for nm, src, scale in ((f"{g}qn", f"{g}qq", True), (f"{g}kn", f"{g}kk", False)):
+        emit(f'tensor<fp16, [1, {HK}, 1, {DK}]> {nm}2 = mul(x={src}, y={src})[name=string("{nm}2")];')
+        emit(f'tensor<fp16, [1, {HK}, 1, 1]> {nm}s = reduce_sum(x={nm}2, axes=ax, keep_dims=kd)[name=string("{nm}s")];')
+        emit(f'tensor<fp16, [1, {HK}, 1, 1]> {nm}e = add(x={nm}s, y=eps)[name=string("{nm}e")];')
+        emit(f'tensor<fp16, [1, {HK}, 1, 1]> {nm}r = pow(x={nm}e, y=mh)[name=string("{nm}r")];')
+        emit(f'tensor<fp16, [1, {HK}, 1, {DK}]> {nm}m = mul(x={src}, y={nm}r)[name=string("{nm}m")];')
+        last = f"{nm}m"
+        if scale:
+            emit(f'tensor<fp16, [1, {HK}, 1, {DK}]> {nm}g = mul(x={nm}m, y=qsc)[name=string("{nm}g")];')
+            last = f"{nm}g"
+        emit(f'tensor<fp16, [1, {HK}, 3, {DK}]> {nm}c = concat(values=({last}, {last}, {last}), axis=int32(2), interleave=bool(false))[name=string("{nm}c")];')
+        emit(f'tensor<fp16, [1, {HV}, 1, {DK}]> {nm}48 = reshape(x={nm}c, shape=qksh)[name=string("{nm}48")];')
+    sl4(f"{g}z1", f"{g}one", (0, QKV, 0, 0), (1, QKV + GDN_Y, 1, 1), (1, GDN_Y, 1, 1))
+    emit(f'tensor<fp16, [1, {HV}, 1, {DK}]> {g}zz = reshape(x={g}z1, shape=qksh)[name=string("{g}zz")];')
+    sl4(f"{g}b1", f"{g}one", (0, QKV + GDN_Y, 0, 0), (1, QKV + GDN_Y + HV, 1, 1), (1, HV, 1, 1))
+    sl4(f"{g}a1", f"{g}one", (0, QKV + GDN_Y + HV, 0, 0), (1, IN_O, 1, 1), (1, HV, 1, 1))
+    emit(f'tensor<fp16, [1, {HV}, 1, {DK}]> {g}ad = add(x={g}a1, y=dtb)[name=string("{g}ad")];')
+    emit(f'tensor<fp16, [1, {HV}, 1, {DK}]> {g}an = mul(x={g}ad, y=nho)[name=string("{g}an")];')
+    emit(f'tensor<fp16, [1, {HV}, 1, {DK}]> {g}sg = sigmoid(x={g}an)[name=string("{g}sg")];')
+    emit(f'tensor<fp16, [1, {HV}, 1, {DK}]> {g}dec = pow(x={g}sg, y=gam)[name=string("{g}dec")];')
+    emit(f'tensor<fp16, [1, {HV}, 1, 1]> {g}bet = sigmoid(x={g}b1)[name=string("{g}bet")];')
+    emit(f'tensor<fp16, [1, {HV}, {DV}, {DK}]> {g}st1 = mul(x={state_in}, y={g}dec)[name=string("{g}st1")];')
+    emit(f'tensor<fp16, [1, {HV}, {DV}, {DK}]> {g}sk = mul(x={g}st1, y={g}kn48)[name=string("{g}sk")];')
+    emit(f'tensor<fp16, [1, {HV}, {DV}, 1]> {g}mem = reduce_sum(x={g}sk, axes=ax, keep_dims=kd)[name=string("{g}mem")];')
+    emit(f'tensor<fp16, [1, {HV}, {DK}, 1]> {g}vt = transpose(x={g}vv, perm=pm)[name=string("{g}vt")];')
+    emit(f'tensor<fp16, [1, {HV}, {DV}, 1]> {g}df = sub(x={g}vt, y={g}mem)[name=string("{g}df")];')
+    emit(f'tensor<fp16, [1, {HV}, {DV}, 1]> {g}dl2 = mul(x={g}df, y={g}bet)[name=string("{g}dl2")];')
+    emit(f'tensor<fp16, [1, {HV}, {DV}, {DK}]> {g}dk2 = mul(x={g}dl2, y={g}kn48)[name=string("{g}dk2")];')
+    emit(f'tensor<fp16, [1, {HV}, {DV}, {DK}]> {state_out} = add(x={g}st1, y={g}dk2)[name=string("{state_out}")];')
+    emit(f'tensor<fp16, [1, {HV}, {DV}, {DK}]> {g}sq = mul(x={state_out}, y={g}qn48)[name=string("{g}sq")];')
+    emit(f'tensor<fp16, [1, {HV}, {DV}, 1]> {g}yv = reduce_sum(x={g}sq, axes=ax, keep_dims=kd)[name=string("{g}yv")];')
+    emit(f'tensor<fp16, [1, {HV}, 1, {DV}]> {g}yt = transpose(x={g}yv, perm=pm)[name=string("{g}yt")];')
+    emit(f'tensor<fp16, [1, {HV}, 1, {DV}]> {g}y2 = mul(x={g}yt, y={g}yt)[name=string("{g}y2")];')
+    emit(f'tensor<fp16, [1, {HV}, 1, 1]> {g}ym = reduce_mean(x={g}y2, axes=ax, keep_dims=kd)[name=string("{g}ym")];')
+    emit(f'tensor<fp16, [1, {HV}, 1, 1]> {g}ye = add(x={g}ym, y=eps)[name=string("{g}ye")];')
+    emit(f'tensor<fp16, [1, {HV}, 1, 1]> {g}yr = pow(x={g}ye, y=mh)[name=string("{g}yr")];')
+    emit(f'tensor<fp16, [1, {HV}, 1, {DV}]> {g}yn2 = mul(x={g}yt, y={g}yr)[name=string("{g}yn2")];')
+    emit(f'tensor<fp16, [1, {HV}, 1, {DV}]> {g}yw = mul(x={g}yn2, y=nw)[name=string("{g}yw")];')
+    emit(f'tensor<fp16, [1, {HV}, 1, {DV}]> {g}zg = sigmoid(x={g}zz)[name=string("{g}zg")];')
+    # Stop at yo. Reshaping a per-step (1, HV, 1, DV) straight to (1, GDN_Y, 1, 1)
+    # is "The strides of the Reshape is not valid" for every slot but the first;
+    # the caller instead stacks the steps and transposes once, which both
+    # materializes the slice and lands the channels in out_proj's order.
+    emit(f'tensor<fp16, [1, {HV}, 1, {DV}]> {g}yo = mul(x={g}yw, y={g}zg)[name=string("{g}yo")];')
+
+
 def build_mil(offs):
     B.clear()
     for c, v in (("mm", 'tensor<bool, [4]>([false,false,false,false])'),):
@@ -110,6 +181,9 @@ def build_mil(offs):
     emit('tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];')
     emit('int32 gr = const()[name=string("gr"), val=int32(1)];')
     emit(f'int32 gq = const()[name=string("gq"), val=int32({QKV})];')
+    emit(f'tensor<int32, [4]> rs = const()[name=string("rs"), val=tensor<int32, [4]>([1,{NH},1,{DK}])];')
+    emit(f'tensor<int32, [4]> qksh = const()[name=string("qksh"), val=tensor<int32, [4]>([1,{HV},1,{DK}])];')
+    emit(f'tensor<int32, [4]> fs = const()[name=string("fs"), val=tensor<int32, [4]>([1,{GDN_Y},1,1])];')
     # hc_n carriers
     emit(f'tensor<int32, [4]> hs = const()[name=string("hs"), val=tensor<int32, [4]>([1,{HC_W},1,1])];')
     sl("hca", "d_hcn", 0, 320, 320, 1, 32, 1, 32)
@@ -132,71 +206,34 @@ def build_mil(offs):
     emit(f'tensor<fp16, [1, {QKV}, 1, {S + 3}]> fseq = concat(values=(fc0, fc1, fc2, fqkv), axis=int32(-1), interleave=bool(false))[name=string("fseq")];')
     emit(f'tensor<fp16, [{QKV}, 1, 1, 4]> TAP = const()[name=string("TAP"), val=tensor<fp16, [{QKV}, 1, 1, 4]>(BLOBFILE(path=string("@model_path/weights/weight_scale.bin"), offset=uint64({offs["taps"]})))];')
     emit(f'tensor<fp16, [1, {QKV}, 1, {S}]> fpre = conv(dilations=dl, groups=gq, pad=pd, pad_type=pt, strides=st, weight=TAP, x=fseq)[name=string("fpre")];')
-    sl("fs12", "b_conv", QKV, 3 * QKV, 2 * QKV)
-    emit(f'tensor<fp16, [1, {3 * QKV}, 1, {S}]> y_conv = concat(values=(fs12, fqkv), axis=int32(1), interleave=bool(false))[name=string("y_conv")];')
+    # New conv cache: fseq is [c0, c1, c2, x_0 .. x_{S-1}], so after K tokens
+    # the three retained taps are exactly fseq at K, K+1, K+2. True for K=1 too.
+    k = K[0]
+    for j in range(3):
+        sl4(f"nc{j}", "fseq", (0, 0, 0, k + j), (1, QKV, 1, k + j + 1), (1, QKV, 1, 1))
+        emit(f'tensor<int32, [4]> nt{j} = const()[name=string("nt{j}"), val=tensor<int32, [4]>([1,1,1,{S}])];')
+        emit(f'tensor<fp16, [1, {QKV}, 1, {S}]> nw{j} = tile(x=nc{j}, reps=nt{j})[name=string("nw{j}")];')
+    emit(f'tensor<fp16, [1, {3 * QKV}, 1, {S}]> y_conv = concat(values=(nw0, nw1, nw2), axis=int32(1), interleave=bool(false))[name=string("y_conv")];')
     emit(f'tensor<fp16, [1, {IN_O}, 1, {S}]> fyin = concat(values=(fpre, frest), axis=int32(1), interleave=bool(false))[name=string("fyin")];')
 
-    # --- GDN core (slot 0)
-    sl("one", "fyin", 0, IN_O, IN_O, 1, 1, 1, 1)
-    sl("qk1", "one", 0, QKV, QKV, 1, 1, 1, 1)
-    emit(f'tensor<int32, [4]> rs = const()[name=string("rs"), val=tensor<int32, [4]>([1,{NH},1,{DK}])];')
-    emit(f'tensor<fp16, [1, {NH}, 1, {DK}]> pk = reshape(x=qk1, shape=rs)[name=string("pk")];')
-    emit(f'tensor<fp16, [1, {NH}, 1, {DK}]> hx = mul(x=pk, y=hlf)[name=string("hx")];')
-    emit(f'tensor<fp16, [1, {NH}, 1, {DK}]> th = tanh(x=hx)[name=string("th")];')
-    emit(f'tensor<fp16, [1, {NH}, 1, {DK}]> hmm = mul(x=hx, y=th)[name=string("hmm")];')
-    emit(f'tensor<fp16, [1, {NH}, 1, {DK}]> cc = add(x=hx, y=hmm)[name=string("cc")];')
-    sl("qq", "cc", 0, HK, HK, 1, DK, 1, DK)
-    sl("kk", "cc", HK, 2 * HK, HK, 1, DK, 1, DK)
-    sl("vv", "cc", 2 * HK, NH, HV, 1, DK, 1, DK)
-    for nm, src, scale in (("qn", "qq", True), ("kn", "kk", False)):
-        emit(f'tensor<fp16, [1, {HK}, 1, {DK}]> {nm}2 = mul(x={src}, y={src})[name=string("{nm}2")];')
-        emit(f'tensor<fp16, [1, {HK}, 1, 1]> {nm}s = reduce_sum(x={nm}2, axes=ax, keep_dims=kd)[name=string("{nm}s")];')
-        emit(f'tensor<fp16, [1, {HK}, 1, 1]> {nm}e = add(x={nm}s, y=eps)[name=string("{nm}e")];')
-        emit(f'tensor<fp16, [1, {HK}, 1, 1]> {nm}r = pow(x={nm}e, y=mh)[name=string("{nm}r")];')
-        emit(f'tensor<fp16, [1, {HK}, 1, {DK}]> {nm}m = mul(x={src}, y={nm}r)[name=string("{nm}m")];')
-        last = f"{nm}m"
-        if scale:
-            emit(f'tensor<fp16, [1, {HK}, 1, {DK}]> {nm}g = mul(x={nm}m, y=qsc)[name=string("{nm}g")];')
-            last = f"{nm}g"
-        emit(f'tensor<fp16, [1, {HK}, 3, {DK}]> {nm}c = concat(values=({last}, {last}, {last}), axis=int32(2), interleave=bool(false))[name=string("{nm}c")];')
-        emit(f'tensor<int32, [4]> {nm}sh = const()[name=string("{nm}sh"), val=tensor<int32, [4]>([1,{HV},1,{DK}])];')
-        emit(f'tensor<fp16, [1, {HV}, 1, {DK}]> {nm}48 = reshape(x={nm}c, shape={nm}sh)[name=string("{nm}48")];')
-    sl("z1", "one", QKV, QKV + GDN_Y, GDN_Y, 1, 1, 1, 1)
-    emit(f'tensor<int32, [4]> zs = const()[name=string("zs"), val=tensor<int32, [4]>([1,{HV},1,{DK}])];')
-    emit(f'tensor<fp16, [1, {HV}, 1, {DK}]> zz = reshape(x=z1, shape=zs)[name=string("zz")];')
-    sl("b1", "one", QKV + GDN_Y, QKV + GDN_Y + HV, HV, 1, 1, 1, 1)
-    sl("a1", "one", QKV + GDN_Y + HV, IN_O, HV, 1, 1, 1, 1)
+    # --- GDN core, unrolled over the K live slots
     sl("gam", "c_param", 0, HV, HV, 1, DK, 1, DK)
     sl("dtb", "c_param", HV, 2 * HV, HV, 1, DK, 1, DK)
     sl("nw", "c_param", 2 * HV, 3 * HV, HV, 1, DK, 1, DK)
-    emit(f'tensor<fp16, [1, {HV}, 1, {DK}]> ad = add(x=a1, y=dtb)[name=string("ad")];')
-    emit(f'tensor<fp16, [1, {HV}, 1, {DK}]> an = mul(x=ad, y=nho)[name=string("an")];')
-    emit(f'tensor<fp16, [1, {HV}, 1, {DK}]> sg = sigmoid(x=an)[name=string("sg")];')
-    emit(f'tensor<fp16, [1, {HV}, 1, {DK}]> dec = pow(x=sg, y=gam)[name=string("dec")];')
-    emit(f'tensor<fp16, [1, {HV}, 1, 1]> bet = sigmoid(x=b1)[name=string("bet")];')
-    emit(f'tensor<fp16, [1, {HV}, {DV}, {DK}]> st1 = mul(x=e_state, y=dec)[name=string("st1")];')
-    emit(f'tensor<fp16, [1, {HV}, {DV}, {DK}]> sk = mul(x=st1, y=kn48)[name=string("sk")];')
-    emit(f'tensor<fp16, [1, {HV}, {DV}, 1]> mem = reduce_sum(x=sk, axes=ax, keep_dims=kd)[name=string("mem")];')
-    emit(f'tensor<fp16, [1, {HV}, {DK}, 1]> vt = transpose(x=vv, perm=pm)[name=string("vt")];')
-    emit(f'tensor<fp16, [1, {HV}, {DV}, 1]> df = sub(x=vt, y=mem)[name=string("df")];')
-    emit(f'tensor<fp16, [1, {HV}, {DV}, 1]> dl2 = mul(x=df, y=bet)[name=string("dl2")];')
-    emit(f'tensor<fp16, [1, {HV}, {DV}, {DK}]> dk2 = mul(x=dl2, y=kn48)[name=string("dk2")];')
-    emit(f'tensor<fp16, [1, {HV}, {DV}, {DK}]> z_state = add(x=st1, y=dk2)[name=string("z_state")];')
-    emit(f'tensor<fp16, [1, {HV}, {DV}, {DK}]> sq = mul(x=z_state, y=qn48)[name=string("sq")];')
-    emit(f'tensor<fp16, [1, {HV}, {DV}, 1]> yv = reduce_sum(x=sq, axes=ax, keep_dims=kd)[name=string("yv")];')
-    emit(f'tensor<fp16, [1, {HV}, 1, {DV}]> yt = transpose(x=yv, perm=pm)[name=string("yt")];')
-    emit(f'tensor<fp16, [1, {HV}, 1, {DV}]> y2 = mul(x=yt, y=yt)[name=string("y2")];')
-    emit(f'tensor<fp16, [1, {HV}, 1, 1]> ym = reduce_mean(x=y2, axes=ax, keep_dims=kd)[name=string("ym")];')
-    emit(f'tensor<fp16, [1, {HV}, 1, 1]> ye = add(x=ym, y=eps)[name=string("ye")];')
-    emit(f'tensor<fp16, [1, {HV}, 1, 1]> yr = pow(x=ye, y=mh)[name=string("yr")];')
-    emit(f'tensor<fp16, [1, {HV}, 1, {DV}]> yn2 = mul(x=yt, y=yr)[name=string("yn2")];')
-    emit(f'tensor<fp16, [1, {HV}, 1, {DV}]> yw = mul(x=yn2, y=nw)[name=string("yw")];')
-    emit(f'tensor<fp16, [1, {HV}, 1, {DV}]> zg = sigmoid(x=zz)[name=string("zg")];')
-    emit(f'tensor<fp16, [1, {HV}, 1, {DV}]> yo = mul(x=yw, y=zg)[name=string("yo")];')
-    emit(f'tensor<int32, [4]> fs = const()[name=string("fs"), val=tensor<int32, [4]>([1,{GDN_Y},1,1])];')
-    emit(f'tensor<fp16, [1, {GDN_Y}, 1, 1]> yf = reshape(x=yo, shape=fs)[name=string("yf")];')
-    emit(f'tensor<int32, [4]> rp = const()[name=string("rp"), val=tensor<int32, [4]>([1,1,1,{S}])];')
-    emit(f'tensor<fp16, [1, {GDN_Y}, 1, {S}]> yx = tile(x=yf, reps=rp)[name=string("yx")];')
+    prev = "e_state"
+    for t in range(k):
+        gdn_core(t, prev, f"q_state{t}")
+        prev = f"q_state{t}"
+    if k == 1:
+        emit(f'tensor<fp16, [1, {HV}, {DV}, 1]> ystk = transpose(x=g0yo, perm=pm)[name=string("ystk")];')
+    else:
+        vals = ", ".join(f"g{t}yo" for t in range(k))
+        emit(f'tensor<fp16, [1, {HV}, {k}, {DV}]> ycat = concat(values=({vals}), axis=int32(2), interleave=bool(false))[name=string("ycat")];')
+        emit(f'tensor<fp16, [1, {HV}, {DV}, {k}]> ystk = transpose(x=ycat, perm=pm)[name=string("ystk")];')
+    emit(f'tensor<int32, [4]> yfs = const()[name=string("yfs"), val=tensor<int32, [4]>([1,{GDN_Y},1,{k}])];')
+    emit(f'tensor<fp16, [1, {GDN_Y}, 1, {k}]> ycol = reshape(x=ystk, shape=yfs)[name=string("ycol")];')
+    emit(f'tensor<int32, [4]> rp = const()[name=string("rp"), val=tensor<int32, [4]>([1,1,1,{S // k}])];')
+    emit(f'tensor<fp16, [1, {GDN_Y}, 1, {S}]> yx = tile(x=ycol, reps=rp)[name=string("yx")];')
     emit(f'tensor<int8, [{H}, {GDN_Y}, 1, 1]> opd = const()[name=string("opd"), val=tensor<int8, [{H}, {GDN_Y}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/weight_data.bin"), offset=uint64({offs["out_d"]})))];')
     emit(f'tensor<fp16, [{H}, 1, 1, 1]> ops = const()[name=string("ops"), val=tensor<fp16, [{H}, 1, 1, 1]>(BLOBFILE(path=string("@model_path/weights/weight_scale.bin"), offset=uint64({offs["out_s"]})))];')
     emit(f'tensor<fp16, [{H}, {GDN_Y}, 1, 1]> WO = constexpr_blockwise_shift_scale(data=opd, scale=ops)[name=string("WO")];')
@@ -232,7 +269,8 @@ def build_mil(offs):
             f"tensor<fp16, [1, 640, 1, 32]> d_hcn, "
             f"tensor<fp16, [1, {HV}, {DV}, {DK}]> e_state) {{\n"
             + "\n".join(B) +
-            f"\n  }} -> (u_shared, v_mixed, w_hyper, x_inj, y_conv, z_state);\n}}\n")
+            f"\n  }} -> ({', '.join(f'q_state{t}' for t in range(K[0]))}, "
+            f"u_shared, v_mixed, w_hyper, x_inj, y_conv);\n}}\n")
 
 
 def build_layer(w, ref):
@@ -280,17 +318,25 @@ def build_layer(w, ref):
         try:
             prog = eng.compile_multiproc(build_mil(offs), files, HC_W, H, S,
                                          raw_weight_files=frozenset(files))
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
             prog = None
+            buf.write(str(exc))
     if prog is None:
+        import os as _os
+        if _os.environ.get("MIL_VERBOSE"):
+            hit = [l for l in buf.getvalue().splitlines()
+                   if "rror" in l or "nvalid" in l]
+            print("  MIL compile: " + (hit[-1] if hit else buf.getvalue()[-400:]))
         return None
     prog.input_elems = [HC_W * S, 3 * QKV * S, 3 * HV * DK, 640 * 32, HV * DV * DK]
-    prog.output_elems = [H * S, H * S, HC_W * S, HC * S, 3 * QKV * S, HV * DV * DK]
+    prog.output_elems = ([HV * DV * DK] * K[0]
+                         + [H * S, H * S, HC_W * S, HC * S, 3 * QKV * S])
     eng._ensure_io(prog)
     return prog, np.ascontiguousarray(param.astype(np.float16)), np.ascontiguousarray(hcn.astype(np.float16))
 
 
 LAYER = [0]
+K = [1]          # live token slots; must divide S
 
 
 def main() -> None:

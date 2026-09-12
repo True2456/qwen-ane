@@ -21,7 +21,7 @@ Inputs (alphabetical, which is how surfaces bind):
     d_hcn    [1, 640, 1, 32]        attn hc_n | mlp hc_n
     e_kc     [1, KVC, 1, KVM]       selected keys
     f_vc     [1, KVC, 1, KVM]       selected values
-    g_mask   [1, 1, 1, KVM + S]     broadcasts over head and group
+    g_mask   [1, 1, G*K, KVM + S]  broadcasts over the kv-head axis
 Outputs (alphabetical):
     t_newk   [1, KVC, 1, S]         slot 0 live, tiled (a last-dim-1 output
     u_shared [1, H, 1, S]           surface comes back zero)
@@ -60,6 +60,7 @@ QW = QSA_HQ * QSA_HD
 
 LAYER = [3]
 KVM = [256]          # key window width; must be a multiple of 32
+KTOK = [1]           # live token slots; must divide S
 INT8 = [True]
 
 
@@ -102,6 +103,7 @@ def build_mil(offs):
     _em('bool kd = const()[name=string("kd"), val=bool(true)];')
     _em('tensor<int32, [4]> pm = const()[name=string("pm"), val=tensor<int32, [4]>([0,1,3,2])];')
     _em('tensor<int32, [4]> pc = const()[name=string("pc"), val=tensor<int32, [4]>([0,3,2,1])];')
+    _em('tensor<int32, [4]> pr = const()[name=string("pr"), val=tensor<int32, [4]>([0,2,3,1])];')
     _em('string pt = const()[name=string("pt"), val=string("valid")];')
     _em('tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];')
     _em('tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];')
@@ -115,41 +117,51 @@ def build_mil(offs):
 
     ML.mixer("A", "a_x", "hcnA", offs["attn"], "amixed", "ainj")
 
-    # --- QSA core, slot 0 live
-    _sl4("h0", "amixed", (0, 0, 0, 0), (1, H, 1, 1), (1, H, 1, 1))
-    _proj("WQ", offs, "q", H, QW, ("h0", 1), "qflat")
-    _proj("WG", offs, "g", H, QW, ("h0", 1), "gflat")
-    _proj("WK", offs, "k", H, KVC, ("h0", 1), "kp")
-    _proj("WV", offs, "v", H, KVC, ("h0", 1), "vp")
+    # --- QSA core over the K live slots
+    kt_ = KTOK[0]
+    _sl4("h0", "amixed", (0, 0, 0, 0), (1, H, 1, kt_), (1, H, 1, kt_))
+    _proj("WQ", offs, "q", H, QW, ("h0", kt_), "qflat")
+    _proj("WG", offs, "g", H, QW, ("h0", kt_), "gflat")
+    _proj("WK", offs, "k", H, KVC, ("h0", kt_), "kp")
+    _proj("WV", offs, "v", H, KVC, ("h0", kt_), "vp")
     for nm, o, n in (("QN", offs["qn"], QSA_HD), ("KN", offs["kn"], QSA_HD)):
         _em(f'tensor<fp16, [1, 1, 1, {n}]> {nm} = const()[name=string("{nm}"), val=tensor<fp16, [1, 1, 1, {n}]>(BLOBFILE(path=string("@model_path/weights/weight_data.bin"), offset=uint64({o})))];')
-    _rsh("qraw", "qflat", (1, QSA_HQ, 1, QSA_HD))
-    _rsh("kraw", "kp", (1, QSA_HKV, 1, QSA_HD))
+    # (1, heads*hd, 1, k) -> (1, heads, k, hd): reshape splits the channel into
+    # head-major rows, the transpose puts the token axis where the RMS and the
+    # attention matmul expect it.
+    for nm, src, hn in (("qraw", "qflat", QSA_HQ), ("kraw", "kp", QSA_HKV),
+                        ("vraw", "vp", QSA_HKV)):
+        _rsh(f"{nm}c", src, (1, hn, QSA_HD, kt_))
+        _em(f'tensor<fp16, [1, {hn}, {kt_}, {QSA_HD}]> {nm} = transpose(x={nm}c, perm=pm)[name=string("{nm}")];')
     for nm, src, hn, wn in (("qn", "qraw", QSA_HQ, "QN"), ("kn", "kraw", QSA_HKV, "KN")):
-        _em(f'tensor<fp16, [1, {hn}, 1, {QSA_HD}]> {nm}2 = mul(x={src}, y={src})[name=string("{nm}2")];')
-        _em(f'tensor<fp16, [1, {hn}, 1, 1]> {nm}m = reduce_mean(x={nm}2, axes=ax, keep_dims=kd)[name=string("{nm}m")];')
-        _em(f'tensor<fp16, [1, {hn}, 1, 1]> {nm}e2 = add(x={nm}m, y=eps)[name=string("{nm}e2")];')
-        _em(f'tensor<fp16, [1, {hn}, 1, 1]> {nm}r = pow(x={nm}e2, y=mh)[name=string("{nm}r")];')
-        _em(f'tensor<fp16, [1, {hn}, 1, {QSA_HD}]> {nm}n = mul(x={src}, y={nm}r)[name=string("{nm}n")];')
-        _em(f'tensor<fp16, [1, {hn}, 1, {QSA_HD}]> {nm}w = mul(x={nm}n, y={wn})[name=string("{nm}w")];')
-    _sl4("cs0", "b_cos", (0, 0, 0, 0), (1, HALF, 1, 1), (1, HALF, 1, 1))
-    _sl4("sn0", "c_sin", (0, 0, 0, 0), (1, HALF, 1, 1), (1, HALF, 1, 1))
-    _em(f'tensor<fp16, [1, 1, 1, {HALF}]> cc2 = transpose(x=cs0, perm=pc)[name=string("cc2")];')
-    _em(f'tensor<fp16, [1, 1, 1, {HALF}]> ss2 = transpose(x=sn0, perm=pc)[name=string("ss2")];')
+        _em(f'tensor<fp16, [1, {hn}, {kt_}, {QSA_HD}]> {nm}2 = mul(x={src}, y={src})[name=string("{nm}2")];')
+        _em(f'tensor<fp16, [1, {hn}, {kt_}, 1]> {nm}m = reduce_mean(x={nm}2, axes=ax, keep_dims=kd)[name=string("{nm}m")];')
+        _em(f'tensor<fp16, [1, {hn}, {kt_}, 1]> {nm}e2 = add(x={nm}m, y=eps)[name=string("{nm}e2")];')
+        _em(f'tensor<fp16, [1, {hn}, {kt_}, 1]> {nm}r = pow(x={nm}e2, y=mh)[name=string("{nm}r")];')
+        _em(f'tensor<fp16, [1, {hn}, {kt_}, {QSA_HD}]> {nm}n = mul(x={src}, y={nm}r)[name=string("{nm}n")];')
+        _em(f'tensor<fp16, [1, {hn}, {kt_}, {QSA_HD}]> {nm}w = mul(x={nm}n, y={wn})[name=string("{nm}w")];')
+    _sl4("cs0", "b_cos", (0, 0, 0, 0), (1, HALF, 1, kt_), (1, HALF, 1, kt_))
+    _sl4("sn0", "c_sin", (0, 0, 0, 0), (1, HALF, 1, kt_), (1, HALF, 1, kt_))
+    _em(f'tensor<fp16, [1, 1, {kt_}, {HALF}]> cc2 = transpose(x=cs0, perm=pr)[name=string("cc2")];')
+    _em(f'tensor<fp16, [1, 1, {kt_}, {HALF}]> ss2 = transpose(x=sn0, perm=pr)[name=string("ss2")];')
     for nm, hn in (("qnw", QSA_HQ), ("knw", QSA_HKV)):
-        _sl4(f"{nm}A", nm, (0, 0, 0, 0), (1, hn, 1, HALF), (1, hn, 1, HALF))
-        _sl4(f"{nm}B", nm, (0, 0, 0, HALF), (1, hn, 1, QSA_ROTARY), (1, hn, 1, HALF))
-        _sl4(f"{nm}R", nm, (0, 0, 0, QSA_ROTARY), (1, hn, 1, QSA_HD), (1, hn, 1, QSA_HD - QSA_ROTARY))
-        _em(f'tensor<fp16, [1, {hn}, 1, {HALF}]> {nm}ac = mul(x={nm}A, y=cc2)[name=string("{nm}ac")];')
-        _em(f'tensor<fp16, [1, {hn}, 1, {HALF}]> {nm}bs = mul(x={nm}B, y=ss2)[name=string("{nm}bs")];')
-        _em(f'tensor<fp16, [1, {hn}, 1, {HALF}]> {nm}p1 = sub(x={nm}ac, y={nm}bs)[name=string("{nm}p1")];')
-        _em(f'tensor<fp16, [1, {hn}, 1, {HALF}]> {nm}bc = mul(x={nm}B, y=cc2)[name=string("{nm}bc")];')
-        _em(f'tensor<fp16, [1, {hn}, 1, {HALF}]> {nm}as = mul(x={nm}A, y=ss2)[name=string("{nm}as")];')
-        _em(f'tensor<fp16, [1, {hn}, 1, {HALF}]> {nm}p2 = add(x={nm}bc, y={nm}as)[name=string("{nm}p2")];')
-        _em(f'tensor<fp16, [1, {hn}, 1, {QSA_HD}]> {nm}f = concat(values=({nm}p1, {nm}p2, {nm}R), axis=int32(-1), interleave=bool(false))[name=string("{nm}f")];')
-    _rsh("nk1", "knwf", (1, KVC, 1, 1))
-    _rsh("nv1", "vp", (1, KVC, 1, 1))
-    _em(f'tensor<int32, [4]> rq = const()[name=string("rq"), val=tensor<int32, [4]>([1,1,1,{S}])];')
+        _sl4(f"{nm}A", nm, (0, 0, 0, 0), (1, hn, kt_, HALF), (1, hn, kt_, HALF))
+        _sl4(f"{nm}B", nm, (0, 0, 0, HALF), (1, hn, kt_, QSA_ROTARY), (1, hn, kt_, HALF))
+        _sl4(f"{nm}R", nm, (0, 0, 0, QSA_ROTARY), (1, hn, kt_, QSA_HD), (1, hn, kt_, QSA_HD - QSA_ROTARY))
+        _em(f'tensor<fp16, [1, {hn}, {kt_}, {HALF}]> {nm}ac = mul(x={nm}A, y=cc2)[name=string("{nm}ac")];')
+        _em(f'tensor<fp16, [1, {hn}, {kt_}, {HALF}]> {nm}bs = mul(x={nm}B, y=ss2)[name=string("{nm}bs")];')
+        _em(f'tensor<fp16, [1, {hn}, {kt_}, {HALF}]> {nm}p1 = sub(x={nm}ac, y={nm}bs)[name=string("{nm}p1")];')
+        _em(f'tensor<fp16, [1, {hn}, {kt_}, {HALF}]> {nm}bc = mul(x={nm}B, y=cc2)[name=string("{nm}bc")];')
+        _em(f'tensor<fp16, [1, {hn}, {kt_}, {HALF}]> {nm}as = mul(x={nm}A, y=ss2)[name=string("{nm}as")];')
+        _em(f'tensor<fp16, [1, {hn}, {kt_}, {HALF}]> {nm}p2 = add(x={nm}bc, y={nm}as)[name=string("{nm}p2")];')
+        _em(f'tensor<fp16, [1, {hn}, {kt_}, {QSA_HD}]> {nm}f = concat(values=({nm}p1, {nm}p2, {nm}R), axis=int32(-1), interleave=bool(false))[name=string("{nm}f")];')
+    # back to BC1S for the host cache, widened to S: a last-dim-k output is fine
+    # but the host reads a fixed S-wide surface, and slots past k are masked.
+    _em(f'tensor<fp16, [1, {QSA_HKV}, {QSA_HD}, {kt_}]> nkt = transpose(x=knwf, perm=pm)[name=string("nkt")];')
+    _rsh("nk1", "nkt", (1, KVC, 1, kt_))
+    _em(f'tensor<fp16, [1, {QSA_HKV}, {QSA_HD}, {kt_}]> nvt = transpose(x=vraw, perm=pm)[name=string("nvt")];')
+    _rsh("nv1", "nvt", (1, KVC, 1, kt_))
+    _em(f'tensor<int32, [4]> rq = const()[name=string("rq"), val=tensor<int32, [4]>([1,1,1,{S // kt_}])];')
     _em(f'tensor<fp16, [1, {KVC}, 1, {S}]> t_newk = tile(x=nk1, reps=rq)[name=string("t_newk")];')
     _em(f'tensor<fp16, [1, {KVC}, 1, {S}]> y_newv = tile(x=nv1, reps=rq)[name=string("y_newv")];')
     _em(f'tensor<fp16, [1, {KVC}, 1, {KV}]> kall = concat(values=(e_kc, t_newk), axis=int32(-1), interleave=bool(false))[name=string("kall")];')
@@ -158,18 +170,21 @@ def build_mil(offs):
     _rsh("vh", "vall", (1, QSA_HKV, QSA_HD, KV))
     _em(f'tensor<fp16, [1, {QSA_HKV}, {KV}, {QSA_HD}]> kt = transpose(x=kh, perm=pm)[name=string("kt")];')
     _em(f'tensor<fp16, [1, {QSA_HKV}, {KV}, {QSA_HD}]> vt2 = transpose(x=vh, perm=pm)[name=string("vt2")];')
-    _rsh("qgrp", "qnwf", (1, QSA_HKV, G, QSA_HD))
-    _em(f'tensor<fp16, [1, {QSA_HKV}, {G}, {KV}]> sc0 = matmul(x=qgrp, y=kt, transpose_x=bool(false), transpose_y=bool(true))[name=string("sc0")];')
-    _em(f'tensor<fp16, [1, {QSA_HKV}, {G}, {KV}]> sc1 = mul(x=sc0, y=scl)[name=string("sc1")];')
-    _em(f'tensor<fp16, [1, {QSA_HKV}, {G}, {KV}]> sc2 = add(x=sc1, y=g_mask)[name=string("sc2")];')
-    _em(f'tensor<fp16, [1, {QSA_HKV}, {G}, {KV}]> pr = softmax(x=sc2, axis=int32(-1))[name=string("pr")];')
-    _em(f'tensor<fp16, [1, {QSA_HKV}, {G}, {QSA_HD}]> ov = matmul(x=pr, y=vt2, transpose_x=bool(false), transpose_y=bool(false))[name=string("ov")];')
-    _rsh("ovh", "ov", (1, QSA_HQ, 1, QSA_HD))
-    _rsh("oflat", "ovh", (1, QW, 1, 1))
-    _em(f'tensor<fp16, [1, {QW}, 1, 1]> gs = sigmoid(x=gflat)[name=string("gs")];')
-    _em(f'tensor<fp16, [1, {QW}, 1, 1]> og = mul(x=oflat, y=gs)[name=string("og")];')
-    _em(f'tensor<int32, [4]> rp = const()[name=string("rp"), val=tensor<int32, [4]>([1,1,1,{S}])];')
-    _em(f'tensor<fp16, [1, {QW}, 1, {S}]> ox = tile(x=og, reps=rp)[name=string("ox")];')
+    # (1, HQ, k, HD) -> (1, HKV, G*k, HD): row g*k+t, so the mask is shared
+    # across the G query heads of one kv head and varies only with the token.
+    _rsh("qgrp", "qnwf", (1, QSA_HKV, G * kt_, QSA_HD))
+    GK = G * kt_
+    _em(f'tensor<fp16, [1, {QSA_HKV}, {GK}, {KV}]> sc0 = matmul(x=qgrp, y=kt, transpose_x=bool(false), transpose_y=bool(true))[name=string("sc0")];')
+    _em(f'tensor<fp16, [1, {QSA_HKV}, {GK}, {KV}]> sc1 = mul(x=sc0, y=scl)[name=string("sc1")];')
+    _em(f'tensor<fp16, [1, {QSA_HKV}, {GK}, {KV}]> sc2 = add(x=sc1, y=g_mask)[name=string("sc2")];')
+    _em(f'tensor<fp16, [1, {QSA_HKV}, {GK}, {KV}]> pr2 = softmax(x=sc2, axis=int32(-1))[name=string("pr2")];')
+    _em(f'tensor<fp16, [1, {QSA_HKV}, {GK}, {QSA_HD}]> ov = matmul(x=pr2, y=vt2, transpose_x=bool(false), transpose_y=bool(false))[name=string("ov")];')
+    _rsh("ovh", "ov", (1, QSA_HQ, kt_, QSA_HD))
+    _em(f'tensor<fp16, [1, {QSA_HQ}, {QSA_HD}, {kt_}]> ovt = transpose(x=ovh, perm=pm)[name=string("ovt")];')
+    _rsh("oflat", "ovt", (1, QW, 1, kt_))
+    _em(f'tensor<fp16, [1, {QW}, 1, {kt_}]> gs = sigmoid(x=gflat)[name=string("gs")];')
+    _em(f'tensor<fp16, [1, {QW}, 1, {kt_}]> og = mul(x=oflat, y=gs)[name=string("og")];')
+    _em(f'tensor<fp16, [1, {QW}, 1, {S}]> ox = tile(x=og, reps=rq)[name=string("ox")];')
     _proj("WO", offs, "o", QW, H, ("ox", S), "attn")
 
     for i in range(HC):
@@ -200,7 +215,7 @@ def build_mil(offs):
             f"tensor<fp16, [1, 640, 1, 32]> d_hcn, "
             f"tensor<fp16, [1, {KVC}, 1, {M}]> e_kc, "
             f"tensor<fp16, [1, {KVC}, 1, {M}]> f_vc, "
-            f"tensor<fp16, [1, 1, 1, {KV}]> g_mask) {{\n"
+            f"tensor<fp16, [1, 1, {G * KTOK[0]}, {KV}]> g_mask) {{\n"
             + "\n".join(ML.B) +
             f"\n  }} -> (t_newk, u_shared, v_mixed, w_hyper, x_inj, y_newv);\n}}\n")
 
@@ -264,7 +279,7 @@ def build_layer(w, ref, qsa):
         raise RuntimeError(f"QSA MIL layer {LAYER[0]} failed: {(hit[-1] if hit else '')[:200]}")
     M = KVM[0]
     prog.input_elems = [HC_W * S, HALF * S, HALF * S, 640 * 32,
-                        KVC * M, KVC * M, M + S]
+                        KVC * M, KVC * M, G * KTOK[0] * (M + S)]
     prog.output_elems = [KVC * S, H * S, H * S, HC_W * S, HC * S, KVC * S]
     if not eng._ensure_io(prog):
         raise RuntimeError("QSA MIL: IO alloc failed")
@@ -297,22 +312,27 @@ def main() -> None:
     qsa = FlashNextQSADecode(max_s=M).eval().half()
     qsa.load_from_layer(w)
 
+    kt_ = KTOK[0]
     rng = np.random.default_rng(12)
     x = np.zeros((HC_W, S), np.float16)
-    x[:, :1] = (rng.standard_normal((HC_W, 1)) * 0.05).astype(np.float16)
+    x[:, :kt_] = (rng.standard_normal((HC_W, kt_)) * 0.05).astype(np.float16)
     kc = np.ascontiguousarray((rng.standard_normal((KVC, M)) * 0.05).astype(np.float16))
     vc = np.ascontiguousarray((rng.standard_normal((KVC, M)) * 0.05).astype(np.float16))
     cos = np.zeros((HALF, S), np.float16)
     sin = np.zeros((HALF, S), np.float16)
-    cos[:, 0] = np.cos(np.arange(HALF) * 0.01).astype(np.float16)
-    sin[:, 0] = np.sin(np.arange(HALF) * 0.01).astype(np.float16)
+    pos = (np.arange(kt_, dtype=np.float32) + 37.0)[:, None] * np.arange(HALF)[None, :] * 0.01
+    cos[:, :kt_] = np.cos(pos).T.astype(np.float16)
+    sin[:, :kt_] = np.sin(pos).T.astype(np.float16)
     off = 37
     mask_ref = np.full((1, M + S, 1, S), QSA_MASK, np.float16)
-    mask_ref[:, :off, :, :1] = 0
-    mask_ref[:, M:M + 1, :, :1] = 0
-    mil_mask = np.full(M + S, QSA_MASK, np.float16)
-    mil_mask[:off] = 0
-    mil_mask[M] = 0
+    mask_ref[:, :off, :, :kt_] = 0
+    for t in range(kt_):
+        mask_ref[:, M:M + t + 1, :, t] = 0
+    row = np.full((kt_, M + S), QSA_MASK, np.float16)
+    row[:, :off] = 0
+    for t in range(kt_):
+        row[t, M:M + t + 1] = 0
+    mil_mask = np.ascontiguousarray(np.tile(row, (G, 1)))
 
     with T.no_grad():
         xt = T.from_numpy(x).reshape(1, HC_W, 1, S)
@@ -324,10 +344,10 @@ def main() -> None:
                               T.from_numpy(mask_ref))
         hyper2 = _recombine(att, hyper_a, inj_a)
         mixed_m, _, inj_m = ref.mlp(hyper2)
-    r_mixed = mixed_m.float().numpy().reshape(H, S)[:, :1]
-    r_hyper = hyper2.float().numpy().reshape(HC_W, S)[:, :1]
-    r_nk = r_nk.float().numpy().reshape(KVC, S)[:, :1]
-    r_nv = r_nv.float().numpy().reshape(KVC, S)[:, :1]
+    r_mixed = mixed_m.float().numpy().reshape(H, S)[:, :kt_]
+    r_hyper = hyper2.float().numpy().reshape(HC_W, S)[:, :kt_]
+    r_nk = r_nk.float().numpy().reshape(KVC, S)[:, :kt_]
+    r_nv = r_nv.float().numpy().reshape(KVC, S)[:, :kt_]
     bank = Mlx4ExpertBank(MLX4_DEFAULT)
     sg_, su_, sd_ = bank.shared_fp32(li)
     src = MlxSafe(MLX4_DEFAULT)
@@ -354,11 +374,14 @@ def main() -> None:
                            (2, "mixed", (H, S)), (3, "hyper", (HC_W, S)),
                            (5, "new_v", (KVC, S))):
         with E._iosurface_view(prog._out_surfs[idx], shape, np.float16) as o:
-            got[nm] = np.array(o, np.float32)[:, :1]
+            got[nm] = np.array(o, np.float32)[:, :kt_]
 
     def rel(a, b_):
         return float(np.linalg.norm(a - b_) / max(np.linalg.norm(b_), 1e-12))
-    print(f"  QSA FULL LAYER (int8={INT8[0]}, m={M}): "
+    for nm, ref_ in (("mixed", r_mixed), ("new_k", r_nk)):
+        print(f"    {nm} per slot: " + "  ".join(
+            f"t{t}={rel(got[nm][:, t], ref_[:, t]):.4f}" for t in range(kt_)))
+    print(f"  QSA FULL LAYER (int8={INT8[0]}, m={M}, k={kt_}): "
           f"mixed {rel(got['mixed'], r_mixed):.5f}  "
           f"hyper {rel(got['hyper'], r_hyper):.5f}  "
           f"shared {rel(got['shared'], r_shared):.5f}  "
@@ -371,7 +394,8 @@ def main() -> None:
         t0 = time.perf_counter()
         eng.submit(prog, procedure_index=0)
         ts.append(time.perf_counter() - t0)
-    print(f"  QSA MIL layer: {float(np.median(ts)) * 1e3:.3f} ms  "
+    _ms = float(np.median(ts)) * 1e3
+    print(f"  QSA MIL layer: {_ms:.3f} ms/pass = {_ms / kt_:.3f} ms/token  "
           f"(Core AI folded qsa_step k=1: ~2.96 ms)", flush=True)
 
 
@@ -381,4 +405,6 @@ if __name__ == "__main__":
         KVM[0] = int(os.environ["QSA_M"])
     if os.environ.get("QSA_INT8") == "0":
         INT8[0] = False
+    if os.environ.get("QSA_K"):
+        KTOK[0] = int(os.environ["QSA_K"])
     main()
