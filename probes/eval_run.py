@@ -98,7 +98,7 @@ def run_gsm8k(client, n: int, shots: int, *, temperature: float = 0.0,
     t0 = time.perf_counter()
     for i, row in enumerate(test):
         prompt = prefix + f"Question: {row['question'].strip()}\nAnswer:"
-        out = client.gen(prompt, max_new=320, stop=["\nQuestion:", "\n\n"],
+        out = client.gen(prompt, max_new=320, stop=["\nQuestion:", "Question:"],
                          temperature=temperature, top_p=top_p, top_k=top_k,
                          min_p=min_p)
         pred = _last_number(out)
@@ -107,6 +107,10 @@ def run_gsm8k(client, n: int, shots: int, *, temperature: float = 0.0,
         correct += ok
         records.append({"i": i, "pred": pred, "gold": gold, "ok": ok,
                         "text": out, "question": row["question"]})
+        if i < 3:
+            preview = out.replace("\n", " / ")[:240]
+            print(f"  sample {i} pred={pred!r} gold={gold!r} ok={ok}  {preview}",
+                  flush=True)
         if (i + 1) % 10 == 0:
             el = time.perf_counter() - t0
             print(f"  {i + 1}/{len(test)}  acc {correct / (i + 1):.3f}  "
