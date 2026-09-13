@@ -91,7 +91,16 @@ sparse window and not in the selection at all.
 costing decode speed, or a measurement that says where it comes from and why
 it cannot be closed.
 
-## Problem 3: the routed experts on the ANE
+## Problem 3: the routed experts on the ANE — CLOSED, do not start
+
+The reverse-engineered ANE guide (arXiv 2606.22283v1) states that control flow
+must be static and that weights cannot be selected or indexed at run time. A
+mixture of experts chooses ten weight sets a token from a routing decision made
+during the run, so it cannot be expressed. The procedure-per-expert spelling is
+480 submits a token at about 1.17 ms of fixed cost each. See
+`ANE-ARCHITECTURE-NOTES.md`. The original text is kept below for the record.
+
+## Problem 3 (original text): the routed experts on the ANE
 
 **Worth: the 3.55 ms a token the GPU takes during prefill and the 29 ms a
 block during decode, plus the whole energy argument.**
