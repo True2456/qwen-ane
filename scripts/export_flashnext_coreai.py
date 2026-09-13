@@ -3713,7 +3713,8 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             if until == "ane":
                 return m_mix, m_hyp, m_inj, m_sh
             mixed_bsh2 = _bc1s_to_bsh(m_mix)
-            inds, sc = hl.moe._route(np.asarray(mixed_bsh2, np.float32).reshape(-1, H))
+            inds, sc = _route_tiled(
+                hl, np.asarray(mixed_bsh2, np.float32).reshape(-1, H))
             if _fused_moe == "all" and hl.moe._resident is not None:
                 sh_bsh = _bc1s_to_bsh(m_sh)
                 hyp_bsh = _bc1s_to_bsh(m_hyp)
@@ -3897,12 +3898,32 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
         _spec_pipe = os.environ.get("FLASHNEXT_PIPE", "0") not in ("0", "false", "")
 
         _fused_moe = os.environ.get("FLASHNEXT_FUSED_MOE", "none")
+        # Wide GDN + MoE at k=32 flips ~2/32 experts on the first layer and
+        # the discrete routing compounds down the stack (gdn0.state 0.0015
+        # vs qsa35.v 0.16 after 32 tokens). Isolated GDN/QSA/MoE are all in
+        # band, so the default keeps GDN at decode width and only widens QSA.
+        # FLASHNEXT_PREFILL_WIDE_GDN=1 restores the original both-wide path.
+        _wide_gdn = os.environ.get("FLASHNEXT_PREFILL_WIDE_GDN", "0") not in (
+            "0", "false", "")
+
+        def _route_tiled(hl, x):
+            """Route in decode-width tiles so a 32-row GEMM cannot flip near-ties."""
+            x = np.asarray(x, np.float32).reshape(-1, H)
+            tile = spec_k
+            if x.shape[0] <= tile:
+                return hl.moe._route(x)
+            inds, sc = [], []
+            for t2 in range(0, x.shape[0], tile):
+                i2, s2 = hl.moe._route(x[t2:t2 + tile])
+                inds.append(i2)
+                sc.append(s2)
+            return np.concatenate(inds, 0), np.concatenate(sc, 0)
 
         def _moe_from_ane(hl, m_mix, m_hyp, m_inj, m_sh, _b=None, bc1s=False):
             mixed_bsh = _bc1s_to_bsh(m_mix)
             t0 = time.perf_counter()
-            inds, sc = hl.moe._route(
-                np.asarray(mixed_bsh, np.float32).reshape(-1, H))
+            inds, sc = _route_tiled(
+                hl, np.asarray(mixed_bsh, np.float32).reshape(-1, H))
             t1 = time.perf_counter()
             if _fused_moe == "all" and hl.moe._resident is not None:
                 sh_bsh = _bc1s_to_bsh(m_sh)
@@ -3955,12 +3976,37 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 hl = host_layers[i]
                 if i in mil_gdn:
                     _t = time.perf_counter()
-                    _spec_xb[..., :n] = np.asarray(hid[..., :n], np.float16)
-                    _ts = time.perf_counter()
-                    m_mix, m_hyp, m_inj, m_sh = _active["gdn"][i](_spec_xb, n=n)
-                    _t2 = time.perf_counter()
-                    _b["gdn_stage"] += _ts - _t
-                    _b["gdn_ane"] += _t2 - _ts
+                    lay = _active["gdn"][i]
+                    if n > lay.k:
+                        if hasattr(lay, "select"):
+                            lay.select(0)
+                        tile = lay.k
+                        parts = []
+                        ane_dt = 0.0
+                        for t2 in range(0, n, tile):
+                            nt = min(tile, n - t2)
+                            _spec_xb[:] = 0
+                            _spec_xb[..., :nt] = np.asarray(
+                                hid[..., t2:t2 + nt], np.float16)
+                            _ts = time.perf_counter()
+                            parts.append(lay(_spec_xb, n=nt))
+                            lay.commit(nt - 1)
+                            ane_dt += time.perf_counter() - _ts
+                        m_mix = np.concatenate([p[0] for p in parts], axis=-1)
+                        m_hyp = np.concatenate([p[1] for p in parts], axis=-1)
+                        m_inj = np.concatenate([p[2] for p in parts], axis=-1)
+                        m_sh = np.concatenate([p[3] for p in parts], axis=-1)
+                        _b["gdn_ane"] += ane_dt
+                        _b["gdn_stage"] += time.perf_counter() - _t - ane_dt
+                    else:
+                        if n < _spec_xb.shape[-1]:
+                            _spec_xb[..., n:] = 0
+                        _spec_xb[..., :n] = np.asarray(hid[..., :n], np.float16)
+                        _ts = time.perf_counter()
+                        m_mix, m_hyp, m_inj, m_sh = lay(_spec_xb, n=n)
+                        _t2 = time.perf_counter()
+                        _b["gdn_stage"] += _ts - _t
+                        _b["gdn_ane"] += _t2 - _ts
                     hid = _moe_from_ane(hl, m_mix, m_hyp, m_inj, m_sh, _b, bc1s=True)
                 elif i in mil_qsa:
                     _t = time.perf_counter()
@@ -4108,7 +4154,9 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             """Adopt the prefix of length j + 1 across every layer."""
             _t = time.perf_counter()
             for i, lay in _active["gdn"].items():
-                lay.commit(j)
+                # Tiled GDN already committed each decode-width tile.
+                if j < lay.k:
+                    lay.commit(j)
             for i in mil_qsa:
                 cache = attn_state[i]
                 cache.offset = spec_kv_base[i] + j + 1
@@ -4307,6 +4355,9 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 f"{k2}={v2 * 1e3 / max(blocks, 1):.1f}"
                 for k2, v2 in mil_qsa_ms.items()), flush=True)
 
+        _ple0 = {i2: l2.snapshot() for i2, l2 in ple_layers.items()} \
+            if ple_layers else {}
+
         def _reset_all() -> None:
             """Put every layer back to an empty context.
 
@@ -4325,15 +4376,37 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 attn_state[i2].reset()
                 qsa_idx_state[i2] = _IS()
                 spec_kv_base[i2] = 0
+            for i2, st2 in _ple0.items():
+                ple_layers[i2].restore(st2)
             if drafter is not None:
                 drafter.reset()
 
-        def _prefill_ids(ids) -> None:
-            """Walk a context through the block path, committing every token."""
-            at = 0
-            width = (prefill_mil_k if (mil_gdn_pf and len(ids) >= prefill_mil_k)
-                     else spec_k)
-            if mil_gdn_pf and width == prefill_mil_k:
+        def _hash_state() -> dict:
+            import hashlib
+            g = {}
+            for i3, l3 in sorted(mil_gdn.items()):
+                g[f"gdn{i3}.state"] = hashlib.sha1(
+                    l3.current_state().tobytes()).hexdigest()[:12]
+                g[f"gdn{i3}.conv"] = hashlib.sha1(
+                    l3._conv.tobytes()).hexdigest()[:12]
+            for i3 in sorted(mil_qsa):
+                c3 = attn_state[i3]
+                o3 = int(c3.offset)
+                g[f"qsa{i3}.kv"] = hashlib.sha1(
+                    c3.keys[:, :o3].tobytes()
+                    + c3.values[:, :o3].tobytes()).hexdigest()[:12]
+                g[f"qsa{i3}.off"] = o3
+            for i3, l3 in sorted(ple_layers.items()):
+                g[f"ple{i3}"] = hashlib.sha1(
+                    np.asarray(l3.history).tobytes()
+                    + l3.conv.tobytes()).hexdigest()[:12]
+            return g
+
+        def _walk_width(ids, width) -> dict:
+            """Walk `ids` at `width` and return layer tensors for a rel compare."""
+            _reset_all()
+            use_wide = bool(mil_gdn_pf and width == prefill_mil_k)
+            if use_wide:
                 for lay2 in mil_gdn_pf.values():
                     if hasattr(lay2, "select"):
                         lay2.select(1)
@@ -4341,17 +4414,60 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     if hasattr(lay2, "select"):
                         lay2.select(1)
                 _active["gdn"], _active["qsa"] = mil_gdn_pf, mil_qsa_pf
+            at = 0
+            while at < len(ids):
+                n2 = min(width, len(ids) - at)
+                for i2 in mil_qsa:
+                    spec_kv_base[i2] = int(attn_state[i2].offset)
+                _block_forward(ids[at:at + n2])
+                _block_commit(n2 - 1)
+                at += n2
+            for lay2 in mil_gdn.values():
+                if hasattr(lay2, "select"):
+                    lay2.select(0)
+            for lay2 in mil_qsa.values():
+                if hasattr(lay2, "select"):
+                    lay2.select(0)
+            _active["gdn"], _active["qsa"] = mil_gdn, mil_qsa
+            snap = {}
+            for i3, l3 in mil_gdn.items():
+                snap[f"gdn{i3}.state"] = np.array(l3.current_state(), np.float32)
+                snap[f"gdn{i3}.conv"] = np.array(l3._conv, np.float32)
+            for i3 in mil_qsa:
+                c3 = attn_state[i3]
+                o3 = int(c3.offset)
+                snap[f"qsa{i3}.k"] = np.array(c3.keys[:, :o3], np.float32)
+                snap[f"qsa{i3}.v"] = np.array(c3.values[:, :o3], np.float32)
+            return snap
+
+        def _prefill_ids(ids) -> None:
+            """Walk a context through the block path, committing every token."""
+            at = 0
+            width = (prefill_mil_k if (mil_qsa_pf and len(ids) >= prefill_mil_k)
+                     else spec_k)
+            if mil_qsa_pf and width == prefill_mil_k:
+                if _wide_gdn:
+                    for lay2 in mil_gdn_pf.values():
+                        if hasattr(lay2, "select"):
+                            lay2.select(1)
+                    _active["gdn"] = mil_gdn_pf
+                for lay2 in mil_qsa_pf.values():
+                    if hasattr(lay2, "select"):
+                        lay2.select(1)
+                _active["qsa"] = mil_qsa_pf
             _lg = None
             while at < len(ids):
-                if (_active["gdn"] is mil_gdn_pf
+                if (_active["qsa"] is mil_qsa_pf
                         and len(ids) - at < width):
-                    for i2, pf in mil_gdn_pf.items():
-                        if mil_gdn[i2] is pf:
-                            pf.select(0)
+                    if _wide_gdn:
+                        for i2, pf in mil_gdn_pf.items():
+                            if mil_gdn[i2] is pf:
+                                pf.select(0)
+                        _active["gdn"] = mil_gdn
                     for i2, pf in mil_qsa_pf.items():
                         if mil_qsa[i2] is pf:
                             pf.select(0)
-                    _active["gdn"], _active["qsa"] = mil_gdn, mil_qsa
+                    _active["qsa"] = mil_qsa
                     width = spec_k
                 n2 = min(width, len(ids) - at)
                 for i2 in mil_qsa:
@@ -4369,13 +4485,15 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                                 np.asarray(_hid, np.float32)[:, :len(nxt), :])),
                             [list(nxt)])
                 at += n2
-            for i2, pf in mil_gdn_pf.items():
-                if mil_gdn[i2] is pf:
-                    pf.select(0)
+            if _wide_gdn:
+                for i2, pf in mil_gdn_pf.items():
+                    if mil_gdn[i2] is pf:
+                        pf.select(0)
+                _active["gdn"] = mil_gdn
             for i2, pf in mil_qsa_pf.items():
                 if mil_qsa[i2] is pf:
                     pf.select(0)
-            _active["gdn"], _active["qsa"] = mil_gdn, mil_qsa
+            _active["qsa"] = mil_qsa
             return _lg
 
         async def serve_loop() -> None:
@@ -4662,6 +4780,26 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             _mem_report(host_layers)
 
         t_all = time.perf_counter()
+        _ab_n = int(os.environ.get("FLASHNEXT_WIDTH_AB", "0") or 0)
+        if _ab_n and spec_k > 1 and mil_gdn_pf:
+            _ids_ab = list(prompt_ids[:_ab_n])
+            print(f"  width A/B over {len(_ids_ab)} tokens "
+                  f"(k={spec_k} vs k={prefill_mil_k})", flush=True)
+            _ha = _walk_width(_ids_ab, spec_k)
+            _hb = _walk_width(_ids_ab, prefill_mil_k)
+            def _rel(a, b):
+                return float(np.linalg.norm(a - b) / max(np.linalg.norm(b), 1e-12))
+            _rows = []
+            for k3 in sorted(_ha, key=lambda s: (s.split(".")[0][:3],
+                                                 int("".join(ch for ch in s if ch.isdigit()) or 0),
+                                                 s)):
+                _rows.append((k3, _rel(_hb[k3], _ha[k3])))
+            print("  width A/B rel (wide vs k=4)  " + "  ".join(
+                f"{n}={e:.4f}" for n, e in _rows if n.endswith(".state")
+                or n.endswith(".k") or n == "gdn0.conv"), flush=True)
+            _worst = max(_rows, key=lambda kv: kv[1])
+            print(f"  width A/B worst {_worst[0]}={_worst[1]:.4f}", flush=True)
+            _reset_all()
         prefill_steps = 0 if serve else len(prompt_ids) - 1
         pf_ids = list(prompt_ids)
         if fn_multi and prefill_steps > 0:
@@ -4701,39 +4839,46 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 were host side all along.
                 """
                 nonlocal _pf_w
-                if _active["gdn"] is not mil_gdn_pf:
+                if _active["qsa"] is not mil_qsa_pf:
                     return
-                for i2, pf in mil_gdn_pf.items():
-                    dec = mil_gdn[i2]
-                    if dec is pf:
-                        # Same program, same surfaces: the chunk's state and
-                        # conv window are already where decode reads them.
-                        dec.select(0)
-                        continue
-                    dec.set_state(pf.current_state())
-                    dec._conv[:] = pf._conv
-                    dec._conv_surface_current = False
+                if _wide_gdn:
+                    for i2, pf in mil_gdn_pf.items():
+                        dec = mil_gdn[i2]
+                        if dec is pf:
+                            # Same program, same surfaces: the chunk's state and
+                            # conv window are already where decode reads them.
+                            dec.select(0)
+                            continue
+                        dec.set_state(pf.current_state())
+                        dec._conv[:] = pf._conv
+                        dec._conv_surface_current = False
+                    _active["gdn"] = mil_gdn
                 for i2, pf in mil_qsa_pf.items():
                     dec = mil_qsa[i2]
                     if hasattr(dec, "select"):
                         dec.select(0)
-                _active["gdn"], _active["qsa"] = mil_gdn, mil_qsa
+                _active["qsa"] = mil_qsa
                 _pf_w = spec_k
 
-            if mil_gdn_pf and _pf_w > 1 and prefill_steps >= prefill_mil_k:
-                for lay_pf in mil_gdn_pf.values():
-                    if hasattr(lay_pf, "select"):
-                        lay_pf.select(1)
+            if mil_qsa_pf and _pf_w > 1 and prefill_steps >= prefill_mil_k:
+                if _wide_gdn:
+                    for lay_pf in mil_gdn_pf.values():
+                        if hasattr(lay_pf, "select"):
+                            lay_pf.select(1)
+                    _active["gdn"] = mil_gdn_pf
                 for lay_pf in mil_qsa_pf.values():
                     if hasattr(lay_pf, "select"):
                         lay_pf.select(1)
-                _active["gdn"], _active["qsa"] = mil_gdn_pf, mil_qsa_pf
+                _active["qsa"] = mil_qsa_pf
                 _pf_w = prefill_mil_k
+                print(f"  prefill k={prefill_mil_k}: QSA wide"
+                      + (", GDN wide" if _wide_gdn
+                         else f", GDN tiled at k={spec_k}"), flush=True)
             while _pf_at < prefill_steps:
                 # The wide graphs only export the last slot's state, so they
                 # can only run chunks of exactly their width. The tail goes
                 # through the decode graphs.
-                if (_active["gdn"] is mil_gdn_pf
+                if (_active["qsa"] is mil_qsa_pf
                         and prefill_steps - _pf_at < _pf_w):
                     _hand_over()
                 n = min(_pf_w, prefill_steps - _pf_at)
