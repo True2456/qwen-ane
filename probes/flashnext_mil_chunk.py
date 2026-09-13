@@ -2,13 +2,14 @@
 
 Q/K/V use [1, Hv, C, D]. Scalar decays are accumulated by a product scan,
 including pairwise decays, without reciprocal prefix products or log(0).
-The UT inverse uses the finite geometric series of a nilpotent matrix.
+The UT inverse uses blocked triangular doubling (a series is diagnostic only).
 Only the final recurrent state is materialized; decode retains prefix states.
 
-A 32-wide chunk is a different recurrence from eight 4-wide ones, and that
-difference is enough to flip MoE experts down a 48-layer stack. When
-`MIL_GDN_CHUNK_TILE` divides the live width, each tile is the same 4-wide
-(or 8-wide) chunk decode uses, with state threaded between them.
+The final state update needs the same power-of-two protection as the query
+matmuls: small delta/key products otherwise lose precision on the ANE and
+corrupt subsequent chunks. Scale delta by 64 for that matmul and undo it
+before adding the incoming state. `MIL_GDN_CHUNK_TILE=4` retains the slower
+decode-width tiling workaround for controlled comparisons.
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ import os
 def gdn_chunk(m, c, offs):
     if c not in (1, 2, 4, 8, 16, 32):
         raise ValueError("chunk live width must be 1, 2, 4, 8, 16 or 32")
-    tile = int(os.environ.get("MIL_GDN_CHUNK_TILE", "4") or 0)
+    tile = int(os.environ.get("MIL_GDN_CHUNK_TILE", "32") or 0)
     if tile and c > tile:
         if c % tile:
             raise ValueError(f"chunk width {c} is not a multiple of tile {tile}")
@@ -33,9 +34,9 @@ def gdn_chunk(m, c, offs):
 
 
 def _chunk_body(m, live, offs, start, state_in, prefix):
-    """One decode-width chunk over slots [start, start+live). Returns state name."""
+    """One chunk over slots [start, start+live). Returns the final state name."""
     q_scale = int(os.environ.get("MIL_GDN_CHUNK_Q_SCALE", "64"))
-    update_scale = int(os.environ.get("MIL_GDN_CHUNK_UPDATE_SCALE", "1"))
+    update_scale = int(os.environ.get("MIL_GDN_CHUNK_UPDATE_SCALE", "64"))
     if q_scale not in (1, 64) or update_scale not in (1, 64):
         raise ValueError("diagnostic matmul scales must be 1 or 64")
     c = 32
@@ -149,6 +150,9 @@ def _chunk_body(m, live, offs, start, state_in, prefix):
     m.sl4(p + 'cend', decay, (0, 0, c - 1, 0), (1, h, c, c), (1, h, 1, c))
     end = op('cendt', (1, h, c, 1), f'transpose(x={p}cend, perm=pm)')
     kend = binary('ckend', 'mul', k, end, c, d)
+    # The state survives into the next chunk. An unscaled update can pass
+    # a one-layer mixed-output check while losing small products here. Keep
+    # the multiply in range, then unscale its result before the state add.
     update_delta = delta
     if update_scale != 1:
         update_delta = binary('cupdate_scaled', 'mul', delta,

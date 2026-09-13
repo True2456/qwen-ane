@@ -476,3 +476,149 @@ token-by-token recurrence at 0.000 while wider ones do not, so the loss is in
 the chunked arithmetic itself, not in running prefill as one submit. The
 likely places are fp16 precision in the triangular inversion, the x64 query
 scaling, and the neutral padding that brings narrower chunks up to 32.
+
+
+## Full-width state update: the missing scale (2026-09-13 remeasurement)
+
+The four-slot tiling above was a workaround. The untiled 32-slot graph can
+pass the short-window gate: the final GDN state-update matmul needs scaling,
+just as the query matmuls already did. The default is now a single 32-slot
+chunk with `MIL_GDN_CHUNK_UPDATE_SCALE=64`. Decode's prefix-state recurrence
+is unchanged. `MIL_GDN_CHUNK_TILE=4 MIL_GDN_CHUNK_UPDATE_SCALE=1` reproduces
+the former workaround; `MIL_GDN_CHUNK_TILE=32 MIL_GDN_CHUNK_UPDATE_SCALE=1`
+reproduces the former fast path.
+
+### Evidence that isolates the state update
+
+On identical fp16 inputs in `probes/mil_chunk_core.py`, changing only the
+state-update scale from 1 to 64 gives:
+
+| relative error against NumPy float64 | scale 1 | scale 64 |
+| --- | --- | --- |
+| current chunk output | 0.00141437 | 0.00141437 |
+| final recurrent state | 0.01562905 | 0.00164694 |
+
+The graph multiplies delta by 64 before `delta.T @ kend`, then multiplies the
+result by 1/64 before adding the decayed incoming state. The unchanged current
+output explains why an output-only check can miss the problem. The improvement
+from power-of-two scaling is evidence of lost small products in the ANE
+matmul; it does not establish the engine's exact internal rounding mode.
+The new default also passes correlated-key and zero-decay core checks:
+output/state errors 0.002879/0.000338 and 0.001296/0.001646 respectively.
+The core probe now fails above 0.005, including for the final state.
+
+`probes/mil_k_check.py` is unchanged. Fresh results with the new default:
+
+| K | per-slot mixed band | final state | conv |
+| --- | --- | --- | --- |
+| 4 | 0.0282–0.0341 | 0.00618 | 0.01217 |
+| 32 | 0.0263–0.0340 | 0.00683 | 0.01129 |
+
+K=32 is 2.349 ms/call versus 4.598 ms for the old tiled default, measured
+before and after on this checkout. `probes/mil_gdn_walk_check.py` additionally
+compares against the production four-slot **prefix-state** graph, not a
+four-slot single-state chunk: after 128 identical input tokens, mixed error
+is 0.007952, recurrent state error 0.006751, and conv is identical.
+
+### QSA oracle rechecked before investigating GDN
+
+The K=1 check ran first. NumPy versus Torch attention error was 0.00070.
+The full width sweep then measured:
+
+| K | mixed | hyper | shared | new_k | new_v |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 0.02830 | 0.02623 | 0.04138 | 0.01382 | 0.01978 |
+| 4 | 0.03433 | 0.02797 | 0.04038 | 0.01472 | 0.02145 |
+| 8 | 0.03202 | 0.02840 | 0.04392 | 0.01478 | 0.02143 |
+| 16 | 0.03668 | 0.02910 | 0.05076 | 0.01493 | 0.02207 |
+| 32 | 0.03469 | 0.02941 | 0.04670 | 0.01495 | 0.02253 |
+
+The shared-program K=32 procedure gives the same numbers. Walking 64 tokens
+at K=1 versus K=32 gives identical key/value caches and last-token mixed error
+0.00055. No QSA graph, causal mask, or rotary change was needed. Both gate
+prompts are below the 2048-key indexer budget, so skipping selection for L>16
+cannot explain this failure; sparse long-context selection is a separate case.
+
+The old `flashnext_mil_qsa_layer.py` executable now delegates to this oracle
+instead of submitting without its required mixed/inject feeds. Every invocation
+checks K=1 first and fails on nonfinite or excessive errors; the walk also has
+failure thresholds. Run:
+
+```bash
+~/.rindi/venvs/coreai/bin/python probes/flashnext_mil_qsa_layer.py --all --two-proc --walk 64
+```
+
+`AneClient(prefill_k=0)` now explicitly sets the child's environment to 0.
+Previously it omitted the setting, silently inheriting either the parent's
+width or the exporter's new default of 32. The environment regression test
+covers both inherited and absent settings.
+
+### Full-model gate configuration
+
+These runs keep real PLE enabled (the checkout's default), the resident MLX
+expert bank, MLX head, speculative width 4, and both MIL layer backends:
+
+```bash
+FLASHNEXT_PREFILL_MIL_K=32 FLASHNEXT_SPEC=4 FLASHNEXT_MOE=mlxresident \
+FLASHNEXT_HEAD=mlx FLASHNEXT_MIL_GDN=1 FLASHNEXT_MIL_QSA=1 \
+~/.rindi/venvs/coreai/bin/python scripts/export_flashnext_coreai.py generate \
+  --ppl-file eval/prose.txt --ppl-tokens 32 --ppl-prefill 512
+```
+
+The same command with `FLASHNEXT_PREFILL_MIL_K=0` freshly reproduces
+**NLL 1.944132**. The first corrected full-width run gives **1.947003**,
+a difference of **+0.002871**, inside the 0.01 gate. These are 32-token
+scores immediately after prefill, not the misleading 1024-token window.
+
+The scorer prints the timing for walking 511 prompt tokens, keeping the
+512th token as input to the first scored prediction. Initial measurements:
+
+| term (ms/token) | K=0 baseline | corrected K=32 |
+| --- | --- | --- |
+| embed | 0.01 | 0.01 |
+| GDN staging | 1.00 | 0.10 |
+| GDN ANE total | 17.97 | 4.59 |
+| GDN router | 1.64 | 1.34 |
+| GDN MoE | 7.55 | 2.97 |
+| GDN recombine | 0.33 | 0.21 |
+| QSA total | 9.52 | 3.11 |
+| head | 0.87 | 0.29 |
+| commit | 1.27 | 0.25 |
+| PLE | 1.70 | 1.43 |
+| PLE lookup (included in PLE) | 0.69 | 0.35 |
+| **prefill** | **511 / 21.459s = 23.8 tok/s** | **511 / 7.336s = 69.7 tok/s** |
+
+GDN call breakdown (write / submit / take): baseline 0.25 / 17.06 / 0.63,
+corrected 0.08 / 4.38 / 0.13 ms/token. QSA breakdown (mix / index / feed /
+ANE / MoE / recombine): baseline 1.46 / 0.18 / 0.08 / 4.59 / 3.08 / 0.11,
+corrected 0.34 / 0.04 / 0.02 / 1.26 / 1.38 / 0.07 ms/token.
+These component breakdowns are nested inside the totals above.
+
+
+A fresh negative-control run with `MIL_GDN_CHUNK_UPDATE_SCALE=1` reproduces
+**NLL 2.015541 exactly**, at 70.3 tok/s. Thus this checkout reproduces the
+quality failure and the scale alone recovers it. The historical 82 tok/s is
+not reproduced here even on the uncorrected fast path; the corrected path
+preserves the measured fast-path rate within run-to-run variation.
+
+The exact tool fixture is now checked in as `eval/prefill_tool.json`.
+`FLASHNEXT_PREFILL_MIL_K=32 python probes/prefill_tool_check.py` verifies a
+cold (0 reused tokens), 324-token prompt, explicit K=32 ready state, and a
+literal `run_shell` call with `cmd="ls -la"`. It generated 47 tokens:
+
+```text
+The user wants me to list files in the current directory. Simple task.
+</think>
+
+<tool_call>
+<function=run_shell>
+<parameter=cmd>
+ls -la
+</parameter>
+</function>
+</tool_call>
+```
+
+No tool is executed by the check. All model and ANE runs were sequential;
+compiled caches were retained. Disk headroom went from 45 GiB to 38 GiB
+through the new graph builds, with no resource or compilation failures.

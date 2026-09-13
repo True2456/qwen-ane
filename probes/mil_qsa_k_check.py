@@ -304,11 +304,19 @@ def walk_compare(narrow: MilQsaLayer, wide: MilQsaLayer, k_wide: int, m: int,
 
     nck, ncv, nlast = run(narrow, 1)
     wck, wcv, wlast = run(wide, k_wide)
-    print(f"  walk {tokens} tok k=1 vs k={k_wide}: "
-          f"cache_k {rel(wck, nck):.5f}  cache_v {rel(wcv, ncv):.5f}  "
-          f"last_tok mixed {rel(wlast[0][:, -1], nlast[0][:, -1]):.5f}  "
-          f"last_chunk vs numpy {rel(wlast[0], wlast[1]):.5f}",
+    errors = {
+        "cache_k": rel(wck, nck), "cache_v": rel(wcv, ncv),
+        "last_mixed": rel(wlast[0][:, -1], nlast[0][:, -1]),
+        "numpy_mixed": rel(wlast[0], wlast[1]),
+    }
+    print(f"  walk {tokens} tok k=1 vs k={k_wide}: " +
+          "  ".join(f"{name} {value:.5f}" for name, value in errors.items()),
           flush=True)
+    for name, limit in (("cache_k", .002), ("cache_v", .002),
+                        ("last_mixed", .005), ("numpy_mixed", .05)):
+        if not np.isfinite(errors[name]) or errors[name] > limit:
+            raise AssertionError(f"walk {name}: {errors[name]:.6f} > {limit}")
+
 
 
 def check_band(tag: str, out: dict) -> None:
@@ -346,8 +354,8 @@ def main() -> None:
     import flashnext_mil_qsa_layer as QL
     QL.INT8[0] = os.environ.get("QSA_INT8", "1") != "0"
     m = int(args.m)
-    if m % 32:
-        raise SystemExit(f"rung {m} is not a multiple of 32")
+    if m <= 0 or m % 32:
+        raise SystemExit(f"rung {m} must be a positive multiple of 32")
     li = int(args.layer)
 
     loader, w = _load_layer(li)

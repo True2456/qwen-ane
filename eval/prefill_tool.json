@@ -1,0 +1,25 @@
+{
+  "op": "gen",
+  "template": true,
+  "messages": [
+    {"role": "user", "content": "List the files in the current directory."}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "run_shell",
+        "description": "Run a shell command, return stdout",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "cmd": {"type": "string", "description": "the command to run"}
+          },
+          "required": ["cmd"]
+        }
+      }
+    }
+  ],
+  "max_new": 160,
+  "temperature": 0
+}

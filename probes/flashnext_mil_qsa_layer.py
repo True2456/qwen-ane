@@ -1,8 +1,9 @@
-"""The whole QSA layer in one MIL program — the sibling of `flashnext_mil_layer`.
+"""The QSA layer MIL programs — the sibling of `flashnext_mil_layer`.
 
-Same shape as the GDN layer: hyper mixer, core, recombine, second mixer, shared
-expert. Only the core differs — grouped-query attention over a host-held KV
-window instead of the gated delta recurrence.
+The front program supplies the attention mixed/inject inputs and indexer
+projection. The main program runs grouped-query attention over a host-held KV
+window, recombine, the second mixer, and the shared expert. Use MilQsaLayer to
+stage both programs; running this module invokes the checked NumPy oracle.
 
 Decode collapses the attention. With one live query slot the Core AI graph's
 per-head einsum over 24 heads becomes a single grouped matmul:
@@ -22,6 +23,8 @@ Inputs (alphabetical, which is how surfaces bind):
     e_kc     [1, KVC, 1, KVM]       selected keys
     f_vc     [1, KVC, 1, KVM]       selected values
     g_mask   [1, 1, G*K, KVM + S]  broadcasts over the kv-head axis
+    h_mixed  [1, H, 1, S]          required front-program mixed input
+    i_inj    [1, HC, 1, S]         required front-program inject input
 Outputs (alphabetical):
     t_newk   [1, KVC, 1, S]         slot 0 live, tiled (a last-dim-1 output
     u_shared [1, H, 1, S]           surface comes back zero)

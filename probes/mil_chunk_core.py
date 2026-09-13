@@ -5,6 +5,7 @@ Outputs selected with --tap make the compiler prune downstream work, allowing
 cumulative stage timings. These are schedules, not additive per-node costs.
 """
 import argparse
+import os
 import time
 import sys
 from pathlib import Path
@@ -22,8 +23,13 @@ def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--tap', default='all',choices=['all','cdecay','ci4','cdelta','cy','q_state31'])
     ap.add_argument('--repeats',type=int,default=301)
+    ap.add_argument('--max-rel', type=float, default=.005,
+                    help='fail when output or final-state relative error exceeds this')
     ap.add_argument('--case', choices=['random', 'correlated', 'zero'], default='random')
     args=ap.parse_args()
+    # This probe isolates one untiled chunk; its named taps do not exist in
+    # the decode-width tiling workaround.
+    os.environ["MIL_GDN_CHUNK_TILE"] = "32"
     h,c,d=48,32,128
     m.B.clear()
     m.emit('tensor<bool, [4]> mm = const()[name=string("mm"), val=tensor<bool, [4]>([false,false,false,false])];')
@@ -87,6 +93,9 @@ def main():
         with _iosurface_view(surf,shapes[name],np.float16) as src: got=np.array(src,np.float64)
         if name in ['cy','q_state31']:
             ref=ref_y if name=='cy' else ref_state
-            print(f'{name}: rel={np.linalg.norm(got-ref)/np.linalg.norm(ref):.8f} max={np.max(np.abs(got-ref)):.8g} finite={np.isfinite(got).all()}')
+            error = float(np.linalg.norm(got-ref)/np.linalg.norm(ref))
+            print(f'{name}: rel={error:.8f} max={np.max(np.abs(got-ref)):.8g} finite={np.isfinite(got).all()}', flush=True)
+            assert np.isfinite(got).all() and error <= args.max_rel, (name, error)
+
 
 if __name__=='__main__': main()
