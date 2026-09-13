@@ -3117,7 +3117,12 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                               f"{time.perf_counter() - t_mil:.0f}s", flush=True)
                 if mil_gdn:
                     print(f"  MIL int8 GDN: {len(mil_gdn)} layers in "
-                          f"{time.perf_counter() - t_mil:.1f}s", flush=True)
+                          f"{time.perf_counter() - t_mil:.1f}s  "
+                          f"chunk_tile={os.environ.get('MIL_GDN_CHUNK_TILE', '32')} "
+                          f"update_scale={os.environ.get('MIL_GDN_CHUNK_UPDATE_SCALE', '64')} "
+                          f"q_scale={os.environ.get('MIL_GDN_CHUNK_Q_SCALE', '64')} "
+                          f"inverse={os.environ.get('MIL_GDN_CHUNK_INVERSE', 'blocked')}",
+                          flush=True)
                 if mil_gdn and mil_qsa and prefill_mil_k > max(1, spec_k):
                     t_pf = time.perf_counter()
                     try:
@@ -3898,9 +3903,10 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
         _spec_pipe = os.environ.get("FLASHNEXT_PIPE", "0") not in ("0", "false", "")
 
         _fused_moe = os.environ.get("FLASHNEXT_FUSED_MOE", "none")
-        # Wide GDN is one submit of k=32 whose recurrence is eight k=4
-        # chunks (MIL_GDN_CHUNK_TILE=4). Host-side GDN tiling remains as a
-        # fallback when a block is wider than the selected procedure.
+        # Wide GDN is one submit of k=32. The recurrence inside that submit
+        # is one chunk of MIL_GDN_CHUNK_TILE slots (default 32). Tile 4 is
+        # the slower decode-width workaround. Host-side GDN tiling remains
+        # as a fallback when a block is wider than the selected procedure.
         # FLASHNEXT_PREFILL_WIDE_GDN=0 keeps GDN at decode width.
         _wide_gdn = os.environ.get("FLASHNEXT_PREFILL_WIDE_GDN", "1") not in (
             "0", "false", "")

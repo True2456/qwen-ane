@@ -639,3 +639,110 @@ The final QSA sweep, shared-program check, 64-token QSA cache walk,
 128-token GDN walk against prefix-state decode, and isolated core all pass
 their executable thresholds. The isolated core negative control with
 `MIL_GDN_CHUNK_UPDATE_SCALE=1` is expected to fail on `q_state31` at 0.01562905.
+
+## Remeasured: the wide chunk loses precision in the state-update matmul
+
+The section above already switched the default to one 32-slot chunk with
+`MIL_GDN_CHUNK_UPDATE_SCALE=64`. This pass re-measured the claim against the
+token-by-token recurrence *before* any full-model run, because `mil_k_check`
+against `MultiTokenStep` passes at every width and still lets experts flip.
+
+`probes/mil_chunk_vs_recurrent.py` compiles the isolated GDN core (no
+projections) once as 32 unrolled `gdn_core` steps and once as a chunk, same
+fp16 inputs. NumPy fp64 WY versus that recurrence is `y=2.4e-7` /
+`state=8e-8`, so the equations are not the loss. Neutral padding (gate 1,
+beta 0, zero q/k/v) in NumPy fp16 is also a non-event:
+
+| pad live→32 vs native-live | y | state |
+| --- | --- | --- |
+| 4 | 5e-8 | 0 |
+| 8 | 6e-8 | 2e-8 |
+| 16 | 1e-8 | 3e-8 |
+
+The non-monotonic tile-8-versus-16 quality table is therefore not padding in
+the arithmetic. The ANE is where the widths come apart.
+
+### Which step diverges
+
+Against the ANE recurrent graph, current-chunk *output* `cy` is the same
+whether the state update is scaled or not. Final *state* is not:
+
+| ANE config vs recurrent | per-slot y (t00 … t31) | state |
+| --- | --- | --- |
+| tile 32, update 64, q 64 (default) | 0.00098 … 0.00325 | **0.00170** |
+| tile 32, update **1**, q 64 | identical y | **0.01564** |
+| tile 32, update 64, q **1** | **0.047 … 0.214** | 0.00170 |
+| tile 4, update 64 | 0.00106 … 0.00809 (spikes at chunk boundaries) | 0.00156 |
+| tile 4, update 1 | same pattern, larger | 0.01014 |
+| tile 8, update 64 | 0.00106 … 0.00382 | 0.00163 |
+| tile 16, update 64 | 0.00106 … 0.00480 | 0.00172 |
+
+`mil_chunk_core.py` on the same seed reproduces the documented pair exactly:
+`cy=0.00141437` either way; `q_state31=0.00164694` at scale 64 and
+`0.01562905` at scale 1 (the probe now fails closed above 0.005). Correlated
+keys at scale 1 are *better* (`state=0.00132`), so this is lost small
+products in the `delta.T @ kend` matmul, not the blocked inverse blowing up.
+
+`MIL_GDN_CHUNK_Q_SCALE=64` is the older underflow fix for `Y`. Turning it
+off wrecks the current outputs and leaves the state alone. Turning the
+update scale off wrecks the state that the next chunk inherits and leaves
+`Y` alone. An output-only check, including `mil_k_check`'s mixed column,
+cannot see the failure.
+
+Tile 4 versus token-by-token is **not** 0.000. That 0.000 was eight k=4
+chunks against eight k=4 chunks. Versus `gdn_core`, tile 4 at the old
+unscaled update is state 0.010, and the first token of each new 4-wide
+chunk spikes because it reads the already-rounded state. Scale 64 brings
+every width into the same 0.0016–0.0017 state band, so the width to ship
+is 32: no padding, one matmul, same accuracy.
+
+### Layer checks, unchanged
+
+`chunk_tile=32 update_scale=64 q_scale=64 inverse=blocked` is what generate
+now prints when the MIL GDN set loads.
+
+| probe | result |
+| --- | --- |
+| `mil_k_check.py` 4 | mixed 0.0282–0.0341, state 0.00618, conv 0.01217 |
+| `mil_k_check.py` 32 | mixed 0.0263–0.0340, state 0.00683, conv 0.01129; vs 8×k=4 mixed 0.00268 state 0.00138 conv 0 |
+| `mil_qsa_k_check.py` 4 / 32 / two-proc | mixed 0.03433 / 0.03469 / 0.03469, K=1 first 0.02830 |
+| `mil_gdn_walk_check.py` 128 tokens | mixed 0.007952, state 0.006751, conv 0 |
+
+### Full-model gates (default tile 32, this checkout)
+
+```bash
+FLASHNEXT_PREFILL_MIL_K=32 FLASHNEXT_SPEC=4 FLASHNEXT_MOE=mlxresident \
+FLASHNEXT_HEAD=mlx FLASHNEXT_MIL_GDN=1 FLASHNEXT_MIL_QSA=1 \
+FLASHNEXT_NO_DRAFTER=1 \
+~/.rindi/venvs/coreai/bin/python scripts/export_flashnext_coreai.py generate \
+  --ppl-file eval/prose.txt --ppl-tokens 32 --ppl-prefill 512
+```
+
+| gate | result |
+| --- | --- |
+| 32 tokens scored after a 512-token prefill | **nll 1.947003** vs 1.944132 (**+0.002871**), inside 0.01 |
+| 511-token prefill | **68.0 tok/s** (7.510 s), GDN submit 4.40 ms/token; above 57.9 |
+| tool prompt, `probes/prefill_tool_check.py` | 324 tokens, 0 reused, 47 generated, **`run_shell(cmd='ls -la')`** |
+| decode `--prompt-ids 760 --max-new 64` (spec 4, PLE on, drafter on) | ids **identical** to the PLE-on baseline in `results/ple/decode_on.log`, **8.288 tok/s** |
+
+The 64-id list earlier in this file (`279, 5492, 1752, …` at 20.3 tok/s) is
+the PLE-off decode. With the table on, greedy from `"The"` is the bedbugs
+continuation starting `20438, 5134, 25, 1001, …`. Chunking does not touch
+the prefix-state decode graphs.
+
+### Negatives from this pass
+
+- **`MIL_GDN_CHUNK_UPDATE_SCALE=1`** at tile 32: core `q_state31=0.01562905`.
+  Historical e2e nll **2.015541**. Do not ship.
+- **`MIL_GDN_CHUNK_Q_SCALE=1`**: current y vs recurrent 0.047–0.214. State
+  unchanged. The query scale is necessary and is not the state bug.
+- **Neutral padding** in NumPy: not the tile-8-versus-16 quality wobble.
+- **Tile 4 as an oracle for tile 32**: matches other 4-wide chunks at 0.000,
+  not the token-by-token recurrence.
+- **`FLASHNEXT_NO_DRAFTER=1` on decode**: 1.00 tokens/pass, 7.134 tok/s, ids
+  diverge after token 3 (`271, 29` inserted). Prefill scoring still used it
+  and matched nll 1.947003; do not use it as the decode-id gate.
+
+No emitter change was required beyond what `1b1779b` already defaulted:
+tile 32, update scale 64. The path print on `MIL int8 GDN:` is so a flag
+that does not reach `gdn_chunk` cannot look like a no-op.
