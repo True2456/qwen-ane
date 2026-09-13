@@ -286,3 +286,34 @@ the drafter's front normalises what is left of it.
 
 So the table's cost on decode is mostly the lookup, and the acceptance part is
 not the drafter failing to follow the backbone. It stays off by default.
+
+## Where the shared expert comes from, and why bf16 is the wrong answer
+
+The ANE graphs bake most weights from the bf16 checkpoint, but the shared
+expert comes from the 4-bit checkpoint's dequantised 8-bit copy. That is a
+round trip the source does not need: bf16 to 8-bit to fp16, for weights that
+run on every token of every one of the 48 layers.
+
+It is not free. The two copies are 0.93% apart by weight, and swapping one for
+the other moves the layer's shared-expert output by 1.7%, against a per-layer
+error of about 3% for the whole port.
+
+Taking it from bf16 instead is **worse**, scoring 1024 tokens after a
+512-token prefill:
+
+| shared expert baked from | nll | ppl |
+| --- | --- | --- |
+| the 4-bit checkpoint's 8-bit copy | 1.845533 | 6.3315 |
+| the bf16 source | 1.852451 | 6.3754 |
+
+0.4% the wrong way. The likely reason is that the quantised checkpoint is
+calibrated and the raw source is not, so its shared expert suits the 4-bit
+routed bank it is summed with. Whatever the reason, the measurement is clear
+enough to keep the current behaviour. `MIL_SHARED_FROM_BF16=1` switches it.
+
+Two things this cost to find, worth remembering. The first attempt read the
+tensors out of the layer weights the exporter already had, which silently
+returned nothing because something upstream consumes them, so both arms
+measured identically and looked like a no-op. And `MIL_SHARED_DEBUG=1` now
+prints which source each layer used, because "the flag had no effect" and
+"the flag is not reaching the code" are indistinguishable from the outside.

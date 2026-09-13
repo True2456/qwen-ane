@@ -334,9 +334,32 @@ def build_layer(w, ref):
     from runtime.expert_bank import Mlx4ExpertBank, MLX4_DEFAULT, MlxSafe
     bank = Mlx4ExpertBank(MLX4_DEFAULT)
     sg_, su_, sd_ = bank.shared_fp32(LAYER[0])
+    # The shared expert runs on every token in every layer. Reading it from
+    # the 4-bit checkpoint's dequantised 8-bit copy costs 0.9% relative error
+    # against the bf16 source, which is right there in the layer weights, and
+    # the port's whole per-layer error is only about 3%. Prefer bf16.
+    _tens = bf16_layer(LAYER[0]) or getattr(w, "tensors", w)
+
+    _bf16_shared = os.environ.get("MIL_SHARED_FROM_BF16", "0") == "1"
+
+    def _shared(key, fallback):
+        hit = _tens.get(f"mlp.shared_expert.{key}.weight") if _bf16_shared \
+            else None
+        if os.environ.get("MIL_SHARED_DEBUG") == "1":
+            print(f"    [shared] L{LAYER[0]} {key}: "
+                  f"{'bf16' if hit is not None else 'bank'}", flush=True)
+        return np.asarray(hit, np.float32) if hit is not None else fallback
+
+    sg_ = _shared('gate_proj', sg_)
+    su_ = _shared('up_proj', su_)
+    sd_ = _shared('down_proj', sd_)
     src = MlxSafe(MLX4_DEFAULT)
-    sgate_ = np.asarray(src.f32(f"model.layers.{LAYER[0]}.mlp.shared_expert_gate.weight"),
-                        np.float32).reshape(1, H)
+    _sg_key = "mlp.shared_expert_gate.weight"
+    sgate_ = (np.asarray(_tens[_sg_key], np.float32)
+              if (_bf16_shared and _sg_key in _tens) else
+              np.asarray(src.f32(
+                  f"model.layers.{LAYER[0]}.mlp.shared_expert_gate.weight"),
+                  np.float32)).reshape(1, H)
     src.close()
     for key, wt, co, ci in (("sh_gate", sg_, I, H), ("sh_up", su_, I, H),
                             ("sh_down", sd_, H, I), ("sh_sg", sgate_, 1, H)):
@@ -400,6 +423,38 @@ def build_layer(w, ref):
 
 
 LAYER = [0]
+
+
+#: One loader over the bf16 checkpoint, shared by every layer build.
+#:
+#: The shared expert is baked from the 4-bit checkpoint's dequantised 8-bit
+#: copy, which is 0.9% away from the bf16 source by weight and moves the
+#: layer's shared output by 1.7%. Taking it from bf16 instead is measurably
+#: *worse*: 1.852451 against 1.845533 scoring 1024 tokens after a 512-token
+#: prefill. The quantised checkpoint is calibrated and the raw source is not,
+#: and the calibrated copy evidently suits the 4-bit routed bank it is added
+#: to. Off by default; MIL_SHARED_FROM_BF16=1 switches it back.
+_BF16 = [None]
+
+
+def bf16_layer(layer: int):
+    """Layer tensors straight from the bf16 checkpoint, or None."""
+    if os.environ.get("MIL_SHARED_FROM_BF16", "0") != "1":
+        return None
+    if _BF16[0] is None:
+        try:
+            from tools.flashnext_reference import FlashNextLoader
+            from export_flashnext_coreai import BASE as _B
+            _BF16[0] = FlashNextLoader(str(_B))
+        except Exception:  # noqa: BLE001
+            _BF16[0] = False
+    if not _BF16[0]:
+        return None
+    try:
+        w = _BF16[0].layer(int(layer))
+        return getattr(w, "tensors", w)
+    except Exception:  # noqa: BLE001
+        return None
 K = [1]          # live token slots; must divide S
 # Speculation needs the recurrent state at every prefix so a partly accepted
 # block can unwind. Prefill accepts the whole chunk, so it only needs the last
