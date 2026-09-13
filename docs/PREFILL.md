@@ -367,3 +367,40 @@ want.
 after the prompt, not a long one.** Use `--ppl-tokens 32 --ppl-prefill 512`.
 A long window measures how fast the recurrence recovers, which is not the
 question.
+
+## Why prefill is barely faster than decode, and what to fix
+
+Prefill runs at decode's batch size. A block is 4 tokens either way, and decode
+confirms about 2.9 of them, so prefill gets 4 tokens a pass against decode's
+2.9. That 1.4x is the whole difference. Nothing about the arithmetic makes
+prefill slow; it simply is not batched.
+
+Widening the block is the fix and it works: 32 tokens a pass is 82 tok/s
+against 25.6. It is unusable today because it corrupts the state, and the
+suspect is now narrower than "the wide path".
+
+The GDN side is verified at every width. `probes/mil_k_check.py` compares it
+against `MultiTokenStep` and prints the same per-slot errors at K=1, 4, 8, 16
+and 32.
+
+The QSA side has never been verified at any width, and the probe that looks
+like it does is not an oracle. `probes/flashnext_mil_qsa_layer.py` run as
+intended reports:
+
+```
+QSA FULL LAYER (int8=True, m=256, k=1): mixed 0.99220  hyper 0.89212
+                                        shared 0.97159  new_k 1.00000
+```
+
+Relative errors of about 1.0 mean the two sides share nothing, yet the shipped
+decode path built from this same graph reproduces the 4-bit MLX reference
+character for character on a tool-calling prompt. So the layer is right and its
+reference is wrong. It reports this at k=1 as well as k=32, so it has been
+uninformative the whole time.
+
+**The next step on prefill is to build a QSA check that works**, along the
+lines of `mil_k_check.py`: drive the layer and a numpy reference from the same
+weights, the same key cache and the same rotary table, and compare at K=1 first
+to establish the oracle before trusting it at 32. Then find out whether the
+wide QSA layer is what corrupts the prompt. If it is, prefill is a fix away
+from 82 tok/s.
