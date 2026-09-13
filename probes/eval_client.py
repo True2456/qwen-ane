@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -96,6 +97,9 @@ class MlxClient:
     """The unmodified 4-bit model, for the arm to compare against."""
 
     def __init__(self, **_):
+        mlx_lm_path = str(Path.home() / ".mlx128/mlx-lm")
+        if mlx_lm_path not in sys.path:
+            sys.path.insert(0, mlx_lm_path)
         import mlx.core as mx
         from mlx_lm.utils import load
         if not hasattr(mx, "unique"):
