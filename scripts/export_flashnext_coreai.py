@@ -2756,7 +2756,8 @@ def stage_moe(seq: int, reuse: bool, prompt_ids: list[int]) -> None:
 
 def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                    no_ane: bool = False, host_front: bool = False,
-                   ppl_ids: list[int] | None = None) -> None:
+                   ppl_ids: list[int] | None = None,
+                   serve: bool = False, serve_ctx: int = 8192) -> None:
     """48-layer greedy decode. ANE every layer that has a compiled asset."""
     if not prompt_ids or max_new < 1:
         raise ValueError("generate requires a nonempty prompt and max_new >= 1")
@@ -2816,7 +2817,11 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             attn_state[i] = AttnCache.empty(
                 int(cfg["num_key_value_heads"]),
                 int(cfg["head_dim"]),
-                max_len=max(seq, len(prompt_ids) + max_new + 8),
+                # Serving sizes the key cache by the context it promises,
+                # not by one prompt. `seq` stays the compiled graph width and
+                # the asset names are keyed off it, so it must not be moved.
+                max_len=max(seq, len(prompt_ids) + max_new + 8,
+                            serve_ctx if serve else 0),
                 dtype=np.float16,
             )
 
@@ -3841,6 +3846,8 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
         # pass.
         _spec_xb = np.zeros((1, HC_W, 1, seq), np.float16)
         spec_pos = [[0, 0] for _ in range(max(1, spec_k))]
+        #: Token ids that end a generation, set per request in serve mode.
+        _stop_ids: set[int] = set()
         _spec_n1 = os.environ.get("FLASHNEXT_SPEC_N1") == "1"
         spec_ms = {"embed": 0.0, "gdn_stage": 0.0,
                    "gdn_ane": 0.0, "gdn_route": 0.0, "gdn_moe": 0.0,
@@ -4176,8 +4183,12 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                         break
                     generated.append(tok)
                     cur.append(tok)
+                    if tok in _stop_ids:
+                        break
                 if lookup is not None:
                     lookup.extend(cur[_before:])
+                if generated and generated[-1] in _stop_ids:
+                    break
                 tid_l = preds[m]
                 chain = mx.array(np.ascontiguousarray(
                     np.asarray(hid, np.float32)[:, m:m + 1, :]))
@@ -4244,6 +4255,148 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 f"{k2}={v2 * 1e3 / max(blocks, 1):.1f}"
                 for k2, v2 in mil_qsa_ms.items()), flush=True)
 
+        def _reset_all() -> None:
+            """Put every layer back to an empty context.
+
+            A GDN layer carries a recurrent state and a conv window, a QSA
+            layer a key cache and the indexer's blocks, and the drafter its own
+            cache. Nothing else survives a turn.
+            """
+            from runtime.flashnext_indexer import IndexerState as _IS
+            zero = np.zeros((HV, DV, DK), np.float16)
+            for lay2 in mil_gdn.values():
+                lay2.select(0) if hasattr(lay2, "select") else None
+                lay2.set_state(zero)
+                lay2._conv[:] = 0
+                lay2._conv_surface_current = False
+            for i2 in mil_qsa:
+                attn_state[i2].reset()
+                qsa_idx_state[i2] = _IS()
+                spec_kv_base[i2] = 0
+            if drafter is not None:
+                drafter.reset()
+
+        def _prefill_ids(ids) -> None:
+            """Walk a context through the block path, committing every token."""
+            at = 0
+            width = (prefill_mil_k if (mil_gdn_pf and len(ids) >= prefill_mil_k)
+                     else spec_k)
+            if mil_gdn_pf and width == prefill_mil_k:
+                for lay2 in mil_gdn_pf.values():
+                    if hasattr(lay2, "select"):
+                        lay2.select(1)
+                _active["gdn"], _active["qsa"] = mil_gdn_pf, mil_qsa_pf
+            _lg = None
+            while at < len(ids):
+                if (_active["gdn"] is mil_gdn_pf
+                        and len(ids) - at < width):
+                    for i2, pf in mil_gdn_pf.items():
+                        if mil_gdn[i2] is pf:
+                            pf.select(0)
+                    _active["gdn"], _active["qsa"] = mil_gdn, mil_qsa
+                    width = spec_k
+                n2 = min(width, len(ids) - at)
+                for i2 in mil_qsa:
+                    spec_kv_base[i2] = int(attn_state[i2].offset)
+                _hid, _lg = _block_forward(ids[at:at + n2])
+                _block_commit(n2 - 1)
+                # The drafter is conditioned on each position's hidden state
+                # paired with the token that follows it, so it walks the
+                # prompt too or it drafts from an empty cache.
+                if drafter is not None:
+                    nxt = ids[at + 1:at + n2 + 1]
+                    if nxt:
+                        drafter.advance(
+                            mx.array(np.ascontiguousarray(
+                                np.asarray(_hid, np.float32)[:, :len(nxt), :])),
+                            [list(nxt)])
+                at += n2
+            for i2, pf in mil_gdn_pf.items():
+                if mil_gdn[i2] is pf:
+                    pf.select(0)
+            _active["gdn"], _active["qsa"] = mil_gdn, mil_qsa
+            return _lg
+
+        async def serve_loop() -> None:
+            """One request a line on stdin, one JSON object a line on stdout.
+
+            The point is to hold the 73 GB once and answer many prompts, so a
+            harness can run MMLU or GSM8K or an agent trace without paying the
+            load again. Ops: `gen` (text in, text out), `score` (the next-token
+            logprob of specific continuations, which is what multiple choice
+            needs), `reset`, `quit`.
+            """
+            nonlocal generated, cur, max_new
+            import json
+            from tokenizers import Tokenizer
+            tok = Tokenizer.from_file(str(BASE / "tokenizer.json"))
+            chat = None
+            print(json.dumps({"ready": True, "spec_k": spec_k,
+                              "prefill_k": prefill_mil_k if mil_gdn_pf else 0}),
+                  flush=True)
+            for line in sys.stdin:
+                line = line.strip()
+                if not line:
+                    continue
+                t0 = time.perf_counter()
+                try:
+                    req = json.loads(line)
+                    op = req.get("op", "gen")
+                    if op == "quit":
+                        break
+                    if op == "reset":
+                        _reset_all()
+                        print(json.dumps({"ok": True}), flush=True)
+                        continue
+                    text = req.get("prompt", "")
+                    if req.get("template"):
+                        if chat is None:
+                            from transformers import AutoTokenizer
+                            chat = AutoTokenizer.from_pretrained(str(BASE))
+                        text = chat.apply_chat_template(
+                            req["messages"], tokenize=False,
+                            add_generation_prompt=True)
+                    ids = list(tok.encode(text, add_special_tokens=False).ids)
+                    if not ids:
+                        raise ValueError("empty prompt")
+                    _reset_all()
+                    if op == "score":
+                        lg = _prefill_ids(ids)
+                        row = np.asarray(lg, np.float64)[-1]
+                        m = row.max()
+                        lse = m + np.log(np.exp(row - m).sum())
+                        out = {}
+                        for c in req.get("choices", []):
+                            cid = tok.encode(c, add_special_tokens=False).ids
+                            if not cid:
+                                continue
+                            out[c] = float(row[cid[0]] - lse)
+                        print(json.dumps({
+                            "logprobs": out, "prompt_tokens": len(ids),
+                            "ms": (time.perf_counter() - t0) * 1e3}), flush=True)
+                        continue
+                    # gen
+                    _prefill_ids(ids[:-1])
+                    cur = list(ids)
+                    generated = []
+                    max_new = int(req.get("max_new", 256))
+                    _stop_ids.clear()
+                    _stop_ids.update(int(v) for v in req.get("stop_ids", []))
+                    await speculate()
+                    got = tok.decode(generated)
+                    for stop in req.get("stop", []):
+                        if stop and stop in got:
+                            got = got[:got.index(stop)]
+                            break
+                    dt = time.perf_counter() - t0
+                    print(json.dumps({
+                        "text": got, "tokens": len(generated),
+                        "prompt_tokens": len(ids), "ms": dt * 1e3,
+                        "tok_s": len(generated) / max(dt, 1e-9)}), flush=True)
+                except Exception as exc:  # noqa: BLE001
+                    print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}),
+                          flush=True)
+
         if spec_k > 1:
             if not (mil_gdn and mil_qsa and q_head is not None):
                 raise RuntimeError("FLASHNEXT_SPEC needs MIL GDN + MIL QSA + "
@@ -4269,8 +4422,33 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                   f"(FLASHNEXT_EAGER, draft || commit)",
                   flush=True)
 
+        # Every layer's raw weights were cached on the host so the MIL
+        # builds, the host mixers and the asset paths could each ask for them.
+        # Nothing reads them once the programs are baked, and they are 24 GB of
+        # Malloc Large in a process whose footprint is otherwise 73 GB wired.
+        if os.environ.get("FLASHNEXT_KEEP_LAYER_CACHE") != "1":
+            _n_cached = len(layer_cache)
+            layer_cache.clear()
+            import gc as _gc
+            _gc.collect()
+            # malloc_zone_pressure_relief returns 0 here, so what is left
+            # after this is live, not spans libmalloc is sitting on.
+            print(f"  released {_n_cached} cached layer weights", flush=True)
+        if os.environ.get("FLASHNEXT_MEM_REPORT") == "1":
+            import gc as _gc2
+            from collections import Counter as _C
+            tally, total = _C(), 0
+            for o in _gc2.get_objects():
+                if isinstance(o, np.ndarray) and o.nbytes >= 4 << 20 \
+                        and o.base is None:
+                    tally[(o.shape, str(o.dtype))] += o.nbytes
+                    total += o.nbytes
+            print(f"  host arrays over 4 MB: {total / 2**30:.2f} GB", flush=True)
+            for (shape, dt), n in tally.most_common(10):
+                print(f"    {n / 2**30:7.3f} GB  {dt:8s} {shape}", flush=True)
+
         t_all = time.perf_counter()
-        prefill_steps = len(prompt_ids) - 1
+        prefill_steps = 0 if serve else len(prompt_ids) - 1
         pf_ids = list(prompt_ids)
         if fn_multi and prefill_steps > 0:
             done = await prefill_chunked(prompt_ids[:-1], prefill_k)
@@ -4382,6 +4560,9 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 spec_ms[_k] = 0.0
             for _k in mil_qsa_ms:
                 mil_qsa_ms[_k] = 0.0
+            if serve:
+                await serve_loop()
+                return
             if ppl_ids:
                 await evaluate_ppl(ppl_ids)
                 return
@@ -4686,6 +4867,18 @@ def main() -> None:
         help="layers: comma-separated decoder indices (default: all 48)",
     )
     p.add_argument(
+        "--serve-ctx",
+        type=int,
+        default=8192,
+        help="generate --serve: key cache size, the longest context served",
+    )
+    p.add_argument(
+        "--serve",
+        action="store_true",
+        help="generate: hold the model and answer one JSON request a line on "
+             "stdin, so a harness can run many prompts without reloading",
+    )
+    p.add_argument(
         "--ppl-file",
         default=None,
         help="generate: score this text file's tokens instead of generating, "
@@ -4776,7 +4969,8 @@ def main() -> None:
             # Cache sizing follows max_new, and scoring walks the whole file.
             args.max_new = len(ppl_ids) + 8
         stage_generate(args.seq, args.max_new, ids, no_ane=args.no_ane,
-                       host_front=args.host_front, ppl_ids=ppl_ids)
+                       host_front=args.host_front, ppl_ids=ppl_ids,
+                       serve=args.serve, serve_ctx=args.serve_ctx)
     elif args.stage == "fuse":
         from export_flashnext_gdn_fuse import stage_fuse
         stage_fuse(args.seq, args.skip_bench, args.reuse, args.export_layers)
