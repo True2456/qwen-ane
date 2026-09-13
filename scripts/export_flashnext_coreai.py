@@ -2787,9 +2787,9 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
     )
 
     prompt_id, mlx_prefix = MLX_GREEDY_THE
-    ple_enabled = os.environ.get("FLASHNEXT_PLE", "0") == "1"
+    ple_enabled = os.environ.get("FLASHNEXT_PLE", "1") not in ("0", "false", "")
     print("  PLE: checkpoint-derived SSD rows" if ple_enabled else
-          "  PLE: zero-table baseline (FLASHNEXT_PLE=1 enables real SSD rows)")
+          "  PLE: zero-table baseline (FLASHNEXT_PLE=0 disables real SSD rows)")
     if len(prompt_ids) > 16:
         print(f"  prompt n={len(prompt_ids)} ids={prompt_ids[:8]}…{prompt_ids[-4:]}  "
               f"max_new={max_new}  MLX 4-bit greedy after {prompt_id}: {list(mlx_prefix)}…")
