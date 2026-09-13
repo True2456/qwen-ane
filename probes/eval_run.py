@@ -100,17 +100,19 @@ def run_gsm8k(client, n: int, shots: int, *, temperature: float = 0.0,
         prompt = prefix + f"Question: {row['question'].strip()}\nAnswer:"
         out = client.gen(prompt, max_new=320, stop=["\nQuestion:", "Question:"],
                          temperature=temperature, top_p=top_p, top_k=top_k,
-                         min_p=min_p)
+                         min_p=min_p, stop_ids=[])
         pred = _last_number(out)
         gold = row["answer"].split("####")[-1].strip().replace(",", "")
         ok = pred is not None and pred == gold
         correct += ok
+        n_tok = getattr(client, "last", {}).get("tokens") if hasattr(client, "last") else None
         records.append({"i": i, "pred": pred, "gold": gold, "ok": ok,
-                        "text": out, "question": row["question"]})
+                        "text": out, "question": row["question"],
+                        "tokens": n_tok})
         if i < 3:
             preview = out.replace("\n", " / ")[:240]
-            print(f"  sample {i} pred={pred!r} gold={gold!r} ok={ok}  {preview}",
-                  flush=True)
+            print(f"  sample {i} pred={pred!r} gold={gold!r} ok={ok} "
+                  f"tok={n_tok}  {preview}", flush=True)
         if (i + 1) % 10 == 0:
             el = time.perf_counter() - t0
             print(f"  {i + 1}/{len(test)}  acc {correct / (i + 1):.3f}  "

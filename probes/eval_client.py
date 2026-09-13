@@ -72,10 +72,17 @@ class AneClient:
 
     def gen(self, prompt: str, max_new: int, stop: list[str],
             temperature: float = 0.0, top_p: float = 1.0, top_k: int = 0,
-            min_p: float = 0.0) -> str:
-        return self._rpc({"op": "gen", "prompt": prompt, "max_new": max_new,
-                          "stop": stop, "temperature": temperature,
-                          "top_p": top_p, "top_k": top_k, "min_p": min_p})["text"]
+            min_p: float = 0.0, stop_ids=None) -> str:
+        req = {"op": "gen", "prompt": prompt, "max_new": max_new,
+               "stop": stop, "temperature": temperature,
+               "top_p": top_p, "top_k": top_k, "min_p": min_p}
+        # generation_config.json lists bos/im_start as eos. That ends a
+        # completion-style GSM8K answer on the first token and yields "".
+        if stop_ids is not None:
+            req["stop_ids"] = stop_ids
+        out = self._rpc(req)
+        self.last = out
+        return out["text"]
 
     def close(self) -> None:
         try:
