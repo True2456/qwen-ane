@@ -56,7 +56,12 @@ def scan(min_bytes: int = 4 << 20) -> dict:
 
     for o in gc.get_objects():
         try:
-            if np is not None and isinstance(o, np.ndarray):
+            cls = type(o)
+            # isinstance() on gc debris trips torch.distributed.reduce_op's
+            # deprecation warning; identity is enough for ndarrays/tensors.
+            if np is not None and (cls is np.ndarray or (
+                    getattr(cls, "__module__", "") == "numpy"
+                    and cls.__name__ == "ndarray")):
                 n = int(o.nbytes)
                 if n < min_bytes:
                     continue
@@ -67,13 +72,14 @@ def scan(min_bytes: int = 4 << 20) -> dict:
                 if rid not in roots or n > roots[rid][1]:
                     roots[rid] = (root, int(getattr(root, "nbytes", n)))
                 continue
-            if torch is not None and isinstance(o, torch.Tensor):
+            if torch is not None and cls.__name__ == "Tensor" and getattr(
+                    cls, "__module__", "").startswith("torch"):
                 n = _nbytes(o)
                 if n >= min_bytes:
                     torch_items.append(
                         (f"torch {tuple(o.shape)} {o.dtype} {o.device}", n))
                 continue
-            if isinstance(o, (bytes, bytearray, memoryview)) and len(o) >= min_bytes:
+            if cls in (bytes, bytearray, memoryview) and len(o) >= min_bytes:
                 blob_items.append((type(o).__name__, len(o)))
         except Exception:
             continue

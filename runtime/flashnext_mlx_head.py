@@ -25,14 +25,13 @@ class QuantizedHead:
             mx.eval(self.w)
             del raw_w
             source.drop_pages(f"{key}.weight")
-            scales = source.f32(f"{key}.scales")
+            scales = np.array(source.f32(f"{key}.scales"), np.float32, copy=True)
+            biases = np.array(source.f32(f"{key}.biases"), np.float32, copy=True)
             source.drop_pages(f"{key}.scales")
-            self.scales = mx.array(scales).astype(mx.float16)
-            del scales
-            biases = source.f32(f"{key}.biases")
             source.drop_pages(f"{key}.biases")
+            self.scales = mx.array(scales).astype(mx.float16)
             self.biases = mx.array(biases).astype(mx.float16)
-            del biases
+            del scales, biases
             mx.eval(self.scales, self.biases)
             source.drop_all_pages()
         finally:

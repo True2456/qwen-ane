@@ -52,16 +52,17 @@ class ResidentMoe:
                 mx.eval(weight)
                 del raw_w
                 source.drop_pages(p + ".weight")
-                scales_np = source.f32(p + ".scales")
+                # f32() of an F32 mmap is a view. DONTNEED before the MLX
+                # copy can leave zeros in the dequant tables; ppl nll then
+                # drifts (1.884456 vs 1.886208) without looking broken.
+                scales_np = np.array(source.f32(p + ".scales"), np.float32, copy=True)
+                biases_np = np.array(source.f32(p + ".biases"), np.float32, copy=True)
                 source.drop_pages(p + ".scales")
-                scales = mx.array(scales_np, dtype=scale_dtype)
-                mx.eval(scales)
-                del scales_np
-                biases_np = source.f32(p + ".biases")
                 source.drop_pages(p + ".biases")
+                scales = mx.array(scales_np, dtype=scale_dtype)
                 biases = mx.array(biases_np, dtype=scale_dtype)
-                mx.eval(biases)
-                del biases_np
+                mx.eval(scales, biases)
+                del scales_np, biases_np
                 self.projections.append((weight, scales, biases))
             source.drop_all_pages()
         finally:

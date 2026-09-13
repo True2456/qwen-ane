@@ -2843,6 +2843,12 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             layer_cache[i] = w
             if layout is None:
                 layout = infer_expert_layout(w, verbose=True)
+            # mlxresident never reads the BF16 expert slabs or the shared-expert
+            # fp32 copies; HostMoE pulls those from the 4-bit bank onto the GPU.
+            if moe_mode == "mlxresident":
+                for k in list(w.tensors):
+                    if k.startswith("mlp.experts.") or k.startswith("mlp.shared_expert."):
+                        del w.tensors[k]
             print(f"    mmap L{i} {w.layer_type} {time.perf_counter() - t0:.1f}s",
                   flush=True)
         return w
@@ -3312,8 +3318,6 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 # is the 93 GB peak (12 GB cache + 68 GB Metal + Foundation).
                 if os.environ.get("FLASHNEXT_KEEP_LAYER_CACHE") != "1":
                     layer_cache.pop(i, None)
-                    if (i + 1) % 8 == 0:
-                        gc.collect()
         ws = 0
         if store.mlx4 is not None:
             for hl in host_layers.values():
