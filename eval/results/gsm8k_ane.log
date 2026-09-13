@@ -1,0 +1,27 @@
+  ane ready in 63s {'ready': True, 'sampling': {'temperature': 0.0, 'top_p': 1.0, 'top_k': 0, 'min_p': 0.0}, 'spec_k': 4, 'prefill_k': 0, 'spec': 4, 'ple': '1'}
+  sample 0 pred='45' gold='45' ok=True tok=320   / assistant / <think> /  / </think> /  / John drives away from home for 3 hours at 60 mph, so he is 3 * 60 = <<3*60=180>>180 miles away from home. / He tries to get home in 4 hours. He spends the first 2 hours in traffic, so he has 4 - 2 =
+  sample 1 pred='460' gold='460' ok=True tok=320   / assistant / <think> /  / </think> /  / Eliza is entitled to 45 - 40 = <<45-40=5>>5 hours of overtime. / Her overtime rate is $10 * 1.2 = $<<10*1.2=12>>12 per hour. / Her total earnings for the first 40 hours are 40 * $10 = $<<40*10=400>>
+  sample 2 pred='366' gold='366' ok=True tok=320   / assistant / <think> /  / </think> /  / The number of downloads in the second month was 3 * 60 = <<3*60=180>>180 downloads. / The number of downloads in the third month was 180 - (30/100 * 180) = 180 - 54 = <<180-54=126>>126 downloads. / 
+  10/200  acc 0.900  94.1s a question
+  20/200  acc 0.900  92.5s a question
+  30/200  acc 0.933  92.0s a question
+  40/200  acc 0.950  92.8s a question
+  50/200  acc 0.960  92.7s a question
+  60/200  acc 0.967  92.2s a question
+  70/200  acc 0.971  92.0s a question
+  80/200  acc 0.975  92.0s a question
+  90/200  acc 0.978  92.0s a question
+  100/200  acc 0.980  91.8s a question
+  110/200  acc 0.973  91.9s a question
+  120/200  acc 0.967  91.8s a question
+  130/200  acc 0.969  91.7s a question
+  140/200  acc 0.964  91.7s a question
+  150/200  acc 0.967  91.9s a question
+  160/200  acc 0.969  92.0s a question
+  170/200  acc 0.965  92.1s a question
+  180/200  acc 0.961  92.1s a question
+  190/200  acc 0.963  92.1s a question
+  200/200  acc 0.965  92.2s a question
+
+gsm8k ane: 193/200 = 0.9650 in 18446s
+  wrote eval/results/gsm8k_ane.json
