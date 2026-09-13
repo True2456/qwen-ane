@@ -115,3 +115,30 @@ Perplexity is not a task score. It says the distributions stayed close; it does
 not say the model still gets a benchmark right. Nothing here goes past 8192
 tokens, which is a thirty-second of what the port claims to support, and the
 remaining long-context gap is measured but not explained.
+
+## The per-layer embedding table was switched off
+
+`FLASHNEXT_PLE` defaults to 0, which runs the per-layer embedding as a table of
+zeros. Every quality number above was measured that way, and so was every
+throughput number. The reference arm zeroes it too — `mlx_lm` has the same
+fallback — so the comparisons are like for like, but both arms were below what
+the checkpoint can do.
+
+Turning it on, scoring 1024 tokens after a 512-token prefill:
+
+| | nll | ppl | scoring rate |
+| --- | --- | --- | --- |
+| zero table (the default) | 1.886208 | 6.5943 | 23.3 tok/s |
+| checkpoint rows from SSD | 1.853263 | **6.3806** | 21.5 tok/s |
+
+3.2% better perplexity for about 8% of throughput. For scale, the entire ANE
+port — int8 weights and activations, forty-eight hand-written MIL graphs, fp16
+mixers — costs around 2%. The table is worth more than the port costs.
+
+It reads the selected rows from the checkpoint with `pread` per token, which is
+where the 8% goes, and `docs` elsewhere records that this lookup is serial at
+queue depth one and that threading the gather is worth roughly 16x. That is
+probably most of the 8% back.
+
+Nothing here has been run through MMLU or GSM8K yet. Perplexity says the table
+helps; a task score would say how much.
