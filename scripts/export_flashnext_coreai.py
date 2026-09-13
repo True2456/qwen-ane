@@ -3872,6 +3872,23 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
         spec_pos = [[0, 0] for _ in range(max(1, spec_k))]
         #: Token ids that end a generation, set per request in serve mode.
         _stop_ids: set[int] = set()
+        # Sampling for the block loop. temperature 0 keeps the greedy path,
+        # where a draft is accepted only on an exact argmax match; anything
+        # else needs the rejection rule in runtime/flashnext_sampling.py or
+        # the output is biased toward the drafter.
+        from runtime.flashnext_sampling import verify_block as _verify_block
+        _samp = {"temperature": float(os.environ.get("FLASHNEXT_TEMP", "0") or 0),
+                 "top_p": float(os.environ.get("FLASHNEXT_TOP_P", "1") or 1),
+                 "top_k": int(os.environ.get("FLASHNEXT_TOP_K", "0") or 0),
+                 "min_p": float(os.environ.get("FLASHNEXT_MIN_P", "0") or 0)}
+        _seed = int(os.environ.get("FLASHNEXT_SEED", "0") or 0)
+        _rng = np.random.default_rng(_seed or None)
+
+        def _verify(lg, drafts):
+            preds = [int(v) for v in np.argmax(lg, axis=-1)]
+            m, nxt = _verify_block(lg, drafts, _samp, _rng)
+            return m, nxt, preds
+
         _spec_n1 = os.environ.get("FLASHNEXT_SPEC_N1") == "1"
         spec_ms = {"embed": 0.0, "gdn_stage": 0.0,
                    "gdn_ane": 0.0, "gdn_route": 0.0, "gdn_moe": 0.0,
@@ -4204,17 +4221,14 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     spec_kv_base[i] = int(attn_state[i].offset)
                 _t1 = time.perf_counter()
                 hid, lg = _block_forward(ids)
-                preds = [int(v) for v in np.argmax(lg, axis=-1)]
+                m, nxt, preds = _verify(lg, drafts)
                 t_verify += time.perf_counter() - _t1
                 blocks += 1
-                m = 0
-                while m < len(drafts) and preds[m] == drafts[m]:
-                    m += 1
                 for t in range(len(drafts)):
                     spec_pos[t][1] += 1
                     spec_pos[t][0] += int(preds[t] == drafts[t])
                 accepted += m
-                emit = drafts[:m] + [preds[m]]
+                emit = drafts[:m] + [nxt]
                 _before = len(cur)
                 for tok in emit:
                     if len(generated) >= max_new:
@@ -4227,7 +4241,7 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     lookup.extend(cur[_before:])
                 if generated and generated[-1] in _stop_ids:
                     break
-                tid_l = preds[m]
+                tid_l = nxt
                 chain = mx.array(np.ascontiguousarray(
                     np.asarray(hid, np.float32)[:, m:m + 1, :]))
                 # Drafter positions past the accepted prefix were conditioned
@@ -4374,7 +4388,8 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             _eos_ids = [int(v) for v in
                         (_eos if isinstance(_eos, list) else [_eos])]
             chat = None
-            print(json.dumps({"ready": True, "spec_k": spec_k,
+            print(json.dumps({"ready": True, "sampling": dict(_samp),
+                              "spec_k": spec_k,
                               "prefill_k": prefill_mil_k if mil_gdn_pf else 0}),
                   flush=True)
             for line in sys.stdin:
@@ -4423,6 +4438,9 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     cur = list(ids)
                     generated = []
                     max_new = int(req.get("max_new", 256))
+                    for key in ("temperature", "top_p", "top_k", "min_p"):
+                        if key in req:
+                            _samp[key] = type(_samp[key])(req[key])
                     _stop_ids.clear()
                     # Without these a request runs to max_new even when the
                     # model has finished its turn. generation_config.json is
