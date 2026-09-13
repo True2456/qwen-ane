@@ -297,3 +297,25 @@ All three gates pass:
    - Gate: Exact token ID sequence match with baseline.
    - Result: Emitted greedy IDs `[279, 5492, 1752, 13, 271, 550, 2088, 38012, 2961, 271, 13962, 13425, 25, 279, 1788, 19214, 944, 42103, 539, 220, 16, 13, 22, 87, 271, 91, 21826, 735, 1510, 25434, 16436, 63, 7772, 735, 586, 10442, 10658, 735, 198, 91, 4277, 91, 4277, 25, 91, 4277, 25, 91, 198, 91, 74988, 16, 11, 16, 21, 11, 16, 17, 23, 11, 16, 17, 23, 60]`. **PASSED**.
 
+
+### Independent verification of the QSA sharing and the MoE boundary work
+
+**The QSA change is correct and its component is faster.** The ANE submit for
+a QSA layer measured 1.45 and 1.63 ms a token before and 1.27 and 1.29 after,
+across separate runs. Perplexity is unchanged to every digit at 1.886208 and
+6.5943, and a decode run emits the same 64 token ids at 21.0 tok/s.
+
+**It does not show up end to end.** Two runs here give 82.2 and 82.2 tok/s
+against 78.0, 82.0 and 83.0 measured on the code before this change. The
+claimed 83.5 to 84.4 is inside that spread. The arithmetic says why: the QSA
+ANE term is about an eighth of the pass, so cutting it 15% is worth 2% of the
+total, which this measurement cannot resolve.
+
+That is worth carrying forward as a rule. End-to-end prefill on a 511-token
+prompt has a spread of roughly 5 tok/s run to run, so anything worth less than
+about 5% has to be argued from the component timers rather than the headline.
+The change is still worth keeping: the component is genuinely faster and it
+frees a second copy of the QSA weights.
+
+The three negative results in task 2 were measured properly and reverted, which
+is the right outcome. The pass total is unchanged at about 82 tok/s.
