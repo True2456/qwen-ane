@@ -4387,6 +4387,89 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 if _gc_path.is_file() else []
             _eos_ids = [int(v) for v in
                         (_eos if isinstance(_eos, list) else [_eos])]
+            # Tokens the live state reflects, and checkpoints it can go back
+            # to. A GDN layer's state is recurrent, so there is no rewinding to
+            # an arbitrary point -- only to somewhere a copy was kept. An agent
+            # loop resends a long shared prefix every turn and the chat
+            # template rewrites the tail of it (Qwen drops thinking blocks from
+            # history), so appending is not enough on its own.
+            _served: list[int] = []
+            _ckpt: list = []
+            _ckpt_max = int(os.environ.get("FLASHNEXT_CHECKPOINTS", "4"))
+
+            def _snapshot(ids):
+                gdn = {i2: (lay2.current_state(), lay2._conv.copy())
+                       for i2, lay2 in mil_gdn.items()}
+                qsa = {}
+                for i2 in mil_qsa:
+                    cache = attn_state[i2]
+                    off = int(cache.offset)
+                    st = qsa_idx_state[i2]
+                    qsa[i2] = (
+                        cache.keys[:, :off].copy(), cache.values[:, :off].copy(),
+                        off,
+                        (None if st.block_keys is None else st.block_keys.copy(),
+                         None if st.recent is None else st.recent.copy(),
+                         st.recent_start, st.covers_prefix))
+                dr = None
+                if drafter is not None:
+                    dr = (None if drafter.kc is None else drafter.kc,
+                          None if drafter.vc is None else drafter.vc,
+                          drafter.offset)
+                ple = {i2: l2.snapshot() for i2, l2 in ple_layers.items()} \
+                    if ple_layers else {}
+                return (list(ids), gdn, qsa, dr, ple)
+
+            def _restore(snap):
+                from runtime.flashnext_indexer import IndexerState as _IS
+                ids, gdn, qsa, dr, ple = snap
+                for i2, (state, conv) in gdn.items():
+                    lay2 = mil_gdn[i2]
+                    lay2.select(0) if hasattr(lay2, "select") else None
+                    lay2.set_state(state)
+                    lay2._conv[:] = conv
+                    lay2._conv_surface_current = False
+                for i2, (keys, values, off, idx) in qsa.items():
+                    cache = attn_state[i2]
+                    cache.keys[:, :off] = keys
+                    cache.values[:, :off] = values
+                    cache.offset = off
+                    st = qsa_idx_state[i2] = _IS()
+                    bk, rec, rs, cp = idx
+                    st.block_keys = None if bk is None else bk.copy()
+                    st.recent = None if rec is None else rec.copy()
+                    st.recent_start, st.covers_prefix = rs, cp
+                    spec_kv_base[i2] = off
+                if drafter is not None and dr is not None:
+                    drafter.kc, drafter.vc, drafter.offset = dr
+                for i2, st2 in ple.items():
+                    ple_layers[i2].restore(st2)
+                _served[:] = list(ids)
+
+            def _keep(ids):
+                snap = _snapshot(ids)
+                _ckpt.append(snap)
+                # Always keep the first, which is usually the system prompt and
+                # tool list every turn shares; drop the oldest of the rest.
+                while len(_ckpt) > _ckpt_max:
+                    _ckpt.pop(1 if len(_ckpt) > 1 else 0)
+
+            def _enter(ids):
+                """Ready the state for `ids`. Returns the tokens reused."""
+                best, best_n = None, 0
+                n = len(_served)
+                if 0 < n < len(ids) and ids[:n] == _served:
+                    return n                       # already loaded, just extend
+                for snap in _ckpt:
+                    k = len(snap[0])
+                    if k < len(ids) and k > best_n and ids[:k] == snap[0]:
+                        best, best_n = snap, k
+                if best is not None:
+                    _restore(best)
+                    return best_n
+                _reset_all()
+                _served.clear()
+                return 0
             chat = None
             print(json.dumps({"ready": True, "sampling": dict(_samp),
                               "spec_k": spec_k,
@@ -4402,6 +4485,50 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     op = req.get("op", "gen")
                     if op == "quit":
                         break
+                    if op in ("state_hash", "restore_check"):
+                        import hashlib
+
+                        def _h():
+                            g = {}
+                            for i3, l3 in sorted(mil_gdn.items()):
+                                g[f"gdn{i3}.state"] = hashlib.sha1(
+                                    l3.current_state().tobytes()).hexdigest()[:10]
+                                g[f"gdn{i3}.conv"] = hashlib.sha1(
+                                    l3._conv.tobytes()).hexdigest()[:10]
+                            for i3 in sorted(mil_qsa):
+                                c3 = attn_state[i3]
+                                o3 = int(c3.offset)
+                                g[f"qsa{i3}.kv"] = hashlib.sha1(
+                                    c3.keys[:, :o3].tobytes()
+                                    + c3.values[:, :o3].tobytes()).hexdigest()[:10]
+                                g[f"qsa{i3}.off"] = o3
+                                s3 = qsa_idx_state[i3]
+                                g[f"qsa{i3}.idx"] = hashlib.sha1(
+                                    (b"" if s3.block_keys is None
+                                     else s3.block_keys.tobytes())
+                                    + (b"" if s3.recent is None
+                                       else s3.recent.tobytes())).hexdigest()[:10]
+                            for i3, l3 in sorted(ple_layers.items()):
+                                g[f"ple{i3}"] = hashlib.sha1(
+                                    np.asarray(l3.history).tobytes()
+                                    + l3.conv.tobytes()).hexdigest()[:10]
+                            return g
+
+                        if op == "restore_check":
+                            # A snapshot taken and put straight back must be a
+                            # no-op. This is the fidelity of the copy itself,
+                            # with no prefill in between to confuse it.
+                            before = _h()
+                            _restore(_snapshot(list(_served)))
+                            after = _h()
+                            bad = [k for k in before if before[k] != after[k]]
+                            print(json.dumps({"entries": len(before),
+                                              "differ": bad}), flush=True)
+                            continue
+                        h = _h()
+                        print(json.dumps({"state": h, "served": len(_served)}),
+                              flush=True)
+                        continue
                     if op == "reset":
                         _reset_all()
                         print(json.dumps({"ok": True}), flush=True)
@@ -4417,9 +4544,11 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     ids = list(tok.encode(text, add_special_tokens=False).ids)
                     if not ids:
                         raise ValueError("empty prompt")
-                    _reset_all()
+                    reused = _enter(ids)
                     if op == "score":
-                        lg = _prefill_ids(ids)
+                        lg = _prefill_ids(ids[reused:])
+                        _served[:] = ids
+                        _keep(ids)
                         row = np.asarray(lg, np.float64)[-1]
                         m = row.max()
                         lse = m + np.log(np.exp(row - m).sum())
@@ -4431,10 +4560,17 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                             out[c] = float(row[cid[0]] - lse)
                         print(json.dumps({
                             "logprobs": out, "prompt_tokens": len(ids),
+                            "reused": reused,
                             "ms": (time.perf_counter() - t0) * 1e3}), flush=True)
                         continue
                     # gen
-                    _prefill_ids(ids[:-1])
+                    _prefill_ids(ids[reused:-1])
+                    _served[:] = ids[:-1]
+                    # Checkpoint the prompt, not the answer: the next turn
+                    # shares this prefix, and the template will rewrite what
+                    # comes after it.
+                    _keep(ids[:-1])
+                    _t_pf = time.perf_counter()
                     cur = list(ids)
                     generated = []
                     max_new = int(req.get("max_new", 256))
@@ -4453,9 +4589,11 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                             got = got[:got.index(stop)]
                             break
                     dt = time.perf_counter() - t0
+                    _served[:] = ids + generated
                     print(json.dumps({
                         "text": got, "tokens": len(generated),
-                        "prompt_tokens": len(ids), "ms": dt * 1e3,
+                        "prompt_tokens": len(ids), "reused": reused,
+                        "prefill_ms": (_t_pf - t0) * 1e3, "ms": dt * 1e3,
                         "tok_s": len(generated) / max(dt, 1e-9)}), flush=True)
                 except Exception as exc:  # noqa: BLE001
                     print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}),
