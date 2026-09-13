@@ -322,3 +322,48 @@ frees a second copy of the QSA weights.
 
 The three negative results in task 2 were measured properly and reverted, which
 is the right outcome. The pass total is unchanged at about 82 tok/s.
+
+## The wide prefill graphs damage the tokens right after a prompt
+
+`FLASHNEXT_PREFILL_MIL_K` must stay 0. Everything above about 82 tok/s stands
+as a throughput measurement and is not usable, because walking a prompt through
+the wide graphs leaves the state wrong enough to change what the model does.
+
+The clearest case is a tool-calling prompt. Same 324-token prompt, greedy, the
+only difference being the width the prompt was walked at:
+
+```
+prefill_k=0    The user wants me to list files in the current directory. Simple task.
+               </think>
+               <tool_call><function=run_shell><parameter=cmd>ls -la</parameter>...
+
+prefill_k=32   The user wants me to run a command. They haven't given me a specific
+               command, but the system prompt suggests I should use the bash tool...
+```
+
+The first is character-for-character what the 4-bit MLX reference produces. The
+second ignores the request. It is not the chunked delta rule: the plain
+recurrent graph at k=32 is just as wrong, and so is k=16. It is the wide
+prefill path itself.
+
+### Why the gate missed it
+
+Perplexity was measured over 1024 tokens scored after a 512-token prefill,
+where the difference is 0.8% and looks like noise. The damage is concentrated
+in the tokens immediately after the prompt and washes out as real tokens flow
+through the recurrence:
+
+| tokens scored after the prefill | prefill_k=0 | prefill_k=32 | cost |
+| --- | --- | --- | --- |
+| 32 | 1.944132 | 2.015541 | +7.4% |
+| 1024 | 1.845533 | 1.853263 | +0.8% |
+
+Greedy generation only ever sees the first case. One wrong argmax at the first
+token sends the whole completion somewhere else, which is how 7% of perplexity
+becomes the difference between calling a tool and asking the user what they
+want.
+
+**So the gate for any prefill change is a short scoring window immediately
+after the prompt, not a long one.** Use `--ppl-tokens 32 --ppl-prefill 512`.
+A long window measures how fast the recurrence recovers, which is not the
+question.
