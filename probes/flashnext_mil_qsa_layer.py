@@ -442,118 +442,6 @@ class _Ref:
         self.mlp.load(w, "mlp_hyper_connection")
 
 
-def main() -> None:
-    import time
-
-    import torch as T
-    from export_flashnext_coreai import _load_layer, FlashNextQSADecode, QSA_MASK
-    from flashnext_pure_step import _recombine
-    from runtime.expert_bank import Mlx4ExpertBank, MLX4_DEFAULT, MlxSafe
-
-    li = LAYER[0]
-    M = KVM[0]
-    loader, w = _load_layer(li)
-    ref = _Ref(w)
-    qsa = FlashNextQSADecode(max_s=M).eval().half()
-    qsa.load_from_layer(w)
-
-    kt_ = KTOK[0]
-    rng = np.random.default_rng(12)
-    x = np.zeros((HC_W, S), np.float16)
-    x[:, :kt_] = (rng.standard_normal((HC_W, kt_)) * 0.05).astype(np.float16)
-    kc = np.ascontiguousarray((rng.standard_normal((KVC, M)) * 0.05).astype(np.float16))
-    vc = np.ascontiguousarray((rng.standard_normal((KVC, M)) * 0.05).astype(np.float16))
-    cos = np.zeros((HALF, S), np.float16)
-    sin = np.zeros((HALF, S), np.float16)
-    pos = (np.arange(kt_, dtype=np.float32) + 37.0)[:, None] * np.arange(HALF)[None, :] * 0.01
-    cos[:, :kt_] = np.cos(pos).T.astype(np.float16)
-    sin[:, :kt_] = np.sin(pos).T.astype(np.float16)
-    off = 37
-    mask_ref = np.full((1, M + S, 1, S), QSA_MASK, np.float16)
-    mask_ref[:, :off, :, :kt_] = 0
-    for t in range(kt_):
-        mask_ref[:, M:M + t + 1, :, t] = 0
-    row = np.full((kt_, M + S), QSA_MASK, np.float16)
-    row[:, :off] = 0
-    for t in range(kt_):
-        row[t, M:M + t + 1] = 0
-    mil_mask = np.ascontiguousarray(np.tile(row, (G, 1)))
-
-    with T.no_grad():
-        xt = T.from_numpy(x).reshape(1, HC_W, 1, S)
-        mixed_a, hyper_a, inj_a = ref.attn(xt)
-        att, r_nk, r_nv = qsa(mixed_a, T.from_numpy(kc).reshape(1, KVC, 1, M),
-                              T.from_numpy(vc).reshape(1, KVC, 1, M),
-                              T.from_numpy(cos).reshape(1, HALF, 1, S),
-                              T.from_numpy(sin).reshape(1, HALF, 1, S),
-                              T.from_numpy(mask_ref))
-        hyper2 = _recombine(att, hyper_a, inj_a)
-        mixed_m, _, inj_m = ref.mlp(hyper2)
-    r_mixed = mixed_m.float().numpy().reshape(H, S)[:, :kt_]
-    r_hyper = hyper2.float().numpy().reshape(HC_W, S)[:, :kt_]
-    r_nk = r_nk.float().numpy().reshape(KVC, S)[:, :kt_]
-    r_nv = r_nv.float().numpy().reshape(KVC, S)[:, :kt_]
-    bank = Mlx4ExpertBank(MLX4_DEFAULT)
-    sg_, su_, sd_ = bank.shared_fp32(li)
-    src = MlxSafe(MLX4_DEFAULT)
-    sgate_ = np.asarray(src.f32(f"model.layers.{li}.mlp.shared_expert_gate.weight"),
-                        np.float32).reshape(1, H)
-    src.close()
-    xr = r_mixed.T
-    gg = xr @ sg_.T
-    r_shared = (((gg / (1 + np.exp(-gg))) * (xr @ su_.T)) @ sd_.T
-                / (1 + np.exp(-(xr @ sgate_.T)))).T
-
-    prog, hcn = build_layer(w, ref, qsa)
-    loader.close()
-    print("  compiled")
-    for surf, val in zip(prog._in_surfs, (x, cos, sin, hcn, kc, vc,
-                                          mil_mask)):
-        with E._iosurface_view(surf, val.shape, np.float16) as d:
-            np.copyto(d, val)
-    if not eng.submit(prog, procedure_index=0):
-        print("  submit failed")
-        return
-    got = {}
-    for idx, nm, shape in ((0, "new_k", (KVC, S)), (1, "shared", (H, S)),
-                           (2, "mixed", (H, S)), (3, "hyper", (HC_W, S)),
-                           (5, "new_v", (KVC, S))):
-        with E._iosurface_view(prog._out_surfs[idx], shape, np.float16) as o:
-            got[nm] = np.array(o, np.float32)[:, :kt_]
-
-    def rel(a, b_):
-        return float(np.linalg.norm(a - b_) / max(np.linalg.norm(b_), 1e-12))
-    for nm, ref_ in (("mixed", r_mixed), ("new_k", r_nk)):
-        print(f"    {nm} per slot: " + "  ".join(
-            f"t{t}={rel(got[nm][:, t], ref_[:, t]):.4f}" for t in range(kt_)))
-    print(f"  QSA FULL LAYER (int8={INT8[0]}, m={M}, k={kt_}): "
-          f"mixed {rel(got['mixed'], r_mixed):.5f}  "
-          f"hyper {rel(got['hyper'], r_hyper):.5f}  "
-          f"shared {rel(got['shared'], r_shared):.5f}  "
-          f"new_k {rel(got['new_k'], r_nk):.5f}  "
-          f"new_v {rel(got['new_v'], r_nv):.5f}", flush=True)
-    for _ in range(5):
-        eng.submit(prog, procedure_index=0)
-    ts = []
-    for _ in range(25):
-        t0 = time.perf_counter()
-        eng.submit(prog, procedure_index=0)
-        ts.append(time.perf_counter() - t0)
-    _ms = float(np.median(ts)) * 1e3
-    print(f"  QSA MIL layer: {_ms:.3f} ms/pass = {_ms / kt_:.3f} ms/token  "
-          f"(Core AI folded qsa_step k=1: ~2.96 ms)", flush=True)
-
-
-if __name__ == "__main__":
-    import os
-    if os.environ.get("QSA_M"):
-        KVM[0] = int(os.environ["QSA_M"])
-    if os.environ.get("QSA_INT8") == "0":
-        INT8[0] = False
-    if os.environ.get("QSA_K"):
-        KTOK[0] = int(os.environ["QSA_K"])
-    main()
-
 
 def build_program_multi(w, ref, qsa, specs):
     """One program with multiple procedures sharing baked weights.
@@ -630,3 +518,13 @@ def build_program_multi(w, ref, qsa, specs):
     if not eng._ensure_io(prog):
         return None, None
     return prog, caught[0][2]["hcn"]
+
+
+def main() -> None:
+    """Use the checked oracle, including the front program's required feeds."""
+    from mil_qsa_k_check import main as check
+    check()
+
+
+if __name__ == "__main__":
+    main()

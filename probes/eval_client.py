@@ -26,8 +26,9 @@ class AneClient:
         env.update({"FLASHNEXT_SPEC": str(spec), "FLASHNEXT_MOE": "mlxresident",
                     "FLASHNEXT_HEAD": "mlx", "FLASHNEXT_MIL_GDN": "1",
                     "FLASHNEXT_MIL_QSA": "1"})
-        if prefill_k:
-            env["FLASHNEXT_PREFILL_MIL_K"] = str(prefill_k)
+        # Zero is an explicit decode-width baseline, even when the parent
+        # environment or the exporter's default enables wide prefill.
+        env["FLASHNEXT_PREFILL_MIL_K"] = str(prefill_k)
         self.p = subprocess.Popen(
             [str(Path.home() / ".rindi/venvs/coreai/bin/python"), "-u",
              str(ROOT / "scripts/export_flashnext_coreai.py"), "generate",

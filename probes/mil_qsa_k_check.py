@@ -311,19 +311,40 @@ def walk_compare(narrow: MilQsaLayer, wide: MilQsaLayer, k_wide: int, m: int,
           flush=True)
 
 
+def check_band(tag: str, out: dict) -> None:
+    """Fail closed; printing a relative error near one is not a passing gate."""
+    limits = {"mixed": .05, "hyper": .04, "shared": .065,
+              "new_k": .025, "new_v": .035}
+    for name, value in out["vs_torch"].items():
+        if not np.isfinite(value) or value > .003:
+            raise AssertionError(f"{tag}: numpy/torch {name} error {value:.6f}")
+    for name, limit in limits.items():
+        value = out["vs_mil"][name]
+        if not np.isfinite(value) or value > limit:
+            raise AssertionError(f"{tag}: MIL/numpy {name} {value:.6f} > {limit}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("widths", nargs="*", type=int, default=None,
                     help="token widths to check (default: 1, or 1 4 8 16 32 with --all)")
     ap.add_argument("--all", action="store_true")
-    ap.add_argument("--layer", type=int, default=3)
-    ap.add_argument("--m", type=int, default=256)
+    ap.add_argument("--layer", type=int, default=int(os.environ.get("QSA_LAYER", "3")))
+    ap.add_argument("--m", type=int, default=int(os.environ.get("QSA_M", "256")))
     ap.add_argument("--two-proc", action="store_true",
                     help="also compile k=4 + k=32 in one program and check proc 1")
     ap.add_argument("--walk", type=int, default=0,
                     help="walk this many tokens at k=1 vs the last width")
     args = ap.parse_args()
-    widths = args.widths or ([1, 4, 8, 16, 32] if args.all else [1])
+    widths = args.widths or ([1, 4, 8, 16, 32] if args.all else [int(os.environ.get("QSA_K", "1"))])
+    if any(k not in (1, 2, 4, 8, 16, 32) for k in widths):
+        raise SystemExit("widths must divide the 32-slot surface")
+    # Every invocation establishes the known-good case before wider graphs.
+    widths = list(dict.fromkeys([1, *widths]))
+    if args.walk and (args.walk % widths[-1] or args.walk > args.m):
+        raise SystemExit("--walk must be a multiple of the widest K and <= --m")
+    import flashnext_mil_qsa_layer as QL
+    QL.INT8[0] = os.environ.get("QSA_INT8", "1") != "0"
     m = int(args.m)
     if m % 32:
         raise SystemExit(f"rung {m} is not a multiple of 32")
@@ -340,17 +361,21 @@ def main() -> None:
         print(f"  compiling QSA L{li} k={k} m={m}", flush=True)
         lay = MilQsaLayer(li, w, ref_mix, qsa_torch, rungs=[m], k=k)
         layers[k] = lay
-        _report(f"K={k}", run_k(k, m, li, w, shared, qsa_torch, lay))
+        out = run_k(k, m, li, w, shared, qsa_torch, lay)
+        _report(f"K={k}", out)
+        check_band(f"K={k}", out)
 
     if args.two_proc:
         print(f"  compiling QSA L{li} two-proc k=4/32 m={m}", flush=True)
         two = MilQsaLayer(li, w, ref_mix, qsa_torch, rungs=[m], k=4, prefill_k=32)
         two.select(1)
-        _report("two-proc k=32", run_k(32, m, li, w, shared, qsa_torch, two))
+        out = run_k(32, m, li, w, shared, qsa_torch, two)
+        _report("two-proc k=32", out)
+        check_band("two-proc k=32", out)
 
     if args.walk:
         if 1 not in layers:
-            print("  compiling QSA L{li} k=1 for the walk", flush=True)
+            print(f"  compiling QSA L{li} k=1 for the walk", flush=True)
             layers[1] = MilQsaLayer(li, w, ref_mix, qsa_torch, rungs=[m], k=1)
         wide_k = widths[-1]
         walk_compare(layers[1], layers[wide_k], wide_k, m, w, shared, args.walk)
