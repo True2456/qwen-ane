@@ -241,3 +241,28 @@ almost no reuse (`hit_rate=0.030`).
 
 Nothing here has been run through MMLU or GSM8K yet. Perplexity says the table
 helps; a task score would say how much.
+
+### Verifying the gather work, and what switching the table on really costs
+
+The bits are unchanged, which was the gate that mattered: scoring 1024 tokens
+after a 512-token prefill gives nll 1.853263 with the table on, to every digit,
+and `probes/mil_k_check.py` prints the same per-slot errors at K=4 and K=32.
+
+The cost was measured on the scorer, and the scorer is the wrong axis. On the
+scorer the table costs 5%, 22.5 tok/s against 23.7, down from 8% before the
+gather was threaded. On decode it costs three times that:
+
+| | tok/s | tokens a pass | drafts accepted |
+| --- | --- | --- | --- |
+| table off | 21.1 | 3.20 | 44/57 |
+| table on | 18.7 | 2.91 | 44/63 |
+
+11%, and only part of it is the lookup. The rest is speculation: the table
+changes the hidden state the MTP head drafts from, the accept rate falls from
+77% to 70%, and a block confirms 2.91 tokens instead of 3.20. The scorer never
+sees that because it accepts every slot by construction.
+
+So the trade is 3.2% perplexity for 11% of decode, not for 5%. That is still
+probably worth taking, and it is now the default, but it should be decided
+against a task score rather than against perplexity, and re-checked after any
+change to the drafter.
