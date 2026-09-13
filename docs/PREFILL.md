@@ -404,3 +404,52 @@ weights, the same key cache and the same rotary table, and compare at K=1 first
 to establish the oracle before trusting it at 32. Then find out whether the
 wide QSA layer is what corrupts the prompt. If it is, prefill is a fix away
 from 82 tok/s.
+
+## Fixed: the corruption was a different recurrence, not a broken layer
+
+The section above said the wide prefill graphs must stay off. That is no longer
+true, and the cause turned out to be neither of the suspects it named.
+
+**The QSA layer was never wrong.** `probes/mil_qsa_k_check.py` replaces the old
+probe, which never fed the front program's mixed and inject inputs and so
+reported errors near 1.0 on a graph that was working. The new check shares
+weights, key cache, rotary table and mask with `MilQsaLayer`, and agrees in the
+same band the GDN check does:
+
+| | mixed | hyper | shared | new_k | new_v |
+| --- | --- | --- | --- | --- | --- |
+| K=1 | 0.0283 | 0.0262 | 0.0414 | 0.0138 | 0.0198 |
+| K=32 | 0.0347 | 0.0294 | 0.0467 | 0.0150 | 0.0225 |
+
+**Serve had a real bug.** It walked 32-token chunks through the k=4 graph, which
+tiled four keys into the cache. Generate already selected the wide procedure;
+serve now does too, and a chunk wider than the selected graph is rejected.
+
+**The corruption was the GDN recurrence at a different width.** Each layer
+passes `mil_k_check` at 32, but a single 32-wide chunk is a different
+approximation from eight 4-wide ones, and the difference is enough to flip a
+few routed experts per layer. Across 48 layers that compounds. So the k=32
+procedure now runs the same 4-wide chunk eight times inside one submit, with the
+state carried between them: mixed, state and conv match eight k=4 passes at
+0.000, and it stays one submit.
+
+That gives up the chunked delta rule on the prefill path, which is why the rate
+is 58 tok/s rather than 82. It is still 2.3x the 25.6 of walking at decode
+width, and it is correct.
+
+### Verified
+
+| gate | result |
+| --- | --- |
+| 32 tokens scored after a 512-token prefill | nll 1.946449 against 1.944132 at k=4, inside 0.01 |
+| the tool-calling prompt | correct `run_shell` call with `ls -la`, as the MLX reference |
+| `mil_k_check` K=4 / K=32 | unchanged |
+| decode | same 64 ids, 20.3 tok/s |
+| footprint | 78 GB, peak 81, unchanged: the wide unroll shares the decode program's weights |
+
+So it is on by default: `FLASHNEXT_PREFILL_MIL_K=32`, and the server and eval
+client pass 32.
+
+The 24 tok/s between this and the 82 of the single wide chunk is still on the
+table, and now has a precise statement: find a 32-wide recurrence whose output
+does not flip the experts the 4-wide one picks.

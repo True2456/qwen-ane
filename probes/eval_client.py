@@ -20,7 +20,7 @@ MLX4 = "/Users/true/models/Qwen3.8-Flash-Next-MLX-4bit"
 class AneClient:
     """The MIL path, held in a subprocess."""
 
-    def __init__(self, ctx: int = 8192, spec: int = 4, prefill_k: int = 0,
+    def __init__(self, ctx: int = 8192, spec: int = 4, prefill_k: int = 32,
                  quiet: bool = True):
         env = dict(os.environ)
         env.update({"FLASHNEXT_SPEC": str(spec), "FLASHNEXT_MOE": "mlxresident",

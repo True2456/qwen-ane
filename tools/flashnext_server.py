@@ -277,9 +277,8 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=2457)
     ap.add_argument("--ctx", type=int, default=8192)
     ap.add_argument("--spec", type=int, default=4)
-    ap.add_argument("--prefill-k", type=int, default=0,
-                    help="wide prefill graphs; 0 because they damage the "
-                         "first tokens after a prompt, see docs/PREFILL.md")
+    ap.add_argument("--prefill-k", type=int, default=32,
+                    help="prompt block width; 0 walks prompts at decode width")
     a = ap.parse_args()
     print(f"loading {MODEL}; this takes a couple of minutes", flush=True)
     t0 = time.perf_counter()

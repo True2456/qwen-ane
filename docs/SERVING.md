@@ -117,5 +117,6 @@ need the serve loop to emit them. No `presence_penalty`, which thinking mode
 does not want anyway. Long context is validated to 8192 tokens. One request at
 a time, and about two minutes to load.
 
-And `--prefill-k` must stay 0: the wide prefill graphs are fast and leave the
-state wrong enough to change what the model does. See `PREFILL.md`.
+Prompts are walked 32 tokens a submit by default, 58 tok/s against 25.6 at
+decode width, with the same short-window perplexity and the same tool calls.
+See the last section of `PREFILL.md` for how that was fixed.

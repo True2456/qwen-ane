@@ -3002,7 +3002,7 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
         # two sets are independent programs and coexist: 132 of them load.
         mil_gdn_pf: dict[int, object] = {}
         mil_qsa_pf: dict[int, object] = {}
-        prefill_mil_k = int(os.environ.get("FLASHNEXT_PREFILL_MIL_K", "0") or 0)
+        prefill_mil_k = int(os.environ.get("FLASHNEXT_PREFILL_MIL_K", "32") or 0)
         # Which set the block path is currently driving. Swapped for the
         # prompt and swapped back before the first drafted block.
         _active = {"gdn": mil_gdn, "qsa": mil_qsa}
