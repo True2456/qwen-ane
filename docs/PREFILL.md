@@ -622,3 +622,20 @@ ls -la
 No tool is executed by the check. All model and ANE runs were sequential;
 compiled caches were retained. Disk headroom went from 45 GiB to 38 GiB
 through the new graph builds, with no resource or compilation failures.
+
+### Final run using only the documented environment variables
+
+A second corrected run, with no `MIL_GDN_CHUNK_*` overrides, gives the same
+**NLL 1.947003** and **511 tokens in 7.175s = 71.2 tok/s** (3.0x the freshly
+measured 23.8 baseline). The complete printed breakdown is:
+
+```text
+prefill ms/token  embed=0.01  gdn_stage=0.10  gdn_ane=4.55  gdn_route=1.30  gdn_moe=2.89  gdn_rec=0.21  qsa=3.07  head=0.26  commit=0.24  ple=1.36  ple_lookup=0.36
+prefill gdn call ms/token  write=0.07  submit=4.34  take=0.13
+prefill qsa ms/token  mix=0.33  index=0.04  feed=0.02  ane=1.24  moe=1.37  recombine=0.07
+```
+
+The final QSA sweep, shared-program check, 64-token QSA cache walk,
+128-token GDN walk against prefix-state decode, and isolated core all pass
+their executable thresholds. The isolated core negative control with
+`MIL_GDN_CHUNK_UPDATE_SCALE=1` is expected to fail on `q_state31` at 0.01562905.

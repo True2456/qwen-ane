@@ -119,7 +119,7 @@ a time, and about two minutes to load.
 
 Prompts are walked 32 tokens a submit by default. The full-width GDN chunk now
 scales its final state-update matmul, replacing the slower four-slot tiling
-workaround. Fresh measurements give 69.7 tok/s against 23.8 at decode width,
+workaround. Fresh measurements give 69.7–71.2 tok/s against 23.8 at decode width,
 NLL 1.947003 against 1.944132 over the first 32 scored tokens, and the correct
 `run_shell(cmd="ls -la")` call. See the last section of `PREFILL.md` for the
 controlled comparison and `probes/prefill_tool_check.py` for the exact fixture.
