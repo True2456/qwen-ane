@@ -3307,6 +3307,13 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                             del tensors[key]
                 if moe_mode == "mlxresident" and (i + 1) % 8 == 0:
                     print(f"    resident GPU MoE {i+1}/{n_layers}: {store.ram_bytes()/1e9:.2f} GB", flush=True)
+                # Drop this layer's leftover host tensors now, not after the
+                # whole 68 GB bank is resident. Holding all 48 until the end
+                # is the 93 GB peak (12 GB cache + 68 GB Metal + Foundation).
+                if os.environ.get("FLASHNEXT_KEEP_LAYER_CACHE") != "1":
+                    layer_cache.pop(i, None)
+                    if (i + 1) % 8 == 0:
+                        gc.collect()
         ws = 0
         if store.mlx4 is not None:
             for hl in host_layers.values():
@@ -4424,6 +4431,18 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}),
                           flush=True)
 
+        # Release leftover layer tensors before the drafter is copied in.
+        # The 93 GB peak was this cache still alive next to the 68 GB bank.
+        if os.environ.get("FLASHNEXT_KEEP_LAYER_CACHE") != "1":
+            _n_cached = len(layer_cache)
+            layer_cache.clear()
+            gc.collect()
+            print(f"  released {_n_cached} cached layer weights", flush=True)
+            try:
+                loader.drop_pages()
+            except Exception:
+                pass
+
         if spec_k > 1:
             if not (mil_gdn and mil_qsa and q_head is not None):
                 raise RuntimeError("FLASHNEXT_SPEC needs MIL GDN + MIL QSA + "
@@ -4449,22 +4468,6 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                   f"(FLASHNEXT_EAGER, draft || commit)",
                   flush=True)
 
-        # Every layer's raw weights were cached on the host so the MIL
-        # builds, the host mixers and the asset paths could each ask for them.
-        # Nothing reads them once the programs are baked, and they are 24 GB of
-        # Malloc Large in a process whose footprint is otherwise 73 GB wired.
-        if os.environ.get("FLASHNEXT_KEEP_LAYER_CACHE") != "1":
-            _n_cached = len(layer_cache)
-            layer_cache.clear()
-            import gc as _gc
-            _gc.collect()
-            # malloc_zone_pressure_relief returns 0 here, so what is left
-            # after this is live, not spans libmalloc is sitting on.
-            print(f"  released {_n_cached} cached layer weights", flush=True)
-            try:
-                loader.drop_pages()
-            except Exception:
-                pass
         from runtime.mem_report import print_report as _mem_report
         if os.environ.get("FLASHNEXT_MEM_REPORT") == "1":
             _mem_report(host_layers)
