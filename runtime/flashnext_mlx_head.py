@@ -20,22 +20,34 @@ class QuantizedHead:
     def __init__(self, path=MLX4_DEFAULT, key: str = "lm_head"):
         source = MlxSafe(os.environ.get("FLASHNEXT_MLX4") or path)
         try:
-            self.w = mx.array(source.raw(f"{key}.weight"))
+            raw_w = source.raw(f"{key}.weight")
+            self.w = mx.array(raw_w)
+            mx.eval(self.w)
+            del raw_w
+            source.drop_pages(f"{key}.weight")
             scales = source.f32(f"{key}.scales")
+            source.drop_pages(f"{key}.scales")
             self.scales = mx.array(scales).astype(mx.float16)
-            self.biases = mx.array(source.f32(f"{key}.biases")).astype(mx.float16)
+            del scales
+            biases = source.f32(f"{key}.biases")
+            source.drop_pages(f"{key}.biases")
+            self.biases = mx.array(biases).astype(mx.float16)
+            del biases
+            mx.eval(self.scales, self.biases)
+            source.drop_all_pages()
         finally:
             source.close()
         # uint32 packing: columns * (32 / bits) elements per row.
+        scale_cols = int(self.scales.shape[-1])
         for bits in (8, 4, 6, 2):
-            if (self.w.shape[-1] * (32 // bits)) % scales.shape[-1] == 0:
-                group = (self.w.shape[-1] * (32 // bits)) // scales.shape[-1]
+            if (self.w.shape[-1] * (32 // bits)) % scale_cols == 0:
+                group = (self.w.shape[-1] * (32 // bits)) // scale_cols
                 if group in (32, 64, 128):
                     self.bits, self.group_size = bits, group
                     break
         else:
-            raise ValueError(f"cannot infer lm_head packing from {self.w.shape} / {scales.shape}")
-        mx.eval(self.w, self.scales, self.biases)
+            raise ValueError(
+                f"cannot infer lm_head packing from {self.w.shape} / {self.scales.shape}")
         self.nbytes = self.w.nbytes + self.scales.nbytes + self.biases.nbytes
 
     def logits_mx(self, x):

@@ -19,6 +19,7 @@ Greedy ``"The"`` on MLX 4-bit is ``220, 17, 15, 15`` (``The 2000…``). Token 4
 from __future__ import annotations
 
 import ctypes
+import fcntl
 import json
 import mmap
 import os
@@ -30,6 +31,35 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
+
+# Darwin fcntl.h. F_NOCACHE keeps the kernel from retaining file pages in the
+# unified buffer cache after a read; without it, copying a 71 GB safetensors
+# into MLX arrays double-occupies RAM for the whole load.
+_F_NOCACHE = getattr(fcntl, "F_NOCACHE", 48)
+
+
+def suppress_file_cache(fh) -> None:
+    """Stop the kernel caching this fd's pages. FLASHNEXT_FILE_CACHE=1 restores."""
+    if os.environ.get("FLASHNEXT_FILE_CACHE", "").strip() in ("1", "true", "TRUE"):
+        return
+    try:
+        fcntl.fcntl(fh.fileno(), _F_NOCACHE, 1)
+    except Exception:
+        pass
+
+
+def drop_mmap_range(mm: mmap.mmap, offset: int, length: int) -> None:
+    """Give the kernel back pages we have already copied out of ``mm``."""
+    if length <= 0 or os.environ.get("FLASHNEXT_FILE_CACHE", "").strip() in (
+            "1", "true", "TRUE"):
+        return
+    page = mmap.PAGESIZE
+    start = offset & ~(page - 1)
+    extra = offset - start
+    try:
+        mm.madvise(mmap.MADV_DONTNEED, start, int(length) + extra)
+    except Exception:
+        pass
 
 H = 2560
 I = 640
@@ -94,6 +124,7 @@ class MlxSafe:
     def __init__(self, path: Path):
         self.path = Path(path)
         self._fh = open(self.path, "rb")
+        suppress_file_cache(self._fh)
         n = struct.unpack("<Q", self._fh.read(8))[0]
         self.header = json.loads(self._fh.read(n))
         self.data_start = 8 + n
@@ -104,6 +135,25 @@ class MlxSafe:
 
     def meta(self, key: str) -> dict:
         return self.header[key]
+
+    def byte_range(self, key: str, expert: int | None = None) -> tuple[int, int]:
+        """File-absolute (offset, length) of one tensor's payload in the mmap."""
+        m = self.header[key]
+        off0, off1 = m["data_offsets"]
+        if expert is not None:
+            inner = int(np.prod(m["shape"][1:]))
+            stride = inner * _ITEM[m["dtype"]]
+            off0 = off0 + int(expert) * stride
+            off1 = off0 + stride
+        start = self.data_start + off0
+        return start, off1 - off0
+
+    def drop_pages(self, key: str, expert: int | None = None) -> None:
+        start, n = self.byte_range(key, expert)
+        drop_mmap_range(self._mm, start, n)
+
+    def drop_all_pages(self) -> None:
+        drop_mmap_range(self._mm, 0, self._mm.size())
 
     def raw(self, key: str, expert: int | None = None) -> np.ndarray:
         m = self.header[key]

@@ -42,13 +42,28 @@ class ResidentMoe:
         prefix = f"model.layers.{layer}.mlp.switch_mlp"
         self.projections = []
         try:
+            # Copy one tensor at a time and drop its file pages so the 71 GB
+            # safetensors mapping does not sit in the UBC next to the 68 GB
+            # of Metal buffers. mx.array is lazy; eval before DONTNEED.
             for name in ("gate_proj", "up_proj", "down_proj"):
                 p = f"{prefix}.{name}"
-                weight = mx.array(source.raw(p + ".weight"))
-                scales = mx.array(source.f32(p + ".scales"), dtype=scale_dtype)
-                biases = mx.array(source.f32(p + ".biases"), dtype=scale_dtype)
-                mx.eval(weight, scales, biases)
+                raw_w = source.raw(p + ".weight")
+                weight = mx.array(raw_w)
+                mx.eval(weight)
+                del raw_w
+                source.drop_pages(p + ".weight")
+                scales_np = source.f32(p + ".scales")
+                source.drop_pages(p + ".scales")
+                scales = mx.array(scales_np, dtype=scale_dtype)
+                mx.eval(scales)
+                del scales_np
+                biases_np = source.f32(p + ".biases")
+                source.drop_pages(p + ".biases")
+                biases = mx.array(biases_np, dtype=scale_dtype)
+                mx.eval(biases)
+                del biases_np
                 self.projections.append((weight, scales, biases))
+            source.drop_all_pages()
         finally:
             source.close()
         # Store the shared expert already transposed and contiguous. ``g.T`` in

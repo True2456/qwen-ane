@@ -52,6 +52,7 @@ any other tools/ file.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import mmap
 import os
@@ -62,6 +63,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+
+_F_NOCACHE = getattr(fcntl, "F_NOCACHE", 48)
 
 DEFAULT_MODEL = "/Users/true/models/Qwen3.8-Flash-Next"
 
@@ -124,6 +127,12 @@ class SafeShard:
     def __init__(self, path: Path):
         self.path = path
         self._fh = open(path, "rb")
+        if os.environ.get("FLASHNEXT_FILE_CACHE", "").strip() not in (
+                "1", "true", "TRUE"):
+            try:
+                fcntl.fcntl(self._fh.fileno(), _F_NOCACHE, 1)
+            except Exception:
+                pass
         n = struct.unpack("<Q", self._fh.read(8))[0]
         self.header = json.loads(self._fh.read(n))
         self.data_start = 8 + n
@@ -131,6 +140,16 @@ class SafeShard:
 
     def meta(self, key: str) -> dict:
         return self.header[key]
+
+    def drop_all_pages(self) -> None:
+        """Release faulted file pages after the tensors have been copied out."""
+        if os.environ.get("FLASHNEXT_FILE_CACHE", "").strip() in (
+                "1", "true", "TRUE"):
+            return
+        try:
+            self._mm.madvise(mmap.MADV_DONTNEED, 0, self._mm.size())
+        except Exception:
+            pass
 
     def raw(self, key: str, expert: Optional[int] = None) -> np.ndarray:
         """Return the raw stored array (no dtype conversion).
@@ -264,6 +283,11 @@ class FlashNextLoader:
         for s in self._shards.values():
             s.close()
         self._shards.clear()
+
+    def drop_pages(self) -> None:
+        """MADV_DONTNEED every open shard. Embedding re-faults on the next row."""
+        for s in self._shards.values():
+            s.drop_all_pages()
 
 
 @dataclass

@@ -645,22 +645,9 @@ class HostMoE:
         self.layer = int(getattr(w, "index", 0))
         self.store = store if store is not None else expert_f16_store()
         self.router_w = np.ascontiguousarray(np.asarray(w["mlp.gate.weight"], np.float32))
-        self.gu = w["mlp.experts.gate_up_proj"]
-        self.dn = w["mlp.experts.down_proj"]
         self.seq = seq
-        sg = np.asarray(w["mlp.shared_expert.gate_proj.weight"], np.float32)
-        su = np.asarray(w["mlp.shared_expert.up_proj.weight"], np.float32)
-        sd = np.asarray(w["mlp.shared_expert.down_proj.weight"], np.float32)
         sgt = np.asarray(w["mlp.shared_expert_gate.weight"], np.float32).reshape(1, -1)
-        self.shared_gate = np.ascontiguousarray(sg)
-        self.shared_up = np.ascontiguousarray(su)
-        self.shared_down = np.ascontiguousarray(sd)
         self.shared_sgate = np.ascontiguousarray(sgt)
-        if getattr(self.store, "mlx4", None) is not None:
-            sg, su, sd = self.store.mlx4.shared_fp32(self.layer)
-            self.shared_gate = sg
-            self.shared_up = su
-            self.shared_down = sd
         self._resident = None
         if _moe_decode_mode() == "mlxresident":
             from runtime.flashnext_mlx_moe import ResidentMoe
@@ -668,14 +655,34 @@ class HostMoE:
             path = Path(os.environ.get("FLASHNEXT_MLX4") or MLX4_DEFAULT)
             bank = Mlx4ExpertBank(path)
             sg, su, sd = bank.shared_fp32(self.layer)
-            self._resident = ResidentMoe(self.layer, (sg, su, sd, self.shared_sgate), path)
+            self._resident = ResidentMoe(
+                self.layer, (sg, su, sd, self.shared_sgate), path)
             bank.shard.close()
+            del sg, su, sd
             self.store.resident_models[self.layer] = self._resident
+            # GPU already holds routed experts and the shared expert. Keeping
+            # the BF16 slabs / fp32 shared copies here was a second copy of
+            # something decode never reads in this mode.
+            self.gu = self.dn = None
+            self.shared_gate = self.shared_up = self.shared_down = None
             self.gu_buf = self.dn_buf = np.empty(0, np.float32)
             self.inds = np.zeros((1, K_PIN), np.int32)
             self.scores = np.zeros((1, K_PIN, 1, seq), np.float16)
             self.last_ms = {"route": 0.0, "gather": 0.0, "gemm": 0.0}
             return
+        self.gu = w["mlp.experts.gate_up_proj"]
+        self.dn = w["mlp.experts.down_proj"]
+        sg = np.asarray(w["mlp.shared_expert.gate_proj.weight"], np.float32)
+        su = np.asarray(w["mlp.shared_expert.up_proj.weight"], np.float32)
+        sd = np.asarray(w["mlp.shared_expert.down_proj.weight"], np.float32)
+        self.shared_gate = np.ascontiguousarray(sg)
+        self.shared_up = np.ascontiguousarray(su)
+        self.shared_down = np.ascontiguousarray(sd)
+        if getattr(self.store, "mlx4", None) is not None:
+            sg, su, sd = self.store.mlx4.shared_fp32(self.layer)
+            self.shared_gate = sg
+            self.shared_up = su
+            self.shared_down = sd
         from runtime.expert_bank import _SwiGLUScratch
         self._q4_scratch = _SwiGLUScratch()
         self._moe_mode = _moe_decode_mode()
@@ -4454,18 +4461,13 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             # malloc_zone_pressure_relief returns 0 here, so what is left
             # after this is live, not spans libmalloc is sitting on.
             print(f"  released {_n_cached} cached layer weights", flush=True)
+            try:
+                loader.drop_pages()
+            except Exception:
+                pass
+        from runtime.mem_report import print_report as _mem_report
         if os.environ.get("FLASHNEXT_MEM_REPORT") == "1":
-            import gc as _gc2
-            from collections import Counter as _C
-            tally, total = _C(), 0
-            for o in _gc2.get_objects():
-                if isinstance(o, np.ndarray) and o.nbytes >= 4 << 20 \
-                        and o.base is None:
-                    tally[(o.shape, str(o.dtype))] += o.nbytes
-                    total += o.nbytes
-            print(f"  host arrays over 4 MB: {total / 2**30:.2f} GB", flush=True)
-            for (shape, dt), n in tally.most_common(10):
-                print(f"    {n / 2**30:7.3f} GB  {dt:8s} {shape}", flush=True)
+            _mem_report(host_layers)
 
         t_all = time.perf_counter()
         prefill_steps = 0 if serve else len(prompt_ids) - 1
