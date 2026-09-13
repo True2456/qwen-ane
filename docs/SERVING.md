@@ -66,9 +66,56 @@ warm and cold are the same model rounding differently, not one of them being
 wrong. Greedy output is reproducible for a given cache state, not across cache
 states — the same property a batching server has.
 
+## The HTTP endpoint
+
+`tools/flashnext_server.py` puts an OpenAI-compatible endpoint in front of it.
+
+```bash
+~/.rindi/venvs/coreai/bin/python tools/flashnext_server.py --port 2457
+```
+
+Point any OpenAI client at `http://127.0.0.1:2457/v1`. The key is not checked.
+`/v1/models` and `/v1/chat/completions` are implemented, streaming and not,
+with `tools`. Requests are serialised behind one lock, because every one of
+them mutates the same recurrent state.
+
+Thinking-mode sampling is the default when a request does not say otherwise:
+temperature 1.0, top_p 0.95, top_k 20, min_p 0.0.
+
+### Tool calls
+
+The template asks for an XML-ish shape rather than JSON, and the generation
+prompt opens the thinking block, so a reply carries `</think>` without its
+opening tag. Both are handled, and the thinking text comes back as
+`reasoning_content`.
+
+The model does not always follow its own format. It has emitted a JSON object
+where the parameter blocks should be, left a stray closing tag behind, and
+named the function after one of its parameters. The parser recovers all three:
+it falls back to JSON inside the function block, strips stray tags, and repairs
+a name that was not declared when exactly one declared tool has all its
+required parameters present. `tests/test_tool_parse.py` covers each.
+
+Arguments come back as a JSON string, as the API requires, and are turned back
+into a mapping on the way in, which is what the template needs.
+
+### A working loop
+
+```
+turn 0: 26.5s tool_calls cached    0/ 324 calls=['run_shell'] args={"cmd": "ls -la"}
+turn 1:  9.9s stop       cached  323/ 378 answers from the tool output
+```
+
+The second turn reuses 323 of 378 tokens through a tool-result turn, which is
+the case that matters: an agent's history grows by an assistant call and a tool
+result each round.
+
 ## Not there yet
 
-No HTTP endpoint; this speaks JSON lines on a pipe. No streaming, so a caller
-waits for the whole turn. No tool definitions passed to the template. No
-`presence_penalty`, which thinking mode does not want anyway. Long context is
-validated to 8192 tokens.
+Streaming sends the turn as one chunk rather than token by token; real deltas
+need the serve loop to emit them. No `presence_penalty`, which thinking mode
+does not want anyway. Long context is validated to 8192 tokens. One request at
+a time, and about two minutes to load.
+
+And `--prefill-k` must stay 0: the wide prefill graphs are fast and leave the
+state wrong enough to change what the model does. See `PREFILL.md`.
