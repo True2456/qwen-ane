@@ -453,3 +453,26 @@ client pass 32.
 The 24 tok/s between this and the 82 of the single wide chunk is still on the
 table, and now has a precise statement: find a 32-wide recurrence whose output
 does not flip the experts the 4-wide one picks.
+
+### Intermediate tile widths do not pass either
+
+`MIL_GDN_CHUNK_TILE` sets the width of each chunk inside the 32-slot prefill
+procedure. Same checks as above, one run each, all deterministic:
+
+| tile | prefill tok/s | nll, 32 tokens after 512 | vs 1.944132 | tool call |
+| --- | --- | --- | --- | --- |
+| 4 (default) | 57.9 | 1.946449 | +0.002 | correct |
+| 8 | 63.8 | 1.983824 | +0.040 | correct |
+| 16 | 66.7 | 1.967086 | +0.023 | correct |
+| 32 | 82 | 2.015541 | +0.071 | wrong |
+
+Only tile 4 is inside the 0.01 gate. Tiles 8 and 16 still produce the right
+tool call, so the damage is smaller than at 32, but it is well outside what
+perplexity allows.
+
+Two things worth noting for whoever picks this up. The error is not monotonic
+in width: tile 16 is closer than tile 8. And a 4-wide chunk matches the
+token-by-token recurrence at 0.000 while wider ones do not, so the loss is in
+the chunked arithmetic itself, not in running prefill as one submit. The
+likely places are fp16 precision in the triangular inversion, the x64 query
+scaling, and the neutral padding that brings narrower chunks up to 32.
