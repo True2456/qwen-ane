@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,7 +20,7 @@ class AneClient:
     """The MIL path, held in a subprocess."""
 
     def __init__(self, ctx: int = 8192, spec: int = 4, prefill_k: int = 32,
-                 quiet: bool = True):
+                 quiet: bool = True, serve_log=None, seed: int | None = None):
         env = dict(os.environ)
         env.update({"FLASHNEXT_SPEC": str(spec), "FLASHNEXT_MOE": "mlxresident",
                     "FLASHNEXT_HEAD": "mlx", "FLASHNEXT_MIL_GDN": "1",
@@ -29,19 +28,28 @@ class AneClient:
         # Zero is an explicit decode-width baseline, even when the parent
         # environment or the exporter's default enables wide prefill.
         env["FLASHNEXT_PREFILL_MIL_K"] = str(prefill_k)
+        if seed is not None:
+            env["FLASHNEXT_SEED"] = str(seed)
+        if serve_log:
+            err = open(serve_log, "w")
+        else:
+            err = subprocess.DEVNULL if quiet else None
+        self._err = err
         self.p = subprocess.Popen(
             [str(Path.home() / ".rindi/venvs/coreai/bin/python"), "-u",
              str(ROOT / "scripts/export_flashnext_coreai.py"), "generate",
              "--serve", "--serve-ctx", str(ctx),
              "--prompt-ids", "760", "--max-new", "1"],
             cwd=str(ROOT), env=env, stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL if quiet else None, text=True)
+            stdout=subprocess.PIPE, stderr=err, text=True)
         # Everything before the ready line is load chatter.
         for line in self.p.stdout:
             line = line.strip()
             if line.startswith("{") and "ready" in line:
                 self.info = json.loads(line)
+                self.info["prefill_k"] = prefill_k
+                self.info["spec"] = spec
+                self.info["ple"] = env.get("FLASHNEXT_PLE", "1")
                 return
         raise RuntimeError("the serve process never became ready")
 
@@ -61,15 +69,22 @@ class AneClient:
         return self._rpc({"op": "score", "prompt": prompt,
                           "choices": choices})["logprobs"]
 
-    def gen(self, prompt: str, max_new: int, stop: list[str]) -> str:
+    def gen(self, prompt: str, max_new: int, stop: list[str],
+            temperature: float = 0.0, top_p: float = 1.0, top_k: int = 0,
+            min_p: float = 0.0) -> str:
         return self._rpc({"op": "gen", "prompt": prompt, "max_new": max_new,
-                          "stop": stop})["text"]
+                          "stop": stop, "temperature": temperature,
+                          "top_p": top_p, "top_k": top_k, "min_p": min_p})["text"]
 
     def close(self) -> None:
         try:
             self._rpc_quit()
         except Exception:  # noqa: BLE001
             self.p.kill()
+            self.p.wait(timeout=30)
+        err = getattr(self, "_err", None)
+        if err not in (None, subprocess.DEVNULL):
+            err.close()
 
     def _rpc_quit(self) -> None:
         self.p.stdin.write(json.dumps({"op": "quit"}) + "\n")
@@ -104,7 +119,10 @@ class MlxClient:
                 out[c] = float((row[cid[0]] - lse).item())
         return out
 
-    def gen(self, prompt: str, max_new: int, stop: list[str]) -> str:
+    def gen(self, prompt: str, max_new: int, stop: list[str],
+            temperature: float = 0.0, **_kw) -> str:
+        if temperature > 0:
+            raise NotImplementedError("mlx eval arm is greedy only")
         mx = self.mx
         from mlx_lm.models.cache import make_prompt_cache
         ids = self.tok.encode(prompt, add_special_tokens=False)

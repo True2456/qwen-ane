@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import time
 from collections import defaultdict
@@ -65,7 +66,8 @@ def run_mmlu(client, n: int, shots: int) -> dict:
         correct += ok
         per_subject[subject][0] += ok
         per_subject[subject][1] += 1
-        records.append({"i": i, "pred": pred, "gold": gold, "ok": ok})
+        records.append({"i": i, "subject": subject, "pred": pred, "gold": gold,
+                        "ok": ok, "logprobs": lp, "question": row["question"]})
         if (i + 1) % 25 == 0:
             el = time.perf_counter() - t0
             print(f"  {i + 1}/{len(test)}  acc {correct / (i + 1):.3f}  "
@@ -86,7 +88,8 @@ def _last_number(text: str) -> str | None:
     return hits[-1].rstrip(".") if hits else None
 
 
-def run_gsm8k(client, n: int, shots: int) -> dict:
+def run_gsm8k(client, n: int, shots: int, *, temperature: float = 0.0,
+              top_p: float = 1.0, top_k: int = 0, min_p: float = 0.0) -> dict:
     rows = _jsonl(EVAL / "gsm8k_test.jsonl")
     fewshot, test = rows[:shots], rows[shots:shots + n]
     prefix = "".join(f"Question: {r['question'].strip()}\n"
@@ -95,19 +98,24 @@ def run_gsm8k(client, n: int, shots: int) -> dict:
     t0 = time.perf_counter()
     for i, row in enumerate(test):
         prompt = prefix + f"Question: {row['question'].strip()}\nAnswer:"
-        out = client.gen(prompt, max_new=320, stop=["\nQuestion:", "\n\n"])
+        out = client.gen(prompt, max_new=320, stop=["\nQuestion:", "\n\n"],
+                         temperature=temperature, top_p=top_p, top_k=top_k,
+                         min_p=min_p)
         pred = _last_number(out)
         gold = row["answer"].split("####")[-1].strip().replace(",", "")
         ok = pred is not None and pred == gold
         correct += ok
-        records.append({"i": i, "pred": pred, "gold": gold, "ok": ok})
+        records.append({"i": i, "pred": pred, "gold": gold, "ok": ok,
+                        "text": out, "question": row["question"]})
         if (i + 1) % 10 == 0:
             el = time.perf_counter() - t0
             print(f"  {i + 1}/{len(test)}  acc {correct / (i + 1):.3f}  "
                   f"{el / (i + 1):.1f}s a question", flush=True)
+    scoring = ("greedy generation, last number" if temperature <= 0 else
+               f"sampled T={temperature} top_p={top_p} top_k={top_k}, last number")
     return {"task": "gsm8k", "n": len(test), "shots": shots,
             "correct": correct, "accuracy": correct / max(len(test), 1),
-            "scoring": "greedy generation, last number",
+            "scoring": scoring,
             "seconds": time.perf_counter() - t0, "records": records}
 
 
@@ -120,20 +128,41 @@ def main() -> int:
     ap.add_argument("--ctx", type=int, default=8192)
     ap.add_argument("--spec", type=int, default=4)
     ap.add_argument("--prefill-k", type=int, default=0)
+    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--top-p", type=float, default=1.0)
+    ap.add_argument("--top-k", type=int, default=0)
+    ap.add_argument("--min-p", type=float, default=0.0)
+    ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     shots = a.shots if a.shots is not None else (5 if a.task == "mmlu" else 8)
 
     t0 = time.perf_counter()
+    serve_log = (Path(a.out).with_suffix(".serve.log")
+                 if a.out and a.backend == "ane" else None)
     client = eval_client.make(a.backend, ctx=a.ctx, spec=a.spec,
-                              prefill_k=a.prefill_k)
-    print(f"  {a.backend} ready in {time.perf_counter() - t0:.0f}s "
-          f"{client.info}", flush=True)
+                              prefill_k=a.prefill_k, serve_log=serve_log,
+                              seed=a.seed)
+    load_s = time.perf_counter() - t0
+    print(f"  {a.backend} ready in {load_s:.0f}s {client.info}", flush=True)
     try:
-        res = (run_mmlu if a.task == "mmlu" else run_gsm8k)(client, a.n, shots)
+        if a.task == "mmlu":
+            res = run_mmlu(client, a.n, shots)
+        else:
+            res = run_gsm8k(client, a.n, shots, temperature=a.temperature,
+                            top_p=a.top_p, top_k=a.top_k, min_p=a.min_p)
     finally:
         client.close()
     res["backend"] = a.backend
+    res["prefill_k"] = a.prefill_k
+    res["spec"] = a.spec
+    res["temperature"] = a.temperature
+    res["top_p"] = a.top_p
+    res["top_k"] = a.top_k
+    res["min_p"] = a.min_p
+    res["seed"] = a.seed
+    res["ple"] = os.environ.get("FLASHNEXT_PLE", "1")
+    res["load_seconds"] = load_s
     print(f"\n{a.task} {a.backend}: {res['correct']}/{res['n']} = "
           f"{res['accuracy']:.4f} in {res['seconds']:.0f}s", flush=True)
     if a.out:
