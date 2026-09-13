@@ -3344,7 +3344,12 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             from runtime.flashnext_ngram import NgramRows, CpuPLE
             ple_rows = NgramRows(BASE)
             ple_layers = {int(i)-1: CpuPLE(ple_rows, int(i)-1) for i in cfg["ple_layer_ids"]}
-            print(f"  PLE: {ple_rows.total} rows x {ple_rows.dim}, pread selected rows only", flush=True)
+            print(
+                f"  PLE: {ple_rows.total} rows x {ple_rows.dim}, "
+                f"pread {ple_rows.dim * 2} B rows, "
+                f"threads={ple_rows._threads} cache={int(ple_rows._cache_on)}",
+                flush=True,
+            )
 
         def apply_moe(i, attn0, hyper, inj, timers):
             hl = host_layers[i]
@@ -3734,7 +3739,7 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 return 0
             pt = {"ane_gdn": 0.0, "ane_qsa": 0.0, "take": 0.0, "route": 0.0,
                   "moe": 0.0, "recombine": 0.0, "mixers": 0.0, "indexer": 0.0,
-                  "kvfeed": 0.0, "embed": 0.0, "ple": 0.0}
+                  "kvfeed": 0.0, "embed": 0.0, "ple": 0.0, "ple_lookup": 0.0}
             prefill_timers.append(pt)
             from runtime.flashnext_indexer import QSAIndexer, IndexerState
 
@@ -3773,6 +3778,7 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                         for j in range(n):
                             hidden[:, j:j + 1, :] = ple_layers[i].step(
                                 hidden[:, j:j + 1, :], chunk[j])
+                            pt["ple_lookup"] += ple_layers[i].last_lookup_ms / 1e3
                         hidden_bc = _bsh_to_bc1s(np.asarray(hidden, np.float32))
                         pt["ple"] += time.perf_counter() - _t0
                     if i in fn_multi:
@@ -3852,7 +3858,7 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
         spec_ms = {"embed": 0.0, "gdn_stage": 0.0,
                    "gdn_ane": 0.0, "gdn_route": 0.0, "gdn_moe": 0.0,
                    "gdn_rec": 0.0, "qsa": 0.0, "head": 0.0, "commit": 0.0,
-                   "overlap": 0.0}
+                   "overlap": 0.0, "ple": 0.0, "ple_lookup": 0.0}
         _spec_pipe = os.environ.get("FLASHNEXT_PIPE", "0") not in ("0", "false", "")
 
         _fused_moe = os.environ.get("FLASHNEXT_FUSED_MOE", "none")
@@ -3904,10 +3910,13 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             _b["embed"] += time.perf_counter() - _t
             for i in range(n_layers):
                 if i in ple_layers:
+                    _t = time.perf_counter()
                     hid_bsh = _bc1s_to_bsh(hid)
                     for j in range(n):
                         hid_bsh[:, j:j + 1, :] = ple_layers[i].step(hid_bsh[:, j:j + 1, :], ids[j])
+                        _b["ple_lookup"] += ple_layers[i].last_lookup_ms / 1e3
                     hid = _bsh_to_bc1s(hid_bsh)
+                    _b["ple"] += time.perf_counter() - _t
                 hl = host_layers[i]
                 if i in mil_gdn:
                     _t = time.perf_counter()
@@ -3981,9 +3990,12 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             def ple_range(lo, hi):
                 if i_ple not in ple_layers:
                     return
+                _t = time.perf_counter()
                 for j in range(lo, hi):
                     hid[:, j:j + 1, :] = ple_layers[i_ple].step(
                         hid[:, j:j + 1, :], ids[j])
+                    _b["ple_lookup"] += ple_layers[i_ple].last_lookup_ms / 1e3
+                _b["ple"] += time.perf_counter() - _t
 
             for i in range(n_layers):
                 i_ple = i
@@ -4130,6 +4142,14 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                   f"ppl {np.exp(total / max(n_scored, 1)):.4f}  "
                   f"in {el:.1f}s ({n_scored / max(el, 1e-9):.1f} tok/s)",
                   flush=True)
+            if ple_rows is not None:
+                n_blocks = max(1, (n_scored + kk - 1) // kk)
+                print(
+                    f"  PLE {ple_rows.stats()}  "
+                    f"block ple={spec_ms['ple'] * 1e3 / n_blocks:.2f} ms "
+                    f"(lookup={spec_ms['ple_lookup'] * 1e3 / n_blocks:.2f} ms)",
+                    flush=True,
+                )
 
         async def speculate() -> None:
             """Draft with the MTP head, verify the whole block on the ANE."""
@@ -4797,6 +4817,8 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
         print(f"  generated text={gen_text!r}")
         print(f"  full text={full_text!r}")
         print(f"  {elapsed:.2f}s  {len(generated) / elapsed:.3f} tok/s")
+        if ple_rows is not None:
+            print(f"  PLE {ple_rows.stats()}", flush=True)
         st = expert_f16_store()
         t_fl = time.perf_counter()
         n_flush = st.flush_disk()

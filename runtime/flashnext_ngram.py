@@ -2,15 +2,21 @@
 
 Shard order and hash parameters come from checkpoint metadata/tensors. The
 large table is never materialized: each lookup uses pread for selected rows.
+A small userspace cache holds rows already seen this process; cache misses
+are issued concurrently so the SSD is not stuck at queue depth one.
 """
 import bisect
+import fcntl
 import json
 import os
 import re
 import struct
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import numpy as np
+
+_F_NOCACHE = getattr(fcntl, "F_NOCACHE", None)
 
 
 class NgramRows:
@@ -42,6 +48,25 @@ class NgramRows:
             self.entries.append((fd, base+start, rows, dim, key))
             total += rows
         self.total, self.dim = total, self.entries[0][3]
+        self._cache: dict[int, np.ndarray] = {}
+        self._pool: ThreadPoolExecutor | None = None
+        self._threads = max(0, int(os.environ.get("FLASHNEXT_PLE_THREADS", "16")))
+        self._cache_on = os.environ.get("FLASHNEXT_PLE_CACHE", "1") not in (
+            "0", "false", "")
+        cap = os.environ.get("FLASHNEXT_PLE_CACHE_ROWS", "262144")
+        self._cache_cap = max(0, int(cap))
+        self.hits = self.misses = 0
+        self.bytes_read = 0
+        self.last_hits = self.last_misses = 0
+        self.last_bytes = 0
+        # Only the 102 GB n-gram shards. Keep their 16 KB pages out of the
+        # kernel cache so they cannot evict the 79 GB model; reuse is the
+        # userspace row cache. Weight tensors loaded via tensor() stay cached.
+        nocache = os.environ.get("FLASHNEXT_PLE_NOCACHE", "1") not in (
+            "0", "false", "")
+        if nocache and _F_NOCACHE is not None:
+            for fd, *_ in self.entries:
+                fcntl.fcntl(fd, _F_NOCACHE, 1)
 
     def _file(self, name):
         if name not in self.files:
@@ -50,6 +75,37 @@ class NgramRows:
             header = json.loads(os.pread(fd,size,8))
             self.files[name] = (fd,size+8,header)
         return self.files[name]
+
+    def _executor(self) -> ThreadPoolExecutor | None:
+        if self._threads <= 1:
+            return None
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(
+                max_workers=self._threads, thread_name_prefix="ple")
+        return self._pool
+
+    def _pread_u16(self, row_ids):
+        """Read `row_ids` (int sequence) into a (n, dim) uint16 array."""
+        n = len(row_ids)
+        out = np.empty((n, self.dim), np.uint16)
+        starts, entries = self.starts, self.entries
+
+        def one(j):
+            row = int(row_ids[j])
+            s = bisect.bisect_right(starts, row) - 1
+            fd, start, _, dim, _ = entries[s]
+            data = os.pread(fd, dim * 2, start + (row - starts[s]) * dim * 2)
+            if len(data) != dim * 2:
+                raise IOError("short n-gram row read")
+            out[j] = np.frombuffer(data, np.uint16)
+
+        pool = self._executor() if n > 1 else None
+        if pool is None:
+            for j in range(n):
+                one(j)
+        else:
+            list(pool.map(one, range(n)))
+        return out
 
     def tensor(self, key):
         fd, base, header = self._file(self.index[key])
@@ -65,13 +121,44 @@ class NgramRows:
     def lookup(self, ids):
         ids=np.asarray(ids,np.int64)
         if np.any(ids<0) or np.any(ids>=self.total): raise IndexError("n-gram row outside table")
-        out=np.empty((ids.size,self.dim),np.uint16)
-        for j,row in enumerate(ids.flat):
-            s=bisect.bisect_right(self.starts,int(row))-1
-            fd,start,_,dim,_=self.entries[s]
-            data=os.pread(fd,dim*2,start+(int(row)-self.starts[s])*dim*2)
-            if len(data)!=dim*2: raise IOError("short n-gram row read")
-            out[j]=np.frombuffer(data,np.uint16)
+        flat = ids.reshape(-1)
+        n = int(flat.size)
+        out = np.empty((n, self.dim), np.uint16)
+        cache = self._cache if self._cache_on else None
+        miss_j = []
+        miss_row = []
+        hits = 0
+        for j in range(n):
+            row = int(flat[j])
+            hit = cache.get(row) if cache is not None else None
+            if hit is not None:
+                out[j] = hit
+                hits += 1
+            else:
+                miss_j.append(j)
+                miss_row.append(row)
+        if miss_row:
+            # One SSD read per unique miss; duplicates in this call share it.
+            unique = list(dict.fromkeys(miss_row))
+            raw = self._pread_u16(unique)
+            fetched = {}
+            for k, row in enumerate(unique):
+                row_u16 = raw[k].copy()
+                fetched[row] = row_u16
+                if cache is not None:
+                    cache[row] = row_u16
+            if cache is not None and self._cache_cap and len(cache) > self._cache_cap:
+                overflow = len(cache) - self._cache_cap
+                for key in list(cache.keys())[:overflow]:
+                    del cache[key]
+            for j, row in zip(miss_j, miss_row):
+                out[j] = fetched[row]
+        misses = len(miss_row)
+        self.last_hits, self.last_misses = hits, misses
+        self.last_bytes = len(set(miss_row)) * self.dim * 2
+        self.hits += hits
+        self.misses += misses
+        self.bytes_read += self.last_bytes
         return (out.astype(np.uint32)<<16).view(np.float32).reshape(*ids.shape,self.dim)
 
     def write_index(self, destination):
@@ -83,9 +170,20 @@ class NgramRows:
               "total_rows":self.total,"dim":self.dim}
         destination.write_text(json.dumps(data,indent=2)+"\n")
 
+    def stats(self) -> str:
+        resident = len(self._cache)
+        return (f"hits={self.hits} misses={self.misses} "
+                f"hit_rate={self.hits / max(self.hits + self.misses, 1):.3f} "
+                f"resident={resident} ({resident * self.dim * 2 / 1e6:.2f} MB) "
+                f"pread={self.bytes_read / 1e6:.2f} MB")
+
     def close(self):
+        if self._pool is not None:
+            self._pool.shutdown(wait=False)
+            self._pool = None
         for fd,_,_ in self.files.values(): os.close(fd)
         self.files.clear()
+        self._cache.clear()
 
 
 class CpuPLE:
@@ -102,6 +200,8 @@ class CpuPLE:
         self.hash={n:rows.tensor(p+"ple_embedding."+n) for n in ("layer_multipliers","ngram_heads_offsets","ngram_heads_vocab_sizes")}
         self.conv=np.zeros(((cfg["ple_conv_kernel_size"]-1)*self.ng,self.h*self.hc),np.float32)
         self.last_lookup_ms=0.
+        self.last_hits=self.last_misses=0
+        self.last_bytes=0
 
     def hash_ids(self, token):
         history=[int(token)]+list(reversed(self.history))
@@ -123,6 +223,9 @@ class CpuPLE:
         t=time.perf_counter()
         emb=self.rows.lookup(self.hash_ids(token)).reshape(-1)
         self.last_lookup_ms=(time.perf_counter()-t)*1e3
+        self.last_hits=self.rows.last_hits
+        self.last_misses=self.rows.last_misses
+        self.last_bytes=self.rows.last_bytes
         self.history=(self.history+[int(token)])[-(self.ng-1):]
         key=self.norm(self.weights["key_proj"]@emb,"norm_key").reshape(self.hc,self.h)
         query=self.norm(hidden.reshape(-1),"norm_query").reshape(self.hc,self.h)
