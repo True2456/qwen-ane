@@ -1026,7 +1026,11 @@ class AneEngine:
                           output_dim=output_dim, seq_len=seq_len,
                           weight_dequant=np.empty((0, 0), np.float32))
         prog._compile_opts = opts_dict
-        prog._keep_alive = keep_alive
+        # The weight blobs exist to be handed to the compiler. Once the model
+        # is loaded they are also on disk under localModelPath, and holding
+        # them costs 5 GB of Foundation objects across 48 layers.
+        drop = os.environ.get("Q38_ANE_KEEP_WEIGHT_BLOBS") != "1"
+        prog._keep_alive = [] if drop else keep_alive
         prog._compile_cache_hit = loaded_from_cache
         prog._compile_timings = {
             "descriptor_seconds": descriptor_seconds,
