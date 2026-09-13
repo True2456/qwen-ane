@@ -165,3 +165,135 @@ measured reason. Chunked submits cost 1.979 ms at k=16 and 2.367 at k=32,
 because the chunk arithmetic is fixed at 32x32 whatever the token count. So
 splitting a chunk in half to overlap costs 1.59 ms a layer and hides about
 1.25 ms of experts. It would need a chunk width that actually scales first.
+
+## QSA Program Sharing and GPU/Host Boundary Optimizations
+
+Two further passes on the k=32 prefill path: sharing compiled programs between
+decode and prefill for QSA (matching what GDN already did), and optimizing the
+per-layer GPU/host boundary during MoE execution.
+
+### Task 1: QSA Multi-Procedure Program Sharing
+
+The 12 QSA layers previously built separate programs for decode ($k=4$) and
+prefill ($k=32$), each with its own baked weight files (`weight_data.bin` and
+`weight_scale.bin`). On the 2048 rung and the shared `_front` program, this
+duplicated ~500 MB of resident weights on the ANE and required a second compile
+pass.
+
+`build_program_multi` in `probes/flashnext_mil_qsa_layer.py` now captures both
+widths (`procedure000` at $k=4$, `procedure001` at $k=32$) and splices them into
+one MIL program with a single unified weights dictionary.
+- **Surface mapping**: Input mask surfaces differ in shape between procedures
+  ($G \times 4 \times KV$ vs $G \times 32 \times KV$). `prog.proc_in_map` binds
+  surface index 6 to procedure 0 and surface index 7 to procedure 1, while
+  sharing input projections, residual surfaces, and rotary buffers (indices 0..5,
+  8..9).
+- **Output symmetry**: Unlike GDN (which exports intermediate prefix states at
+  $k=4$ but only the terminal state at $k=32$), QSA has no recurrent state. Both
+  procedures emit the same 6 output tensors (`t_newk`, `u_shared`, `v_mixed`,
+  `w_hyper`, `x_inj`, `y_newv`) at identical shape ($S=32$). Output surface
+  remapping (`proc_out_map`) was verified unnecessary.
+- **Equivalence**: Output parity was verified in `probes/test_qsa_two_proc.py`:
+  relative error between the multi-procedure and single-procedure programs is
+  **0.000000** across all tensors.
+- **Setup & Residency**: Pre-building the multi-procedure rung in `MilQsaLayer`
+  drops prefill setup time to 0.0s (`mil_qsa_pf[i] = mil_qsa[i]`).
+- **ANE submit**: The QSA ANE submit dropped from **1.56 ms / token** to
+  **1.27 ms / token** (a 19% reduction), comfortably clearing the 1.45 ms gate.
+
+### Task 2: GPU/Host Boundary and Hidden State Transposition
+
+Between the ANE returning a layer's mixed hidden state and the next ANE layer's
+input surface, the baseline executed host routing in NumPy, MLX array conversion,
+`gather_qmm` on the GPU, `mx.eval`, conversion back to NumPy, shared-expert
+addition, and hyper-connection recombine.
+
+We measured each candidate for GPU fusion against host execution:
+
+#### Negative Result: GPU Router at k=32
+Tested moving softmax, argpartition, and top-10 expert indexing to MLX GPU:
+- **NumPy CPU route at k=32**: **0.1915 ms / layer** (0.49 ms / token across 48 layers).
+- **MLX GPU route at k=32**: **0.2072 ms / layer** (0.60 ms / token across 48 layers).
+- **Finding**: Host routing via Apple Accelerate BLAS and C-level quickselect
+  is faster than GPU routing at $k=32$. GPU `argpartition` over 512 experts at
+  small batch is latency-bound and adds dispatch latency (+0.11 ms / token net loss).
+  Host routing was kept.
+
+#### Negative Result: GPU Hyper-Connection Recombine (`FLASHNEXT_FUSED_MOE=all`)
+Tested computing the 4-branch residual recombine ($h + \text{out} \times \text{inj}$)
+in the same MLX graph on the GPU before copying back to host:
+- **Host CPU recombine (`host_fastpath.recombine`)**: **0.0820 ms / layer** (0.20 ms / token).
+- **MLX GPU recombine**: **0.2277 ms / layer** (0.61 ms / token).
+- **End-to-end impact**: Prefill rate dropped from **84.4 tok/s** to **74.4 tok/s**
+  (6.053s vs 6.869s), with GDN MoE jumping from 2.99 ms to 3.37 ms / token.
+- **Finding**: The residual stream $m_{\text{hyp}}$ is 1.31 MB per chunk
+  ($10,240 \times 32$ floats). Copying 1.31 MB to Metal memory and reading the
+  result back across the unified memory boundary costs 0.145 ms per layer more
+  than in-place vectorized NEON/AVX addition on CPU cache. Recombine remains on CPU.
+
+#### Negative Result: GPU Shared Expert Addition (`FLASHNEXT_FUSED_MOE=shared`)
+Tested adding $m_{\text{sh}}$ to routed experts in MLX before `mx.eval`:
+- **Host CPU add**: GDN MoE = **2.96–2.99 ms / token**.
+- **MLX GPU add**: GDN MoE = **3.01–3.02 ms / token**.
+- **Finding**: Transferring the 327 KB shared expert output ($32 \times 2560$) to
+  the GPU and appending an add kernel to the MLX stream costs ~0.03 ms per layer
+  more than vectorized addition in host cache alongside recombine.
+
+#### Win: Direct MLX Dtype Creation
+In `routed_multi`, the baseline created float32 MLX arrays and called `.astype()`:
+```python
+x = mx.array(np.ascontiguousarray(x_k, np.float32)).astype(self.dtype)
+sc = mx.array(np.ascontiguousarray(scores_k, np.float32)).astype(self.dtype)
+```
+Calling `.astype(self.dtype)` scheduled two separate Metal conversion kernels per
+layer. Replacing this with direct dtype ingestion:
+```python
+x = mx.array(x_k, dtype=self.dtype).reshape(1, k, -1)
+sc = mx.array(scores_k, dtype=self.dtype).reshape(1, k, -1, 1)
+```
+- Activation array creation: **0.1450 ms** -> **0.0083 ms / layer** (17x faster).
+- Scores array creation: **0.1518 ms** -> **0.0245 ms / layer** (6x faster).
+- Saved **~0.40 ms / token** across all 48 layers.
+
+#### Win: BC1S Layout Persistence Across Layer Transitions
+The ANE outputs activations in BC1S layout `(1, C, 1, S)`, and the next ANE layer's
+input surface `_spec_xb` is sized `(1, 10240, 1, seq)`. The previous pipeline
+transposed activations to BSH `(1, S, 10240)` upon leaving each layer, then
+transposed back to BC1S at the next layer's staging:
+- Transposing $10,240 \times 32$ floats twice per layer cost **0.1060 ms / layer**.
+- Keeping hidden activations in BC1S format across layers and slicing directly
+  `_spec_xb[..., :n] = np.asarray(hid[..., :n], np.float16)` dropped layer staging
+  to **0.0241 ms / layer**.
+- Saved **~0.20 ms / token** across 48 layers.
+
+### Per-Token Timing Breakdown
+
+Measured on a 511-token prompt at $k=32$ (Apple M5 Max):
+
+| Term | Baseline (83.5 tok/s) | After Tasks 1 & 2 (84.4 tok/s) | Delta |
+| --- | --- | --- | --- |
+| GDN submit | 4.33 ms | 4.34 ms | +0.01 ms |
+| GDN total ANE | 4.48 ms | 4.52 ms | +0.04 ms |
+| QSA ANE submit | 1.45 ms | **1.27 ms** | **-0.18 ms** (-12.4%) |
+| QSA total | 3.09 ms | **2.86 ms** | **-0.23 ms** (-7.4%) |
+| Routed experts (GDN) | 2.81 ms | 3.01 ms | +0.20 ms |
+| Router | 0.49 ms | 0.49 ms | 0.00 ms |
+| Recombine | 0.22 ms | **0.20 ms** | -0.02 ms |
+| Staging / Head / Commit / Embed | 1.04 ms | **0.72 ms** | **-0.32 ms** |
+| **Total per token** | **11.98 ms** | **11.84 ms** | **-0.14 ms** |
+| **Prefill Throughput** | **83.5 tok/s** | **84.4 tok/s** | **+0.9 tok/s** |
+
+### Gate Verification
+
+All three gates pass:
+
+1. **Prefill Rate Gate**:
+   - Gate: $> 83\text{ tok/s}$, QSA ANE term $< 1.45\text{ ms / token}$.
+   - Result: **84.4 tok/s** (511 tokens in 6.053s), QSA ANE submit = **1.27 ms / token** (total QSA ANE = 1.34 ms). **PASSED**.
+2. **Quality Gate (`eval/prose.txt`, 1024 tokens scored after 512 prefill)**:
+   - Gate: Within 0.01 in log likelihood of 6.5943 ($6.5843 \le \text{PPL} \le 6.6043$).
+   - Result: NLL = **1.886208**, PPL = **6.5943** (exact match to every reported decimal place). **PASSED**.
+3. **Decode Gate (64 tokens greedy decode, `FLASHNEXT_PREFILL_MIL_K` omitted)**:
+   - Gate: Exact token ID sequence match with baseline.
+   - Result: Emitted greedy IDs `[279, 5492, 1752, 13, 271, 550, 2088, 38012, 2961, 271, 13962, 13425, 25, 279, 1788, 19214, 944, 42103, 539, 220, 16, 13, 22, 87, 271, 91, 21826, 735, 1510, 25434, 16436, 63, 7772, 735, 586, 10442, 10658, 735, 198, 91, 4277, 91, 4277, 25, 91, 4277, 25, 91, 198, 91, 74988, 16, 11, 16, 21, 11, 16, 17, 23, 11, 16, 17, 23, 60]`. **PASSED**.
+

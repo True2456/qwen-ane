@@ -3686,6 +3686,23 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 return m_mix, m_hyp, m_inj, m_sh
             mixed_bsh2 = _bc1s_to_bsh(m_mix)
             inds, sc = hl.moe._route(np.asarray(mixed_bsh2, np.float32).reshape(-1, H))
+            if _fused_moe == "all" and hl.moe._resident is not None:
+                sh_bsh = _bc1s_to_bsh(m_sh)
+                hyp_bsh = _bc1s_to_bsh(m_hyp)
+                inj_bsh = _bc1s_to_bsh(m_inj)
+                hid_h = hl.moe._resident.routed_multi(
+                    mixed_bsh2, inds, sc, shared_k=sh_bsh, hyp_k=hyp_bsh, inj_k=inj_bsh)
+                _t5 = time.perf_counter()
+                tq["moe"] += _t5 - _t4
+                return _bsh_to_bc1s(hid_h) if bc1s else hid_h
+            if _fused_moe == "shared" and hl.moe._resident is not None:
+                sh_bsh = _bc1s_to_bsh(m_sh)
+                y = hl.moe._resident.routed_multi(mixed_bsh2, inds, sc, shared_k=sh_bsh)
+                _t5 = time.perf_counter()
+                tq["moe"] += _t5 - _t4
+                hc = host_recombine(_bsh_to_bc1s(y), m_hyp, m_inj)
+                tq["recombine"] += time.perf_counter() - _t5
+                return hc if bc1s else _bc1s_to_bsh(hc)
             routed = hl.moe._resident.routed_multi(mixed_bsh2, inds, sc)
             y = routed + _bc1s_to_bsh(m_sh)
             _t5 = time.perf_counter()
@@ -3831,55 +3848,81 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                    "overlap": 0.0}
         _spec_pipe = os.environ.get("FLASHNEXT_PIPE", "0") not in ("0", "false", "")
 
-        def _moe_from_ane(hl, m_mix, m_hyp, m_inj, m_sh, _b=None):
+        _fused_moe = os.environ.get("FLASHNEXT_FUSED_MOE", "none")
+
+        def _moe_from_ane(hl, m_mix, m_hyp, m_inj, m_sh, _b=None, bc1s=False):
             mixed_bsh = _bc1s_to_bsh(m_mix)
             t0 = time.perf_counter()
             inds, sc = hl.moe._route(
                 np.asarray(mixed_bsh, np.float32).reshape(-1, H))
             t1 = time.perf_counter()
+            if _fused_moe == "all" and hl.moe._resident is not None:
+                sh_bsh = _bc1s_to_bsh(m_sh)
+                hyp_bsh = _bc1s_to_bsh(m_hyp)
+                inj_bsh = _bc1s_to_bsh(m_inj)
+                hid_h = hl.moe._resident.routed_multi(
+                    mixed_bsh, inds, sc, shared_k=sh_bsh, hyp_k=hyp_bsh, inj_k=inj_bsh)
+                t2 = time.perf_counter()
+                if _b is not None:
+                    _b["gdn_route"] += t1 - t0
+                    _b["gdn_moe"] += t2 - t1
+                return _bsh_to_bc1s(hid_h) if bc1s else hid_h
+            if _fused_moe == "shared" and hl.moe._resident is not None:
+                sh_bsh = _bc1s_to_bsh(m_sh)
+                y = hl.moe._resident.routed_multi(mixed_bsh, inds, sc, shared_k=sh_bsh)
+                t2 = time.perf_counter()
+                hc = host_recombine(_bsh_to_bc1s(y), m_hyp, m_inj)
+                t3 = time.perf_counter()
+                if _b is not None:
+                    _b["gdn_route"] += t1 - t0
+                    _b["gdn_moe"] += t2 - t1
+                    _b["gdn_rec"] += t3 - t2
+                return hc if bc1s else _bc1s_to_bsh(hc)
             routed = hl.moe._resident.routed_multi(mixed_bsh, inds, sc)
             y = routed + _bc1s_to_bsh(m_sh)
             t2 = time.perf_counter()
-            hid_h = _bc1s_to_bsh(host_recombine(_bsh_to_bc1s(y), m_hyp, m_inj))
+            hc = host_recombine(_bsh_to_bc1s(y), m_hyp, m_inj)
             t3 = time.perf_counter()
             if _b is not None:
                 _b["gdn_route"] += t1 - t0
                 _b["gdn_moe"] += t2 - t1
                 _b["gdn_rec"] += t3 - t2
-            return hid_h
+            return hc if bc1s else _bc1s_to_bsh(hc)
 
         def _block_forward_serial(ids):
             n = len(ids)
             _b = spec_ms
             _t = time.perf_counter()
-            hid = real_embedding_hidden(loader, list(ids))
+            hid = _bsh_to_bc1s(real_embedding_hidden(loader, list(ids)))
             _b["embed"] += time.perf_counter() - _t
             for i in range(n_layers):
                 if i in ple_layers:
+                    hid_bsh = _bc1s_to_bsh(hid)
                     for j in range(n):
-                        hid[:, j:j + 1, :] = ple_layers[i].step(hid[:, j:j + 1, :], ids[j])
+                        hid_bsh[:, j:j + 1, :] = ple_layers[i].step(hid_bsh[:, j:j + 1, :], ids[j])
+                    hid = _bsh_to_bc1s(hid_bsh)
                 hl = host_layers[i]
                 if i in mil_gdn:
                     _t = time.perf_counter()
-                    bc = _bsh_to_bc1s(np.asarray(hid, np.float32))
-                    _spec_xb[..., :n] = np.asarray(bc[..., :n], np.float16)
+                    _spec_xb[..., :n] = np.asarray(hid[..., :n], np.float16)
                     _ts = time.perf_counter()
                     m_mix, m_hyp, m_inj, m_sh = _active["gdn"][i](_spec_xb, n=n)
                     _t2 = time.perf_counter()
                     _b["gdn_stage"] += _ts - _t
                     _b["gdn_ane"] += _t2 - _ts
-                    hid = _moe_from_ane(hl, m_mix, m_hyp, m_inj, m_sh, _b)
+                    hid = _moe_from_ane(hl, m_mix, m_hyp, m_inj, m_sh, _b, bc1s=True)
                 elif i in mil_qsa:
                     _t = time.perf_counter()
-                    hid = mil_qsa_step_layer(i, hid, n=n, commit=False)
+                    hid = mil_qsa_step_layer(i, hid, n=n, commit=False, bc1s=True)
                     _b["qsa"] += time.perf_counter() - _t
                 else:
                     raise RuntimeError(f"speculation: layer {i} has no K-slot graph")
             _t = time.perf_counter()
-            mixed = gated_residual(mix_w, "hyper_connection_mixer", hid, False)
+            hid_bsh = _bc1s_to_bsh(hid)
+            mixed = gated_residual(mix_w, "hyper_connection_mixer", hid_bsh, False)
             lg = q_head(mixed) if q_head is not None else lm_logits(mixed, lm_w)
             _b["head"] += time.perf_counter() - _t
-            return hid, np.asarray(lg, np.float32).reshape(n, -1)
+            return hid_bsh, np.asarray(lg, np.float32).reshape(n, -1)
 
         def _block_forward_pipe(ids):
             """Two-half wavefront: GPU MoE of half h overlaps ANE of the next half.

@@ -78,7 +78,7 @@ class ResidentMoe:
     # and added 34 ms to the gather. The MoE eval is latency-bound, and the
     # extra ops in the same graph cost more than the NumPy matmul they replace.
 
-    def routed_multi(self, x_k, ids_k, scores_k):
+    def routed_multi(self, x_k, ids_k, scores_k, shared_k=None, hyp_k=None, inj_k=None):
         """Routed experts for k tokens in one submit.
 
         Same expert weights serve every token in the batch, so cost is close to
@@ -87,11 +87,10 @@ class ResidentMoe:
         SwitchGLU: expand_dims(x, (-2, -3)) with rhs_indices (1, k, K).
         """
         k = int(np.asarray(x_k).reshape(-1, x_k.shape[-1]).shape[0])
-        x = mx.array(np.ascontiguousarray(x_k, np.float32)).astype(self.dtype)
-        x = mx.expand_dims(x.reshape(1, k, -1), (-2, -3))
-        ids = mx.array(np.ascontiguousarray(ids_k, np.uint32)).reshape(1, k, -1)
-        sc = mx.array(np.ascontiguousarray(scores_k, np.float32))
-        sc = sc.astype(self.dtype).reshape(1, k, -1, 1)
+        x = mx.array(x_k, dtype=self.dtype).reshape(1, k, -1)
+        x = mx.expand_dims(x, (-2, -3))
+        ids = mx.array(ids_k, dtype=mx.uint32).reshape(1, k, -1)
+        sc = mx.array(scores_k, dtype=self.dtype).reshape(1, k, -1, 1)
 
         def project(t, p):
             return mx.gather_qmm(t, *p, rhs_indices=ids, transpose=True,
@@ -100,10 +99,24 @@ class ResidentMoe:
         gate = project(x, self.projections[0])
         up = project(x, self.projections[1])
         y = project(gate * mx.sigmoid(gate) * up, self.projections[2])
-        y = mx.sum(y.squeeze(-2) * sc, axis=-2)
-        y = y.astype(mx.float32)
-        mx.eval(y)
-        return np.array(y).reshape(1, k, -1)
+        routed = mx.sum(y.squeeze(-2) * sc, axis=-2)
+
+        if shared_k is not None:
+            sh = mx.array(shared_k, dtype=mx.float32).reshape(1, k, -1)
+            y_tot = routed.astype(mx.float32) + sh
+        else:
+            y_tot = routed.astype(mx.float32)
+
+        if hyp_k is not None and inj_k is not None:
+            inj = mx.array(inj_k, dtype=mx.float32).reshape(1, k, -1, 1)
+            hyp = mx.array(hyp_k, dtype=mx.float32).reshape(1, k, -1)
+            injection = mx.reshape(inj * mx.expand_dims(y_tot, -2), (1, k, -1))
+            res = hyp + injection
+            mx.eval(res)
+            return np.array(res).reshape(1, k, -1)
+
+        mx.eval(y_tot)
+        return np.array(y_tot).reshape(1, k, -1)
 
     def apply(self, x, ids, scores):
         t = time.perf_counter()
