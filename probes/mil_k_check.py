@@ -85,6 +85,35 @@ def main() -> None:
         ts.append(time.perf_counter() - t0)
     ms = float(np.median(ts)) * 1e3
     print(f"  K={k}: {ms:.3f} ms/pass  =  {ms / k:.3f} ms/token", flush=True)
+
+    if k > 4:
+        loader, w = _load_layer(li)
+        both = MilGdnLayer(li, w, MultiTokenStep(w, 1).eval().half(),
+                           k=4, prefill_k=k, single_state=True)
+        loader.close()
+        both._conv[:] = conv[:, 0]
+        both.set_state(state)
+        both.select(1)
+        wide_m = both(x.reshape(1, HC_W, 1, S), n=k)[0].reshape(H, k)
+        both.commit(k - 1)
+        wide_s = both.current_state().astype(np.float32)
+        wide_c = both._conv.astype(np.float32)
+        both.set_state(state)
+        both._conv[:] = conv[:, 0]
+        both._conv_surface_current = False
+        both.select(0)
+        parts = []
+        for t in range(0, k, 4):
+            xb = np.zeros((HC_W, S), np.float16)
+            xb[:, :4] = x[:, t:t + 4]
+            parts.append(both(xb.reshape(1, HC_W, 1, S), n=4)[0].reshape(H, 4))
+            both.commit(3)
+        nar_m = np.concatenate(parts, axis=1)
+        nar_s = both.current_state().astype(np.float32)
+        nar_c = both._conv.astype(np.float32)
+        print(f"  K={k} vs 8xK=4: mixed {rel(wide_m, nar_m):.5f}  "
+              f"state {rel(wide_s, nar_s):.5f}  conv {rel(wide_c, nar_c):.5f}",
+              flush=True)
     if os.environ.get("MIL_K_SUBMIT_ONLY") == "1":
         ts = []
         for _ in range(repeats):

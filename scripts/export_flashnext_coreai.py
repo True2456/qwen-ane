@@ -3898,12 +3898,11 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
         _spec_pipe = os.environ.get("FLASHNEXT_PIPE", "0") not in ("0", "false", "")
 
         _fused_moe = os.environ.get("FLASHNEXT_FUSED_MOE", "none")
-        # Wide GDN + MoE at k=32 flips ~2/32 experts on the first layer and
-        # the discrete routing compounds down the stack (gdn0.state 0.0015
-        # vs qsa35.v 0.16 after 32 tokens). Isolated GDN/QSA/MoE are all in
-        # band, so the default keeps GDN at decode width and only widens QSA.
-        # FLASHNEXT_PREFILL_WIDE_GDN=1 restores the original both-wide path.
-        _wide_gdn = os.environ.get("FLASHNEXT_PREFILL_WIDE_GDN", "0") not in (
+        # Wide GDN is one submit of k=32 whose recurrence is eight k=4
+        # chunks (MIL_GDN_CHUNK_TILE=4). Host-side GDN tiling remains as a
+        # fallback when a block is wider than the selected procedure.
+        # FLASHNEXT_PREFILL_WIDE_GDN=0 keeps GDN at decode width.
+        _wide_gdn = os.environ.get("FLASHNEXT_PREFILL_WIDE_GDN", "1") not in (
             "0", "false", "")
 
         def _route_tiled(hl, x):
