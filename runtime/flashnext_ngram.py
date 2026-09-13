@@ -219,6 +219,19 @@ class CpuPLE:
         a=x.reshape(self.hc,self.h)
         return (a/np.sqrt(np.mean(a*a,axis=-1,keepdims=True)+self.eps)).reshape(-1)*(self.weights[name]+1)
 
+    def snapshot(self):
+        """The whole of this layer's per-token state: history and conv window.
+
+        Speculation drafts tokens that may be rejected, so a drafter running
+        this layer has to do it on a copy and hand nothing back.
+        """
+        return (list(self.history), self.conv.copy())
+
+    def restore(self, state) -> None:
+        history, conv = state
+        self.history = list(history)
+        self.conv = conv.copy()
+
     def step(self,hidden,token):
         t=time.perf_counter()
         emb=self.rows.lookup(self.hash_ids(token)).reshape(-1)

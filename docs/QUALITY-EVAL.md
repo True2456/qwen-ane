@@ -248,21 +248,41 @@ The bits are unchanged, which was the gate that mattered: scoring 1024 tokens
 after a 512-token prefill gives nll 1.853263 with the table on, to every digit,
 and `probes/mil_k_check.py` prints the same per-slot errors at K=4 and K=32.
 
-The cost was measured on the scorer, and the scorer is the wrong axis. On the
-scorer the table costs 5%, 22.5 tok/s against 23.7, down from 8% before the
-gather was threaded. On decode it costs three times that:
+The cost was measured on the scorer, and the scorer is the wrong axis: it
+accepts every slot by construction, so it cannot see what the table does to
+speculation. On the scorer the table costs 5%, 22.5 tok/s against 23.7, down
+from 8% before the gather was threaded.
 
-| | tok/s | tokens a pass | drafts accepted |
-| --- | --- | --- | --- |
-| table off | 21.1 | 3.20 | 44/57 |
-| table on | 18.7 | 2.91 | 44/63 |
+On decode, over 256 tokens of the code prompt:
 
-11%, and only part of it is the lookup. The rest is speculation: the table
-changes the hidden state the MTP head drafts from, the accept rate falls from
-77% to 70%, and a block confirms 2.91 tokens instead of 3.20. The scorer never
-sees that because it accepts every slot by construction.
+| | tok/s | tokens a pass | drafts accepted | d1 | d2 | d3 |
+| --- | --- | --- | --- | --- | --- | --- |
+| table off | 18.06 | 2.78 | 165/273 (60%) | 79% | 73% | 54% |
+| table on | 16.38 | 2.64 | 160/288 (56%) | 75% | 64% | 60% |
 
-So the trade is 3.2% perplexity for 11% of decode, not for 5%. That is still
-probably worth taking, and it is now the default, but it should be decided
-against a task score rather than against perplexity, and re-checked after any
-change to the drafter.
+About 9%. Roughly four points of that is the lookup and five is a block
+confirming 2.64 tokens instead of 2.78. The per-position picture is mixed
+rather than a clean collapse: the third position is better with the table on.
+
+A 64-token run of the same thing put the cost at 11% and showed the first
+position improving while the later two fell, which suggested the drafter had
+stopped matching a backbone that had moved. That reading does not survive the
+longer run, and the fix it implied does not work either — see below. Sixty-four
+tokens is twenty blocks, and twenty blocks is not enough to separate a four
+point change in acceptance from noise.
+
+### Negative result: giving the drafter its own copy of the table
+
+The MTP drafter does not apply the per-layer embedding. The backbone does, so
+from the second draft position onward, where the drafter chains its own state
+rather than starting from the backbone's, the two run on different arithmetic.
+
+`FLASHNEXT_DRAFT_PLE=1` gives the drafter a second `CpuPLE` with its own
+history and conv window, forked from the backbone's at every draft so the
+rejected drafts touch nothing, and applies it to the chained state. It changes
+nothing: identical accept rates at every position, identical output, and 18.21
+tok/s against 18.54. The table's contribution is small next to the state and
+the drafter's front normalises what is left of it.
+
+So the table's cost on decode is mostly the lookup, and the acceptance part is
+not the drafter failing to follow the backbone. It stays off by default.

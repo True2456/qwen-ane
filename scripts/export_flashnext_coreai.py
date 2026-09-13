@@ -4483,6 +4483,16 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             _a0 = mx.get_active_memory()
             drafter = None if os.environ.get("FLASHNEXT_NO_DRAFTER") == "1" \
                 else MtpDrafter(q_head)
+            if drafter is not None and ple_layers and \
+                    os.environ.get("FLASHNEXT_DRAFT_PLE", "0") == "1":
+                # A second instance of the same layer, with its own history and
+                # conv window, forked from the backbone's at every draft.
+                from runtime.flashnext_ngram import CpuPLE as _CpuPLE
+                _pl = sorted(ple_layers)[0]
+                drafter.ple = _CpuPLE(ple_rows, _pl)
+                drafter.ple_src = ple_layers[_pl]
+                print(f"  drafter runs the PLE of layer {_pl} on its own state",
+                      flush=True)
             _info = mx.metal.device_info()
             print(f"  MTP drafter loaded in {time.perf_counter() - _t:.1f}s  "
                   f"active {_a0 / 1e9:.1f} -> {mx.get_active_memory() / 1e9:.1f} GB  "

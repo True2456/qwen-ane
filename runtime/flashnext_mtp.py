@@ -177,6 +177,12 @@ class MtpDrafter:
         if routed is None:
             routed = os.environ.get("FLASHNEXT_MTP_SHARED_ONLY") != "1"
         self.routed = bool(routed)
+        # The backbone applies the per-layer embedding to its hidden stream;
+        # a drafter that does not diverges from it the moment it chains its
+        # own state, which is why d2 and d3 fell when the table was switched
+        # on while d1, which starts from the backbone's state, improved.
+        self.ple = None
+        self.ple_src = None
         src = MlxSafe(os.environ.get("FLASHNEXT_MLX4") or path)
         try:
             self.emb = _Embed(os.environ.get("FLASHNEXT_MLX4") or path)
@@ -328,10 +334,19 @@ class MtpDrafter:
         out: list[int] = []
         h = hidden_hc
         tok = int(token_id)
+        if self.ple is not None and self.ple_src is not None:
+            # Fork the backbone's table state; the drafts must not touch it.
+            self.ple.restore(self.ple_src.snapshot())
         for _ in range(n):
             logits, h = self.step(h, [[tok]])
             nxt = mx.argmax(logits.reshape(-1))
             mx.eval(nxt, h)
+            if self.ple is not None:
+                # `h` is the state at this token's position, and the backbone's
+                # state there carries the table's contribution for it.
+                arr = np.asarray(h, np.float32)
+                h = mx.array(np.ascontiguousarray(
+                    self.ple.step(arr.reshape(-1), tok).reshape(arr.shape)))
             tok = int(nxt.item())
             if lookup is not None:
                 hit = lookup.next_token(out)
