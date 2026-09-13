@@ -61,23 +61,34 @@ class MilQsaLayer:
     is enough, since the indexer caps selection at the budget anyway.
     """
 
-    __slots__ = ("layer", "k", "_progs", "_hcn", "_eng", "_bufs", "_front")
+    __slots__ = ("layer", "k", "_progs", "_hcn", "_eng", "_bufs", "_front", "_proc", "_proc_k")
 
     def __init__(self, layer: int, weights, ref, qsa, rungs, k: int = 1,
-                 engine: AneEngine | None = None):
+                 prefill_k: int = 0, engine: AneEngine | None = None):
         import flashnext_mil_qsa_layer as QL
         self._eng = engine or QL.eng
         QL.LAYER[0] = int(layer)
         QL.KTOK[0] = int(k)
         self.k = int(k)
         self.layer = int(layer)
+        self._proc = 0
+        self._proc_k = {0: self.k}
+        if prefill_k and int(prefill_k) > self.k:
+            self._proc_k[1] = int(prefill_k)
         self._progs: dict[int, object] = {}
         self._hcn = None
-        for m in sorted(set(int(r) for r in rungs)):
+        rungs_list = sorted(set(int(r) for r in rungs))
+        widest_rung = max(rungs_list) if rungs_list else 2048
+        for m in rungs_list:
             if m % 32:
                 raise ValueError(f"QSA rung {m} is not a multiple of 32")
             QL.KVM[0] = m
-            prog, hcn = QL.build_layer(weights, ref, qsa)
+            if 1 in self._proc_k and m == widest_rung:
+                prog, hcn = QL.build_program_multi(
+                    weights, ref, qsa,
+                    [(self._proc_k[0], m), (self._proc_k[1], m)])
+            else:
+                prog, hcn = QL.build_layer(weights, ref, qsa)
             self._progs[m] = prog
             self._hcn = hcn
         # One hc_norm row serves both programs: the front slices the attn half
@@ -86,7 +97,8 @@ class MilQsaLayer:
         self._bufs = {
             m: {"k": np.zeros((KVC, m), np.float16),
                 "v": np.zeros((KVC, m), np.float16),
-                "mask": np.full((G * self.k, m + S), QSA_MASK, np.float16)}
+                "mask": {k_val: np.full((G * k_val, m + S), QSA_MASK, np.float16)
+                         for k_val in self._proc_k.values()}}
             for m in self._progs
         }
 
@@ -94,7 +106,17 @@ class MilQsaLayer:
     def rungs(self) -> list[int]:
         return sorted(self._progs)
 
+    def select(self, proc: int) -> None:
+        """Point every accessor at one procedure of a shared program."""
+        proc = int(proc)
+        if proc not in self._proc_k:
+            raise RuntimeError(f"MIL QSA layer {self.layer}: no procedure {proc}")
+        self._proc = proc
+        self.k = self._proc_k[proc]
+
     def rung_for(self, need: int) -> int:
+        if self._proc > 0:
+            return self.rungs[-1]
         return next((m for m in self.rungs if m >= need), self.rungs[-1])
 
     def front(self, x_bc1s, n: int):
@@ -126,31 +148,40 @@ class MilQsaLayer:
         """
         prog = self._progs[m]
         b = self._bufs[m]
-        w = self.k if n is None else int(n)
+        cur_k = self.k
+        w = cur_k if n is None else int(n)
         b["k"][:, :nsel] = keys
         b["k"][:, nsel:] = 0
         b["v"][:, :nsel] = values
         b["v"][:, nsel:] = 0
+        mask_arr = b["mask"][cur_k]
         # One mask row per (query head group, token): a token attends to the
         # selected prefix and to this block's own tokens up to itself.
-        row = b["mask"][:self.k]
+        row = mask_arr[:cur_k]
         row[:] = QSA_MASK
         row[:, :nsel] = 0
-        for t in range(self.k):
+        for t in range(cur_k):
             row[t, m:m + t + 1] = 0
         for g in range(1, G):
-            b["mask"][g * self.k:(g + 1) * self.k] = row
+            mask_arr[g * cur_k:(g + 1) * cur_k] = row
         x = np.ascontiguousarray(np.asarray(x_bc1s, np.float16).reshape(HC_W, S))
         mx_ = np.zeros((H, S), np.float16)
         ij_ = np.zeros((HC, S), np.float16)
         mx_[:, :w] = mixed
         ij_[:, :w] = inj
-        for surf, val in zip(prog._in_surfs, (x, cos, sin, self._hcn,
-                                              b["k"], b["v"], b["mask"],
-                                              mx_, ij_)):
+
+        in_map = getattr(prog, "proc_in_map", None)
+        if in_map and self._proc in in_map:
+            surfs = [prog._in_surfs[i] for i in in_map[self._proc]]
+        else:
+            surfs = prog._in_surfs
+
+        for surf, val in zip(surfs, (x, cos, sin, self._hcn,
+                                     b["k"], b["v"], mask_arr,
+                                     mx_, ij_)):
             with _iosurface_view(surf, val.shape, np.float16) as dst:
                 np.copyto(dst, val)
-        if not self._eng.submit(prog, procedure_index=0):
+        if not self._eng.submit(prog, procedure_index=self._proc):
             raise RuntimeError(f"QSA MIL layer {self.layer}: submit failed")
         # surfaces bind alphabetically: t_newk, u_shared, v_mixed, w_hyper,
         # x_inj, y_newv
@@ -166,7 +197,7 @@ class MilQsaLayer:
                 out["new_k"], out["new_v"])
 
 
-def build_layers(layer_indices, loader_fn, rungs, k: int = 1, engine=None):
+def build_layers(layer_indices, loader_fn, rungs, k: int = 1, prefill_k: int = 0, engine=None):
     """Compile a MIL QSA layer per index. Returns {index: MilQsaLayer}."""
     from export_flashnext_coreai import FlashNextQSADecode
     from flashnext_mil_qsa_layer import _Ref
@@ -177,7 +208,7 @@ def build_layers(layer_indices, loader_fn, rungs, k: int = 1, engine=None):
         try:
             qsa = FlashNextQSADecode(max_s=max(rungs)).eval().half()
             qsa.load_from_layer(w)
-            out[li] = MilQsaLayer(li, w, _Ref(w), qsa, rungs, k, engine)
+            out[li] = MilQsaLayer(li, w, _Ref(w), qsa, rungs, k, prefill_k=prefill_k, engine=engine)
         finally:
             loader.close()
     return out

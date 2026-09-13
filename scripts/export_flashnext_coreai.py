@@ -3049,8 +3049,11 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     try:
                         qd = FlashNextQSADecode(max_s=max(mq_rungs)).eval().half()
                         qd.load_from_layer(lw)
-                        mil_qsa[i] = MilQsaLayer(i, lw, _QRef(lw), qd, mq_rungs,
-                                                 k=max(1, spec_k))
+                        mil_qsa[i] = MilQsaLayer(
+                            i, lw, _QRef(lw), qd, mq_rungs,
+                            k=max(1, spec_k),
+                            prefill_k=(prefill_mil_k
+                                       if prefill_mil_k > max(1, spec_k) else 0))
                     except Exception as exc:  # noqa: BLE001
                         print(f"  MIL QSA L{i} failed ({exc}); falling back to Core AI",
                               flush=True)
@@ -3105,16 +3108,11 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                         # nothing more to build and no weights to duplicate.
                         for i in sorted(mil_gdn):
                             mil_gdn_pf[i] = mil_gdn[i]
-                        # Prefill only ever sees the widest rung, so it needs
-                        # one program a layer plus the front, not the ladder.
+                        # The GDN and QSA layers already carry the wide unroll as a
+                        # second procedure of the same program, so there is
+                        # nothing more to build and no weights to duplicate.
                         for i in sorted(mil_qsa):
-                            lw = layer_w(i)
-                            qd = FlashNextQSADecode(
-                                max_s=max(mq_rungs)).eval().half()
-                            qd.load_from_layer(lw)
-                            mil_qsa_pf[i] = MilQsaLayer(
-                                i, lw, _QRef(lw), qd, [max(mq_rungs)],
-                                k=prefill_mil_k)
+                            mil_qsa_pf[i] = mil_qsa[i]
                     except Exception as exc:  # noqa: BLE001
                         print(f"  MIL prefill k={prefill_mil_k} failed ({exc}); "
                               f"prompt walks the decode graphs", flush=True)
@@ -3122,8 +3120,8 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                         mil_qsa_pf.clear()
                     if mil_gdn_pf:
                         print(f"  MIL prefill k={prefill_mil_k}: "
-                              f"{len(mil_gdn_pf)} GDN (a second procedure of "
-                              f"the decode program) + {len(mil_qsa_pf)} QSA "
+                              f"{len(mil_gdn_pf)} GDN + {len(mil_qsa_pf)} QSA "
+                              f"(both using shared-program procedures) "
                               f"in {time.perf_counter() - t_pf:.1f}s", flush=True)
                 if mil_gdn:
                     pure_assets.clear()
@@ -4280,11 +4278,18 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     dec.set_state(pf.current_state())
                     dec._conv[:] = pf._conv
                     dec._conv_surface_current = False
+                for i2, pf in mil_qsa_pf.items():
+                    dec = mil_qsa[i2]
+                    if hasattr(dec, "select"):
+                        dec.select(0)
                 _active["gdn"], _active["qsa"] = mil_gdn, mil_qsa
                 _pf_w = spec_k
 
             if mil_gdn_pf and _pf_w > 1 and prefill_steps >= prefill_mil_k:
                 for lay_pf in mil_gdn_pf.values():
+                    if hasattr(lay_pf, "select"):
+                        lay_pf.select(1)
+                for lay_pf in mil_qsa_pf.values():
                     if hasattr(lay_pf, "select"):
                         lay_pf.select(1)
                 _active["gdn"], _active["qsa"] = mil_gdn_pf, mil_qsa_pf

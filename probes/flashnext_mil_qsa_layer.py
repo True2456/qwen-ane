@@ -63,6 +63,10 @@ KVM = [256]          # key window width; must be a multiple of 32
 KTOK = [1]           # live token slots; must divide S
 INT8 = [True]
 
+#: Set to a truthy placeholder to make `build_layer` return its pieces
+#: instead of compiling. See `build_program_multi`.
+CAPTURE: list[dict | None] = [None]
+
 
 def _em(line: str) -> None:
     ML.B.append("    " + line)
@@ -268,6 +272,12 @@ def build_layer(w, ref, qsa):
     hcn = np.concatenate([ref.attn.hc_n.detach().float().numpy().reshape(320, 32),
                           ref.mlp.hc_n.detach().float().numpy().reshape(320, 32)], axis=0)
     src_mil = build_mil(offs)
+    if CAPTURE[0] is not None:
+        CAPTURE[0] = {
+            "mil": src_mil, "files": files,
+            "hcn": np.ascontiguousarray(hcn.astype(np.float16)),
+        }
+        return None, None
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         try:
@@ -489,3 +499,80 @@ if __name__ == "__main__":
     if os.environ.get("QSA_K"):
         KTOK[0] = int(os.environ["QSA_K"])
     main()
+
+
+def build_program_multi(w, ref, qsa, specs):
+    """One program with multiple procedures sharing baked weights.
+
+    specs: list of (k, m) tuples (or int k using current KVM[0]).
+    Returns (prog, hcn) or (None, None).
+    """
+    caught = []
+    for spec in specs:
+        if isinstance(spec, (list, tuple)):
+            k, m = int(spec[0]), int(spec[1])
+        else:
+            k, m = int(spec), KVM[0]
+        KTOK[0] = k
+        KVM[0] = m
+        CAPTURE[0] = {}
+        try:
+            build_layer(w, ref, qsa)
+            got = CAPTURE[0]
+        finally:
+            CAPTURE[0] = None
+        if not got or not got.get("mil"):
+            return None, None
+        caught.append((k, m, got))
+
+    def body(text, name):
+        i = text.index("  func main<ios18>")
+        j = text.rstrip().rindex("}")
+        return text[i:j].replace("func main<ios18>", f"func {name}<ios18>", 1)
+
+    text = (f"program(1.3)\n{E._BUILD_INFO}\n{{\n"
+            + "".join(body(c["mil"], f"procedure{n:03d}")
+                      for n, (_, _, c) in enumerate(caught))
+            + "}\n")
+    # Weights are identical across widths and key lengths for a given layer
+    files = max((c["files"] for _, _, c in caught),
+                key=lambda f: sum(len(v) for v in f.values()))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        try:
+            prog = eng.compile_multiproc(text, files, HC_W, H, S,
+                                         raw_weight_files=frozenset(files))
+        except Exception as exc:  # noqa: BLE001
+            prog = None
+            buf.write(str(exc))
+    if prog is None:
+        if os.environ.get("MIL_VERBOSE") == "2":
+            print(buf.getvalue())
+        elif os.environ.get("MIL_VERBOSE"):
+            hit = [l for l in buf.getvalue().splitlines()
+                   if "rror" in l or "nvalid" in l]
+            print("  MIL QSA multi: " + (hit[-1] if hit else buf.getvalue()[-400:]))
+        return None, None
+
+    M = caught[0][1]
+    input_elems = [HC_W * S, HALF * S, HALF * S, 640 * 32, KVC * M, KVC * M]
+    mask_indices = []
+    for n, (k, m, _) in enumerate(caught):
+        mask_indices.append(len(input_elems))
+        input_elems.append(G * k * (m + S))
+    h_mixed_idx = len(input_elems)
+    input_elems.append(H * S)
+    i_inj_idx = len(input_elems)
+    input_elems.append(HC * S)
+
+    prog.input_elems = input_elems
+    prog.proc_in_map = {}
+    prog.proc_k = {}
+    for n, (k, _, _) in enumerate(caught):
+        prog.proc_in_map[n] = [0, 1, 2, 3, 4, 5, mask_indices[n], h_mixed_idx, i_inj_idx]
+        prog.proc_k[n] = k
+
+    prog.output_elems = [KVC * S, H * S, H * S, HC_W * S, HC * S, KVC * S]
+    if not eng._ensure_io(prog):
+        return None, None
+    return prog, caught[0][2]["hcn"]
