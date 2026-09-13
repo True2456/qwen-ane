@@ -4368,6 +4368,11 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             import json
             from tokenizers import Tokenizer
             tok = Tokenizer.from_file(str(BASE / "tokenizer.json"))
+            _gc_path = BASE / "generation_config.json"
+            _eos = json.loads(_gc_path.read_text()).get("eos_token_id", []) \
+                if _gc_path.is_file() else []
+            _eos_ids = [int(v) for v in
+                        (_eos if isinstance(_eos, list) else [_eos])]
             chat = None
             print(json.dumps({"ready": True, "spec_k": spec_k,
                               "prefill_k": prefill_mil_k if mil_gdn_pf else 0}),
@@ -4419,7 +4424,10 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     generated = []
                     max_new = int(req.get("max_new", 256))
                     _stop_ids.clear()
-                    _stop_ids.update(int(v) for v in req.get("stop_ids", []))
+                    # Without these a request runs to max_new even when the
+                    # model has finished its turn. generation_config.json is
+                    # the model's own answer to where a turn ends.
+                    _stop_ids.update(req.get("stop_ids", _eos_ids))
                     await speculate()
                     got = tok.decode(generated)
                     for stop in req.get("stop", []):
