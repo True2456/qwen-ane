@@ -150,6 +150,10 @@ class MilQsaLayer:
         b = self._bufs[m]
         cur_k = self.k
         w = cur_k if n is None else int(n)
+        if w > cur_k:
+            raise RuntimeError(
+                f"QSA MIL layer {self.layer}: n={w} exceeds procedure "
+                f"width {cur_k} (procedure {self._proc} was not selected)")
         b["k"][:, :nsel] = keys
         b["k"][:, nsel:] = 0
         b["v"][:, :nsel] = values

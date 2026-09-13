@@ -4337,6 +4337,9 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 for lay2 in mil_gdn_pf.values():
                     if hasattr(lay2, "select"):
                         lay2.select(1)
+                for lay2 in mil_qsa_pf.values():
+                    if hasattr(lay2, "select"):
+                        lay2.select(1)
                 _active["gdn"], _active["qsa"] = mil_gdn_pf, mil_qsa_pf
             _lg = None
             while at < len(ids):
@@ -4344,6 +4347,9 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                         and len(ids) - at < width):
                     for i2, pf in mil_gdn_pf.items():
                         if mil_gdn[i2] is pf:
+                            pf.select(0)
+                    for i2, pf in mil_qsa_pf.items():
+                        if mil_qsa[i2] is pf:
                             pf.select(0)
                     _active["gdn"], _active["qsa"] = mil_gdn, mil_qsa
                     width = spec_k
@@ -4365,6 +4371,9 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                 at += n2
             for i2, pf in mil_gdn_pf.items():
                 if mil_gdn[i2] is pf:
+                    pf.select(0)
+            for i2, pf in mil_qsa_pf.items():
+                if mil_qsa[i2] is pf:
                     pf.select(0)
             _active["gdn"], _active["qsa"] = mil_gdn, mil_qsa
             return _lg
@@ -4540,7 +4549,9 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                             chat = AutoTokenizer.from_pretrained(str(BASE))
                         text = chat.apply_chat_template(
                             req["messages"], tokenize=False,
-                            add_generation_prompt=True)
+                            add_generation_prompt=True,
+                            **({"tools": req["tools"]} if req.get("tools")
+                               else {}))
                     ids = list(tok.encode(text, add_special_tokens=False).ids)
                     if not ids:
                         raise ValueError("empty prompt")

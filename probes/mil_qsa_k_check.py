@@ -241,6 +241,76 @@ def run_k(k: int, m: int, layer: int, w, shared, qsa_torch, lay: MilQsaLayer) ->
     return {"vs_torch": vs_torch, "vs_mil": vs_mil, "per": per}
 
 
+def _report(tag: str, out: dict) -> None:
+    k = len(out["per"]["mixed"])
+    vt = out["vs_torch"]
+    vm = out["vs_mil"]
+    print(f"  {tag}: numpy vs torch  attn {vt['attn']:.5f}  "
+          f"new_k {vt['new_k']:.5f}  new_v {vt['new_v']:.5f}", flush=True)
+    mix_slots = "  ".join(f"t{t}={e:.4f}" for t, e in enumerate(out["per"]["mixed"]))
+    nk_slots = "  ".join(f"t{t}={e:.4f}" for t, e in enumerate(out["per"]["new_k"]))
+    print(f"  {tag}: mixed {mix_slots}", flush=True)
+    print(f"  {tag}: new_k {nk_slots}", flush=True)
+    print(f"  {tag}: MIL vs numpy  mixed {vm['mixed']:.5f}  "
+          f"hyper {vm['hyper']:.5f}  shared {vm['shared']:.5f}  "
+          f"new_k {vm['new_k']:.5f}  new_v {vm['new_v']:.5f}", flush=True)
+
+
+def walk_compare(narrow: MilQsaLayer, wide: MilQsaLayer, k_wide: int, m: int,
+                 w, shared, tokens: int) -> None:
+    """Walk the same tokens one-by-one and in k-wide chunks; compare the cache."""
+    rng = np.random.default_rng(3)
+    x = np.zeros((1, HC_W, 1, tokens), np.float32)
+    x[0, :, 0, :] = (rng.standard_normal((HC_W, tokens)) * 0.05).astype(np.float32)
+    inv = 1.0 / (10_000_000.0 ** (
+        np.arange(0, QSA_ROTARY, 2, dtype=np.float32) / np.float32(QSA_ROTARY)))
+
+    def run(lay, width):
+        ck = np.zeros((KVC, tokens), np.float16)
+        cv = np.zeros((KVC, tokens), np.float16)
+        last = None
+        off = 0
+        while off < tokens:
+            n = width
+            xb = np.zeros((1, HC_W, 1, S), np.float32)
+            xb[..., :n] = x[..., off:off + n]
+            cos = np.zeros((HALF, S), np.float16)
+            sin = np.zeros((HALF, S), np.float16)
+            pos = (np.arange(n, dtype=np.float32) + np.float32(off))[:, None] * inv
+            cos[:, :n] = np.cos(pos).T.astype(np.float16)
+            sin[:, :n] = np.sin(pos).T.astype(np.float16)
+            mask = np.full((n, m + S), QSA_MASK, np.float16)
+            nsel = min(off, m)
+            mask[:, :nsel] = 0
+            for t in range(n):
+                mask[t, m:m + t + 1] = 0
+            kc = np.zeros((KVC, m), np.float16)
+            vc = np.zeros((KVC, m), np.float16)
+            if nsel:
+                kc[:, :nsel] = ck[:, :nsel]
+                vc[:, :nsel] = cv[:, :nsel]
+            ref = numpy_layer(xb, kc, vc, cos, sin, mask, n, m, w, shared)
+            x16 = np.zeros((HC_W, S), np.float16)
+            x16[:, :n] = np.asarray(xb[0, :, 0, :n], np.float16)
+            g_mix, _, _, _, g_nk, g_nv = lay(
+                x16, ck[:, :nsel], cv[:, :nsel], cos, sin, nsel, m, n=n,
+                mixed=np.asarray(ref["attn_mixed"], np.float16),
+                inj=np.asarray(ref["attn_inj"], np.float16))
+            ck[:, off:off + n] = np.asarray(g_nk, np.float16)
+            cv[:, off:off + n] = np.asarray(g_nv, np.float16)
+            last = (g_mix.reshape(H, n), ref["mixed"], g_nk, ref["new_k"])
+            off += n
+        return ck, cv, last
+
+    nck, ncv, nlast = run(narrow, 1)
+    wck, wcv, wlast = run(wide, k_wide)
+    print(f"  walk {tokens} tok k=1 vs k={k_wide}: "
+          f"cache_k {rel(wck, nck):.5f}  cache_v {rel(wcv, ncv):.5f}  "
+          f"last_tok mixed {rel(wlast[0][:, -1], nlast[0][:, -1]):.5f}  "
+          f"last_chunk vs numpy {rel(wlast[0], wlast[1]):.5f}",
+          flush=True)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("widths", nargs="*", type=int, default=None,
@@ -248,6 +318,10 @@ def main() -> None:
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--layer", type=int, default=3)
     ap.add_argument("--m", type=int, default=256)
+    ap.add_argument("--two-proc", action="store_true",
+                    help="also compile k=4 + k=32 in one program and check proc 1")
+    ap.add_argument("--walk", type=int, default=0,
+                    help="walk this many tokens at k=1 vs the last width")
     args = ap.parse_args()
     widths = args.widths or ([1, 4, 8, 16, 32] if args.all else [1])
     m = int(args.m)
@@ -260,22 +334,26 @@ def main() -> None:
     qsa_torch = FlashNextQSADecode(max_s=m).eval().half()
     qsa_torch.load_from_layer(w)
     ref_mix = _Ref(w)
+    layers = {}
 
     for k in widths:
         print(f"  compiling QSA L{li} k={k} m={m}", flush=True)
         lay = MilQsaLayer(li, w, ref_mix, qsa_torch, rungs=[m], k=k)
-        out = run_k(k, m, li, w, shared, qsa_torch, lay)
-        vt = out["vs_torch"]
-        print(f"  K={k}: numpy vs torch  attn {vt['attn']:.5f}  "
-              f"new_k {vt['new_k']:.5f}  new_v {vt['new_v']:.5f}", flush=True)
-        vm = out["vs_mil"]
-        mix_slots = "  ".join(f"t{t}={e:.4f}" for t, e in enumerate(out["per"]["mixed"]))
-        nk_slots = "  ".join(f"t{t}={e:.4f}" for t, e in enumerate(out["per"]["new_k"]))
-        print(f"  K={k}: mixed {mix_slots}", flush=True)
-        print(f"  K={k}: new_k {nk_slots}", flush=True)
-        print(f"  K={k}: MIL vs numpy  mixed {vm['mixed']:.5f}  "
-              f"hyper {vm['hyper']:.5f}  shared {vm['shared']:.5f}  "
-              f"new_k {vm['new_k']:.5f}  new_v {vm['new_v']:.5f}", flush=True)
+        layers[k] = lay
+        _report(f"K={k}", run_k(k, m, li, w, shared, qsa_torch, lay))
+
+    if args.two_proc:
+        print(f"  compiling QSA L{li} two-proc k=4/32 m={m}", flush=True)
+        two = MilQsaLayer(li, w, ref_mix, qsa_torch, rungs=[m], k=4, prefill_k=32)
+        two.select(1)
+        _report("two-proc k=32", run_k(32, m, li, w, shared, qsa_torch, two))
+
+    if args.walk:
+        if 1 not in layers:
+            print("  compiling QSA L{li} k=1 for the walk", flush=True)
+            layers[1] = MilQsaLayer(li, w, ref_mix, qsa_torch, rungs=[m], k=1)
+        wide_k = widths[-1]
+        walk_compare(layers[1], layers[wide_k], wide_k, m, w, shared, args.walk)
 
     loader.close()
 

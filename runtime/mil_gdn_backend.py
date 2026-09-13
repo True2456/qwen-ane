@@ -160,6 +160,10 @@ class MilGdnLayer:
         # u_shared, v_mixed, w_hyper, x_inj, y_conv.
         kk = self.k
         w = kk if n is None else int(n)
+        if w > kk:
+            raise RuntimeError(
+                f"MIL layer {self.layer}: n={w} exceeds procedure "
+                f"width {kk} (procedure {self._proc} was not selected)")
         if n is None:
             # Plain decode consumes the whole block; speculation calls commit()
             # itself once it knows how many tokens the backbone confirmed.
