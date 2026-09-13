@@ -1,0 +1,29 @@
+[transformers] You are using a model of type `qwen4_exp` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+  mlx ready in 11s {'ready': True, 'backend': 'mlx'}
+  25/600  acc 0.640  0.76s a question
+  50/600  acc 0.660  0.66s a question
+  75/600  acc 0.693  0.59s a question
+  100/600  acc 0.720  0.62s a question
+  125/600  acc 0.744  0.78s a question
+  150/600  acc 0.767  0.74s a question
+  175/600  acc 0.789  0.83s a question
+  200/600  acc 0.805  0.85s a question
+  225/600  acc 0.809  1.01s a question
+  250/600  acc 0.824  1.33s a question
+  275/600  acc 0.833  1.69s a question
+  300/600  acc 0.843  2.13s a question
+  325/600  acc 0.849  2.31s a question
+  350/600  acc 0.851  2.57s a question
+  375/600  acc 0.859  2.83s a question
+  400/600  acc 0.863  3.02s a question
+  425/600  acc 0.864  3.18s a question
+  450/600  acc 0.864  3.28s a question
+  475/600  acc 0.859  3.39s a question
+  500/600  acc 0.852  3.42s a question
+  525/600  acc 0.853  3.48s a question
+  550/600  acc 0.856  3.55s a question
+  575/600  acc 0.859  3.50s a question
+  600/600  acc 0.863  3.50s a question
+
+mmlu mlx: 518/600 = 0.8633 in 2102s
+  wrote eval/results/mmlu_mlx.json
