@@ -1,0 +1,28 @@
+  ane ready in 72s {'ready': True, 'sampling': {'temperature': 0.0, 'top_p': 1.0, 'top_k': 0, 'min_p': 0.0}, 'spec_k': 4, 'prefill_k': 0, 'spec': 4, 'ple': '1'}
+  25/600  acc 0.600  15.26s a question
+  50/600  acc 0.680  15.17s a question
+  75/600  acc 0.720  15.15s a question
+  100/600  acc 0.740  15.19s a question
+  125/600  acc 0.768  15.03s a question
+  150/600  acc 0.793  14.92s a question
+  175/600  acc 0.806  14.87s a question
+  200/600  acc 0.820  14.87s a question
+  225/600  acc 0.822  14.81s a question
+  250/600  acc 0.840  15.41s a question
+  275/600  acc 0.851  16.28s a question
+  300/600  acc 0.860  16.96s a question
+  325/600  acc 0.865  17.55s a question
+  350/600  acc 0.866  18.08s a question
+  375/600  acc 0.872  18.56s a question
+  400/600  acc 0.875  18.89s a question
+  425/600  acc 0.878  19.15s a question
+  450/600  acc 0.878  19.39s a question
+  475/600  acc 0.872  19.60s a question
+  500/600  acc 0.864  19.62s a question
+  525/600  acc 0.865  19.51s a question
+  550/600  acc 0.867  19.38s a question
+  575/600  acc 0.870  19.27s a question
+  600/600  acc 0.873  19.17s a question
+
+mmlu ane: 524/600 = 0.8733 in 11501s
+  wrote eval/results/mmlu_ane.json
