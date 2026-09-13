@@ -113,10 +113,13 @@ Halving the resident weights is the likely reason. Perplexity is unchanged to
 every digit, 1.886208 and 6.5943 scoring 1024 tokens after a 512-token
 prefill, and a decode run emits the same ids at 20.7 tok/s.
 
-The cost is compile time. Building 36 two-procedure programs took 136s against
-about 22s for the two separate sets, and ANE compile times here are volatile
-enough that the number should be re-checked on a warm cache before anyone
-plans around it.
+It costs nothing at startup either, which the first measurement got wrong. The
+136s that building 36 two-procedure programs appeared to take was a cold
+compile: the ANE keeps compiled model packages in the process temp directory
+and reuses them through `compiledModelExists` / `loadWithQoS:`, which
+`Q38_ANE_REUSE_COMPILED` leaves on by default, and that cache had just been
+deleted to free disk. Warm, the same 36 programs load in 16s and the 12 QSA
+layers in 6s, the same as the two separate sets took before.
 
 Prefill across this whole sequence: 7.4, then 25.6 filling every slot, 40 at
 K=8, 58 with a second graph set, 65 with the chunked delta rule, and 82 with
