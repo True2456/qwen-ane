@@ -51,8 +51,8 @@ Total package size is **~14.2 GB** (compared to 52 GB for base BF16 weights), re
 
 Install the unified CLI:
 ```bash
-git clone https://github.com/True2456/Rindi.git
-cd Rindi
+git clone https://github.com/True2456/qwen-ane.git
+cd qwen-ane
 pip install -e .
 ```
 

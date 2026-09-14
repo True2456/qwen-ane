@@ -21,8 +21,8 @@ will compile, but program limits and speed will differ.
 ## Install
 
 ```bash
-git clone https://github.com/True2456/Rindi.git
-cd Rindi
+git clone https://github.com/True2456/qwen-ane.git
+cd qwen-ane
 pip install -e .
 ```
 
@@ -59,8 +59,9 @@ qwen-ane serve
 qwen-ane serve -model 27b -port 2457 -ctx 4096
 ```
 
-First launch looks for weights on disk, then pulls the Hugging Face package
-into `~/.qwenANE/models/` if nothing local is found.
+First launch uses a checkpoint already on the machine (`~/models/…`,
+`~/.lmstudio/models/Qwen/…`, or `--model-path`). Hugging Face is only a
+fallback if nothing local is found.
 
 ```text
   Qwen ANE CLI
@@ -85,30 +86,31 @@ Resume a session with `qwen-ane chat --resume <session-id>`.
 
 ## Models and weights
 
-```bash
-qwen-ane models              # what is installed, and where
-qwen-ane pull flash-next     # Hugging Face -> ~/.qwenANE/models/flash-next
-qwen-ane pull 27b
-```
+If the weights are already on disk, you do not need to download anything.
+`qwen-ane models` shows what it found. Common locations are picked up
+automatically:
 
-Default Hub repos:
+- Flash-Next: `~/models/Qwen3.8-Flash-Next`, `~/models/Qwen3.8-Flash-Next-MLX-4bit`
+- 27B: `~/.lmstudio/models/Qwen/Qwen3.8-27B`, `~/models/Qwen3.8-27B`
 
-- Flash-Next: [True2456/Qwen3.8-Flash-Next-ANE](https://huggingface.co/True2456/Qwen3.8-Flash-Next-ANE)
-- 27B: [True2456/Qwen3.8-27B-ANE](https://huggingface.co/True2456/Qwen3.8-27B-ANE)
-
-If you already have the base BF16 (or MLX) checkpoint:
+Or pass the directory:
 
 ```bash
 qwen-ane chat -model flash-next --model-path ~/models/Qwen3.8-Flash-Next
 qwen-ane chat -model 27b --model-path ~/.lmstudio/models/Qwen/Qwen3.8-27B
 ```
 
-`qwen-ane build <model> --source /path/to/bf16` links that checkpoint into
+`qwen-ane pull` is only for a machine that does not already have the
+checkpoint. Default Hub repos are
+[True2456/Qwen3.8-Flash-Next-ANE](https://huggingface.co/True2456/Qwen3.8-Flash-Next-ANE)
+and [True2456/Qwen3.8-27B-ANE](https://huggingface.co/True2456/Qwen3.8-27B-ANE).
+
+`qwen-ane build <model> --source /path/to/bf16` links a local checkpoint into
 `~/.qwenANE/models/`. 27B quantizes INT4 into `~/Library/Caches/q38-pure-ane`
 on the first serve; later launches reuse the bake.
 
 Discovery order: `~/.qwenANE/models/<name>`, then `~/models/…` and
-`~/.lmstudio/models/Qwen/…`, then Hugging Face.
+`~/.lmstudio/models/Qwen/…`. Hub download is last, and only if those miss.
 
 ## Talking to the server
 
