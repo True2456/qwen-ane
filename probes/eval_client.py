@@ -35,9 +35,12 @@ class AneClient:
             err = open(serve_log, "w")
         else:
             err = subprocess.DEVNULL if quiet else None
-        self._err = err
+        py = os.environ.get("FLASHNEXT_PYTHON")
+        if not py:
+            cand = Path.home() / ".rindi/venvs/coreai/bin/python"
+            py = str(cand) if cand.exists() else sys.executable
         self.p = subprocess.Popen(
-            [str(Path.home() / ".rindi/venvs/coreai/bin/python"), "-u",
+            [py, "-u",
              str(ROOT / "scripts/export_flashnext_coreai.py"), "generate",
              "--serve", "--serve-ctx", str(ctx),
              "--prompt-ids", "760", "--max-new", "1"],

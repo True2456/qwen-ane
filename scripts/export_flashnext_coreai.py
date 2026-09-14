@@ -72,7 +72,7 @@ from runtime import host_fastpath
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-BASE = Path("/Users/true/models/Qwen3.8-Flash-Next")
+BASE = Path(os.environ.get("FLASHNEXT_MODEL", str(Path.home() / "models" / "Qwen3.8-Flash-Next")))
 OUT_DIR = ROOT / "artifacts" / "coreai"
 
 H = 2560
@@ -4514,6 +4514,26 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
             import json
             from tokenizers import Tokenizer
             tok = Tokenizer.from_file(str(BASE / "tokenizer.json"))
+
+            def _truthy(v):
+                if isinstance(v, bool):
+                    return v
+                if isinstance(v, (int, float)):
+                    return v != 0
+                return str(v).strip().lower() not in ("", "0", "false", "off", "no")
+
+            _EFFORTS = {"low", "medium", "xhigh"}
+            _EFFORT_ALIAS = {"minimal": "low", "min": "low",
+                             "high": "xhigh", "max": "xhigh"}
+
+            def _effort(v):
+                if v is None:
+                    return None
+                s = str(v).strip().lower()
+                if s in ("", "off", "none", "false", "0"):
+                    return None
+                s = _EFFORT_ALIAS.get(s, s)
+                return s if s in _EFFORTS else None
             _gc_path = BASE / "generation_config.json"
             _eos = json.loads(_gc_path.read_text()).get("eos_token_id", []) \
                 if _gc_path.is_file() else []
@@ -4668,16 +4688,46 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     text = req.get("prompt", "")
                     if req.get("template"):
                         if chat is None:
-                            from transformers import AutoTokenizer
-                            chat = AutoTokenizer.from_pretrained(str(BASE))
+                            # AutoTokenizer reads config.json (model_type
+                            # qwen4_exp) and warns; the Jinja template and
+                            # tokenizer.json are all serve actually uses.
+                            from transformers import PreTrainedTokenizerFast
+                            _tc = json.loads(
+                                (BASE / "tokenizer_config.json").read_text())
+                            chat = PreTrainedTokenizerFast(
+                                tokenizer_file=str(BASE / "tokenizer.json"),
+                                chat_template=_tc.get("chat_template"))
+                        tmpl = {"add_generation_prompt": True}
+                        if req.get("tools"):
+                            tmpl["tools"] = req["tools"]
+                        ctk = req.get("chat_template_kwargs") or {}
+                        if not isinstance(ctk, dict):
+                            ctk = {}
+                        if "enable_thinking" in req:
+                            tmpl["enable_thinking"] = _truthy(req["enable_thinking"])
+                        elif "enable_thinking" in ctk:
+                            tmpl["enable_thinking"] = _truthy(ctk["enable_thinking"])
+                        else:
+                            tmpl["enable_thinking"] = True
+                        effort = _effort(ctk.get("reasoning_effort")) \
+                            or _effort(req.get("reasoning_effort"))
+                        if effort and tmpl["enable_thinking"]:
+                            tmpl["reasoning_effort"] = effort
+                        if "preserve_thinking" in ctk:
+                            tmpl["preserve_thinking"] = bool(
+                                ctk["preserve_thinking"])
                         text = chat.apply_chat_template(
-                            req["messages"], tokenize=False,
-                            add_generation_prompt=True,
-                            **({"tools": req["tools"]} if req.get("tools")
-                               else {}))
+                            req["messages"], tokenize=False, **tmpl)
                     ids = list(tok.encode(text, add_special_tokens=False).ids)
                     if not ids:
                         raise ValueError("empty prompt")
+                    # AttnCache is serve_ctx slots. Prefilling past that used
+                    # to IndexError a couple of minutes in; Qwen Code then
+                    # retried the same 500 three times.
+                    if len(ids) >= serve_ctx:
+                        raise ValueError(
+                            f"prompt is {len(ids)} tokens; context is "
+                            f"{serve_ctx}")
                     reused = _enter(ids)
                     if op == "score":
                         lg = _prefill_ids(ids[reused:])
@@ -4707,7 +4757,12 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                     _t_pf = time.perf_counter()
                     cur = list(ids)
                     generated = []
-                    max_new = int(req.get("max_new", 256))
+                    max_new = min(int(req.get("max_new", 256)),
+                                  serve_ctx - len(ids))
+                    if max_new < 1:
+                        raise ValueError(
+                            f"prompt is {len(ids)} tokens; context is "
+                            f"{serve_ctx}")
                     for key in ("temperature", "top_p", "top_k", "min_p"):
                         if key in req:
                             _samp[key] = type(_samp[key])(req[key])

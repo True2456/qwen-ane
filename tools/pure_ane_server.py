@@ -103,6 +103,42 @@ _REASONING_INSTRUCTIONS={
 }
 
 
+_TOOL_ALIAS={
+    "run_shell":"bash","run_shell_command":"bash","shell":"bash",
+    "read_file":"read","write_file":"write","str_replace":"edit","replace":"edit",
+}
+_ARG_ALIAS={
+    "bash":(("cmd","command"),),
+    "read":(("file_path","path"),("target_file","path")),
+    "write":(("file_path","path"),("contents","content")),
+}
+
+
+def _declared_tools(functions:list[dict[str,Any]]|None)->dict[str,list[str]]:
+    declared={}
+    for fn in functions or []:
+        name=fn.get("name")
+        if isinstance(name,str):
+            required=(fn.get("parameters") or {}).get("required") or []
+            declared[name]=list(required) if isinstance(required,list) else []
+    return declared
+
+
+def _repair_tool_name(name:str,args:dict[str,Any],declared:dict[str,list[str]])->str:
+    alias=_TOOL_ALIAS.get(name,name)
+    if declared and alias in declared:return alias
+    if not declared or name in declared:return name
+    fits=[n for n,req in declared.items() if all(k in args for k in req)]
+    return fits[0] if len(fits)==1 else alias
+
+
+def _alias_tool_args(name:str,args:dict[str,Any])->dict[str,Any]:
+    out=dict(args)
+    for src,dst in _ARG_ALIAS.get(name,()):
+        if src in out and dst not in out:out[dst]=out.pop(src)
+    return out
+
+
 def chat_prompt(messages:list[dict[str,Any]],enable_thinking:bool=True,
                 reasoning_effort:str="xhigh",
                 tools:list[dict[str,Any]]|None=None,
@@ -117,9 +153,13 @@ def chat_prompt(messages:list[dict[str,Any]],enable_thinking:bool=True,
     reasoning_instruction=(_REASONING_INSTRUCTIONS[reasoning_effort]
                            if enable_thinking else "")
     out=[];start=0
+    first_role=str(messages[0].get("role",""))
+    if first_role=="developer":
+        messages=[{**messages[0],"role":"system"},*messages[1:]]
+        first_role="system"
     if tools:
         system_content=""
-        if messages[0].get("role")=="system":
+        if first_role=="system":
             system_content=_content_text(messages[0].get("content"));start=1
         block=[]
         if reasoning_instruction:block.append(reasoning_instruction+"\n\n")
@@ -144,6 +184,7 @@ def chat_prompt(messages:list[dict[str,Any]],enable_thinking:bool=True,
         out.append("<|im_start|>system\n"+reasoning_instruction+"<|im_end|>\n")
     for index,message in enumerate(messages[start:],start=start):
         role=str(message.get("role",""))
+        if role=="developer":role="system"
         content=_content_text(message.get("content"))
         if role=="system":
             if index!=0:raise ValueError("system message must be first")
@@ -177,7 +218,9 @@ _TOOL_CALL_RE=re.compile(
 _TOOL_PARAM_RE=re.compile(r"<parameter=([\w.-]+)>\s*(.*?)\s*</parameter>",re.S)
 
 
-def split_tool_calls(text:str)->tuple[str,list[dict[str,Any]]]:
+def split_tool_calls(text:str,functions:list[dict[str,Any]]|None=None
+                     )->tuple[str,list[dict[str,Any]]]:
+    declared=_declared_tools(functions)
     calls=[]
     for match in _TOOL_CALL_RE.finditer(text):
         args={}
@@ -185,8 +228,10 @@ def split_tool_calls(text:str)->tuple[str,list[dict[str,Any]]]:
             raw=raw.strip()
             try:args[name]=json.loads(raw)
             except (json.JSONDecodeError,TypeError):args[name]=raw
+        name=_repair_tool_name(match.group(1),args,declared)
+        args=_alias_tool_args(name,args)
         calls.append({"id":"call_"+uuid.uuid4().hex[:24],"type":"function",
-                      "function":{"name":match.group(1),
+                      "function":{"name":name,
                                   "arguments":json.dumps(args,ensure_ascii=False,separators=(",",":"))}})
     return _TOOL_CALL_RE.sub("",text).strip(),calls
 
@@ -371,8 +416,8 @@ class PureAneService:
         prompt_ids=self.tokenizer.encode(prompt)
         if not prompt_ids:raise ValueError("prompt tokenized to nothing")
         if max_tokens<1:raise ValueError("max_tokens must be at least 1")
-        if len(prompt_ids)+max_tokens>self.args.context:
-            raise ValueError(f"prompt plus generation ({len(prompt_ids)+max_tokens}) exceeds configured context {self.args.context}")
+        if len(prompt_ids)>=self.args.context:
+            raise ValueError(f"prompt ({len(prompt_ids)}) exceeds configured context {self.args.context}")
         if temperature<0:raise ValueError("temperature must be non-negative")
         if not 0<top_p<=1:raise ValueError("top_p must be in (0, 1]")
         if top_k<0:raise ValueError("top_k must be non-negative")
@@ -386,6 +431,7 @@ class PureAneService:
                  prefix_cache:bool=True)->dict[str,Any]:
         prompt_ids=self.validate(prompt,max_tokens,temperature,top_p,top_k,
                                  repetition_penalty)
+        max_tokens=min(max_tokens,self.args.context-len(prompt_ids))
         selector=_sampling_selector(prompt_ids,temperature,top_p,top_k,
                                     repetition_penalty,seed)
         emitter=TextEmitter(self.tokenizer,stops or [],emit)
@@ -455,8 +501,16 @@ def _stops(value:Any)->list[str]:
     raise ValueError("stop must be a string or list of strings")
 
 
+def _usage(result:dict[str,Any])->dict[str,Any]:
+    return {"prompt_tokens":result["prompt_tokens"],
+            "completion_tokens":result["completion_tokens"],
+            "total_tokens":result["total_tokens"],
+            "prompt_tokens_details":{"cached_tokens":int(result.get("prefix_tokens_reused") or 0)}}
+
+
 def _request_options(req:dict[str,Any],default_tokens:int)->dict[str,Any]:
-    return {"max_tokens":int(req.get("max_tokens") or req.get("max_completion_tokens") or default_tokens),
+    requested=int(req.get("max_tokens") or req.get("max_completion_tokens") or default_tokens)
+    return {"max_tokens":max(1,min(requested,default_tokens)),
             "temperature":float(req.get("temperature",0.0)),
             "top_p":float(req.get("top_p",1.0)),"top_k":int(req.get("top_k",0)),
             "repetition_penalty":float(req.get("repetition_penalty",1.0)),
@@ -464,11 +518,21 @@ def _request_options(req:dict[str,Any],default_tokens:int)->dict[str,Any]:
             "prefix_cache":bool(req.get("prefix_cache",True))}
 
 
+_EFFORT_ALIAS={"minimal":"low","min":"low","high":"xhigh","max":"xhigh"}
+
+
 def _thinking_options(req:dict[str,Any],*,default:bool=True)->tuple[bool,str]:
-    enabled=req.get("enable_thinking",default)
+    ctk=req.get("chat_template_kwargs")
+    ctk=ctk if isinstance(ctk,dict) else {}
+    enabled=req.get("enable_thinking",ctk.get("enable_thinking",default))
+    if enabled is None:enabled=default
+    if isinstance(enabled,str):
+        enabled=enabled.strip().lower() not in ("","0","false","off","none")
     if not isinstance(enabled,bool):raise ValueError("enable_thinking must be a boolean")
-    effort=req.get("reasoning_effort","xhigh")
+    effort=req.get("reasoning_effort",ctk.get("reasoning_effort","xhigh"))
+    if effort is None:effort="xhigh"
     if not isinstance(effort,str):raise ValueError("reasoning_effort must be a string")
+    effort=_EFFORT_ALIAS.get(effort.strip().lower(),effort.strip().lower())
     if enabled and effort not in _REASONING_INSTRUCTIONS:
         raise ValueError("reasoning_effort must be one of: low, medium, xhigh")
     return enabled,effort
@@ -532,7 +596,16 @@ def build_handler(service:PureAneService):
             )
             options=_request_options(req,service.args.max_tokens)
             service.validate(prompt,**options)
-            cid="chatcmpl-"+uuid.uuid4().hex;stream=bool(req.get("stream",False));created=int(time.time())
+            cid="chatcmpl-"+uuid.uuid4().hex
+            stream=bool(req.get("stream",False))
+            created=int(time.time())
+            print(
+                f"  req stream={stream} tools={len(functions)} msgs="
+                f"{len(req.get('messages') or [])} max_tokens={options['max_tokens']} "
+                f"client_max={req.get('max_tokens') or req.get('max_completion_tokens')} "
+                f"think={enable_thinking}/{reasoning_effort} prompt_chars={len(prompt)}",
+                flush=True,
+            )
             if stream:
                 self._sse_start();self._sse({"id":cid,"object":"chat.completion.chunk","created":created,"model":service.args.name,"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":None}]})
                 def emit_content(delta:str)->None:
@@ -548,18 +621,18 @@ def build_handler(service:PureAneService):
                 )
                 if not functions:router.finish()
                 reasoning,visible=split_reasoning(result["text"],enable_thinking)
-                content,calls=(split_tool_calls(visible)
+                content,calls=(split_tool_calls(visible,functions)
                                if functions else (visible,[]))
                 if functions and reasoning:emit_reasoning(reasoning)
                 if functions and content:emit_content(content)
                 if calls:
                     self._sse({"id":cid,"object":"chat.completion.chunk","created":created,"model":service.args.name,"choices":[{"index":0,"delta":{"tool_calls":[dict(index=i,**call) for i,call in enumerate(calls)]},"finish_reason":None}]})
                 finish="tool_calls" if calls else result["finish_reason"]
-                self._sse({"id":cid,"object":"chat.completion.chunk","created":created,"model":service.args.name,"choices":[{"index":0,"delta":{},"finish_reason":finish}],"usage":{"prompt_tokens":result["prompt_tokens"],"completion_tokens":result["completion_tokens"],"total_tokens":result["total_tokens"]}})
+                self._sse({"id":cid,"object":"chat.completion.chunk","created":created,"model":service.args.name,"choices":[{"index":0,"delta":{},"finish_reason":finish}],"usage":_usage(result)})
                 self.wfile.write(b"data: [DONE]\n\n");self.wfile.flush();return
             result=service.generate(prompt,**options)
             reasoning,visible=split_reasoning(result["text"],enable_thinking)
-            content,calls=(split_tool_calls(visible)
+            content,calls=(split_tool_calls(visible,functions)
                            if functions else (visible,[]))
             message={"role":"assistant","content":content or (None if calls else "")}
             if enable_thinking:message["reasoning_content"]=reasoning
@@ -568,7 +641,7 @@ def build_handler(service:PureAneService):
             metadata={k:v for k,v in result.items() if k not in ("text","prompt_tokens","completion_tokens","total_tokens","finish_reason")}
             metadata.update(enable_thinking=enable_thinking,
                             reasoning_effort=(reasoning_effort if enable_thinking else None))
-            self._json({"id":cid,"object":"chat.completion","created":created,"model":service.args.name,"choices":[{"index":0,"message":message,"finish_reason":finish}],"usage":{"prompt_tokens":result["prompt_tokens"],"completion_tokens":result["completion_tokens"],"total_tokens":result["total_tokens"]},"pure_ane":metadata})
+            self._json({"id":cid,"object":"chat.completion","created":created,"model":service.args.name,"choices":[{"index":0,"message":message,"finish_reason":finish}],"usage":_usage(result),"pure_ane":metadata})
         def _completion(self,req:dict[str,Any])->None:
             prompt=req.get("prompt","")
             if not isinstance(prompt,str):raise ValueError("prompt must be a string")
@@ -616,11 +689,11 @@ def bench_client(args:argparse.Namespace)->None:
 def main()->None:
     parser=argparse.ArgumentParser(description=__doc__);sub=parser.add_subparsers(dest="command",required=True)
     s=sub.add_parser("serve")
-    s.add_argument("--model",default=os.environ.get("Q38_MODEL","/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B"))
+    s.add_argument("--model",default=os.environ.get("Q38_MODEL",str(Path.home()/".lmstudio"/"models"/"Qwen"/"Qwen3.8-27B")))
     s.add_argument("--engine-path",default=os.environ.get("Q38_ANE_ENGINE",str(_TOOLS.parent)))
-    s.add_argument("--name",default="qwen3.8-27b-pure-ane");s.add_argument("--host",default="127.0.0.1");s.add_argument("--port",type=int,default=1240)
+    s.add_argument("--name",default="Qwen3.8-27B");s.add_argument("--host",default="127.0.0.1");s.add_argument("--port",type=int,default=1240)
     s.add_argument("--bits",type=int,choices=(4,8,16),default=4);s.add_argument("--context",type=int,default=4096)
-    s.add_argument("--mtp-draft",type=int,choices=(0,1,2),default=0);s.add_argument("--max-tokens",type=int,default=256)
+    s.add_argument("--mtp-draft",type=int,choices=(0,1,2,3),default=0);s.add_argument("--max-tokens",type=int,default=2048)
     s.add_argument("--bake-cache",default=os.environ.get("Q38_ANE_BAKE_CACHE","auto"),
                    help="prequantized-weight cache directory (default: ~/Library/Caches/q38-pure-ane)")
     s.add_argument("--no-bake-cache",action="store_const",const="",dest="bake_cache",

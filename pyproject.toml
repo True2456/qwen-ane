@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen-ane"
+version = "0.1.0"
+description = "Native Apple Silicon Neural Engine (ANE) Inference Engine and CLI for Qwen Models"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "True2456" }
+]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Operating System :: MacOS",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.24.0",
+    "huggingface_hub>=0.20.0",
+    "safetensors>=0.4.0",
+    "tokenizers>=0.15.0",
+]
+
+[project.optional-dependencies]
+mlx = [
+    "mlx>=0.16.0",
+]
+
+[project.scripts]
+qwen-ane = "qwen_ane.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["qwen_ane*"]

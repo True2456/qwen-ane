@@ -95,6 +95,7 @@ class SafeTensorFile:
             header = json.loads(f.read(header_len))
         self.data_offset = 8 + header_len
         self.header = {k: v for k, v in header.items() if k != "__metadata__"}
+        self._mmaps: dict[str, np.memmap] = {}
 
     def info(self, name: str) -> TensorInfo:
         meta = self.header[name]
@@ -112,10 +113,14 @@ class SafeTensorFile:
                           self.data_offset + a, b - a)
 
     def mmap(self, name: str) -> np.memmap:
-        info = self.info(name)
-        dtype = self._DTYPES[info.dtype][0]
-        return np.memmap(info.path, mode="r", dtype=dtype,
-                         offset=info.offset, shape=info.shape, order="C")
+        m = self._mmaps.get(name)
+        if m is None:
+            info = self.info(name)
+            dtype = self._DTYPES[info.dtype][0]
+            m = np.memmap(info.path, mode="r", dtype=dtype,
+                          offset=info.offset, shape=info.shape, order="C")
+            self._mmaps[name] = m
+        return m
 
     def array(self, name: str, dtype=np.float32) -> np.ndarray:
         info = self.info(name)
@@ -192,9 +197,26 @@ class Checkpoint:
             if len(candidates) != 1:
                 raise KeyError(f"could not identify embedding tensor: {candidates}")
             self.embedding_name = candidates[0]
+        self._quant_manifest: dict[str, dict] = {}
+        manifest_path = self.path / "quant_cache" / "manifest.json"
+        if manifest_path.is_file():
+            try:
+                with manifest_path.open("r", encoding="utf-8") as f:
+                    mdata = json.load(f)
+                    self._quant_manifest = mdata.get("quant_manifest", mdata)
+            except Exception:
+                pass
+        self._quant_by_tensor = {
+            item["tensor_name"]: item
+            for item in self._quant_manifest.values()
+            if "tensor_name" in item and item.get("row_start", 0) == 0
+        }
 
     def configure_quant_cache(self, root: str | os.PathLike[str] | None) -> None:
         """Select a versioned persistent cache for prebaked ANE weight blobs."""
+        if (self.path / "quant_cache").is_dir() and (self.path / "quant_cache" / "manifest.json").is_file():
+            self.quant_cache_dir = self.path / "quant_cache"
+            return
         if not root:
             self.quant_cache_dir = None
             return
@@ -217,6 +239,13 @@ class Checkpoint:
         return self._files[filename]
 
     def info(self, name: str) -> TensorInfo:
+        if name in self.weight_map:
+            return self._file(name).info(name)
+        if name in self._quant_by_tensor:
+            item = self._quant_by_tensor[name]
+            shape = tuple(item["shape"])
+            dtype = item.get("dtype", "BF16")
+            return TensorInfo(name, self.path / "model.safetensors", dtype, shape, 0, 0)
         return self._file(name).info(name)
 
     def tensor(self, name: str, dtype=np.float32) -> np.ndarray:
@@ -297,6 +326,33 @@ class StandaloneTokenizer:
         return self.impl.decode(ids, skip_special_tokens=False)
 
 
+def _compile_ane_program(driver: AneDriver, mil: str, blobs: dict[str, bytes],
+                         in_dim: int, out_dim: int, width: int, *,
+                         raw_weight_files: frozenset[str] | None = None,
+                         error: str = "ANE compile failed"):
+    capture = io.StringIO()
+    with contextlib.redirect_stdout(capture), contextlib.redirect_stderr(capture):
+        program = driver.engine.compile_multiproc(
+            mil, blobs, in_dim, out_dim, width,
+            raw_weight_files=raw_weight_files or frozenset()
+        )
+    if program is None:
+        tail = "\n".join(capture.getvalue().strip().splitlines()[-10:])
+        raise RuntimeError(f"{error}:\n{tail}")
+    driver.engine._ensure_io(program)
+    with driver.view(program._in_surf, (in_dim, width), np.float16) as d:
+        d[:] = 0
+    return program
+
+
+def _mil_conv_prelude(channels: int, width: int) -> str:
+    return f'''    string pt = const()[name=string("pt"), val=string("valid")];
+    tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+    tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+    tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+    int32 g1 = const()[name=string("g1"), val=int32(1)];'''
+
+
 def _dense_decl(name: str, out_dim: int, in_dim: int, bits: int) -> str:
     if bits == 16:
         return (
@@ -335,28 +391,9 @@ def _packed_split_down_projection(module, blobs: dict[str, bytes],
 
     data = blobs.pop("d.bin")
     scales = blobs.pop("ds.bin", None)
-    part_in = in_dim // parts
-    if bits == 16:
-        rows = np.frombuffer(data, dtype=np.float16).reshape(out_dim, in_dim)
-        payloads = [np.ascontiguousarray(
-            rows[:, part * part_in:(part + 1) * part_in]
-        ).tobytes() for part in range(parts)]
-    elif bits == 8:
-        rows = np.frombuffer(data, dtype=np.int8).reshape(out_dim, in_dim)
-        payloads = [np.ascontiguousarray(
-            rows[:, part * part_in:(part + 1) * part_in]
-        ).tobytes() for part in range(parts)]
-    elif bits == 4:
-        packed_in = in_dim // 2
-        packed_part = part_in // 2
-        rows = np.frombuffer(data, dtype=np.uint8).reshape(out_dim, packed_in)
-        payloads = [np.ascontiguousarray(
-            rows[:, part * packed_part:(part + 1) * packed_part]
-        ).tobytes() for part in range(parts)]
-    else:
-        raise ValueError(f"unsupported down_proj precision int{bits}")
-    if bits != 16 and scales is None:
-        raise ValueError("quantized down_proj has no row scales")
+    payloads, scales, part_in = _quantized_down_slices(
+        data, scales, out_dim, in_dim, bits, parts
+    )
 
     raw = bytearray()
 
@@ -400,6 +437,61 @@ def _packed_split_down_projection(module, blobs: dict[str, bytes],
     ))
     blobs["down.bin"] = bytes(raw)
     return "\n".join(decls), "\n".join(convs), frozenset({"down.bin"})
+
+
+def _quantized_down_slices(data: bytes, scales: bytes | None, out_dim: int,
+                           in_dim: int, bits: int, parts: int
+                           ) -> tuple[list[bytes], bytes | None, int]:
+    """Slice a row-quantized ``down_proj`` along input channels."""
+    if in_dim % parts or (bits == 4 and (in_dim // parts) % 2):
+        raise ValueError(f"cannot split input dimension {in_dim} into {parts}")
+    part_in = in_dim // parts
+    if bits == 16:
+        rows = np.frombuffer(data, dtype=np.float16).reshape(out_dim, in_dim)
+        payloads = [np.ascontiguousarray(
+            rows[:, part * part_in:(part + 1) * part_in]
+        ).tobytes() for part in range(parts)]
+    elif bits == 8:
+        rows = np.frombuffer(data, dtype=np.int8).reshape(out_dim, in_dim)
+        payloads = [np.ascontiguousarray(
+            rows[:, part * part_in:(part + 1) * part_in]
+        ).tobytes() for part in range(parts)]
+    elif bits == 4:
+        packed_in = in_dim // 2
+        packed_part = part_in // 2
+        rows = np.frombuffer(data, dtype=np.uint8).reshape(out_dim, packed_in)
+        payloads = [np.ascontiguousarray(
+            rows[:, part * packed_part:(part + 1) * packed_part]
+        ).tobytes() for part in range(parts)]
+    else:
+        raise ValueError(f"unsupported down_proj precision int{bits}")
+    if bits != 16 and scales is None:
+        raise ValueError("quantized down_proj has no row scales")
+    return payloads, scales, part_in
+
+
+def _conv_rms_block(source: str, output: str, channels: int, width: int,
+                    weight: str, mean: str, prefix: str, *,
+                    scale: float = 64.0, groups: str = "gr") -> str:
+    """Overflow-scaled RMSNorm via a 1x1 mean conv, then affine ``weight``.
+
+    macOS 27's Exclave verifier rejects ``_stable_rms_block`` (reshape the
+    5120-wide channel axis onto W, ``reduce_mean`` there) when that graph is
+    fused with a large int4/fp16 projection. The procedure-bank spelling —
+    ``square → conv(1/H) → sqrt → divide`` — compiles at the 27B fused
+    ``[16480, 5120]`` shape on this OS. ``scale`` is the pre-square gain
+    (64 for layer 0, 2 otherwise) so fp16 squares do not overflow.
+    """
+    sh = float(np.float16(scale)).hex()
+    eh = float(np.float16(1e-6 * scale * scale)).hex()
+    p = prefix
+    return f'''    tensor<fp16, [1, {channels}, 1, {width}]> {p}xs = mul(x={source}, y=fp16({sh}))[name=string("{p}xs")];
+    tensor<fp16, [1, {channels}, 1, {width}]> {p}sq = mul(x={p}xs, y={p}xs)[name=string("{p}sq")];
+    tensor<fp16, [1, 1, 1, {width}]> {p}ms = conv(dilations=dl, groups={groups}, pad=pd, pad_type=pt, strides=st, weight={mean}, x={p}sq)[name=string("{p}ms")];
+    tensor<fp16, [1, 1, 1, {width}]> {p}me = add(x={p}ms, y=fp16({eh}))[name=string("{p}me")];
+    tensor<fp16, [1, 1, 1, {width}]> {p}sd = sqrt(x={p}me)[name=string("{p}sd")];
+    tensor<fp16, [1, {channels}, 1, {width}]> {p}u = real_div(x={p}xs, y={p}sd)[name=string("{p}u")];
+    tensor<fp16, [1, {channels}, 1, {width}]> {output} = mul(x={p}u, y={weight})[name=string("{output}")];'''
 
 
 def _stable_rms_block(source: str, output: str, channels: int, width: int,
@@ -559,15 +651,21 @@ def _quantize_matrix(checkpoint: Checkpoint, tensor_name: str,
     cache_key = None
     data_path = scale_path = None
     if checkpoint.quant_cache_dir is not None:
-        source_stat = info.path.stat()
-        cache_key = hashlib.sha256(
-            (f"q38-quant-v2-zstd\0{tensor_name}\0{bits}\0{row_start}:{row_end}\0"
-             f"{info.dtype}\0{info.shape}\0{info.offset}:{info.nbytes}\0"
-             f"{source_stat.st_size}:{source_stat.st_mtime_ns}").encode()
-        ).hexdigest()
-        suffix = ".zst" if _zstd is not None else ".raw"
-        data_path = checkpoint.quant_cache_dir / f"{cache_key}.data{suffix}"
-        scale_path = checkpoint.quant_cache_dir / f"{cache_key}.scales{suffix}"
+        manifest_key = f"{tensor_name}:{bits}:{row_start}:{row_end}"
+        manifest_item = getattr(checkpoint, "_quant_manifest", {}).get(manifest_key)
+        if manifest_item is not None:
+            data_path = checkpoint.quant_cache_dir / manifest_item["data_file"]
+            scale_path = checkpoint.quant_cache_dir / manifest_item["scales_file"]
+        else:
+            source_stat = info.path.stat()
+            cache_key = hashlib.sha256(
+                (f"q38-quant-v2-zstd\0{tensor_name}\0{bits}\0{row_start}:{row_end}\0"
+                 f"{info.dtype}\0{info.shape}\0{info.offset}:{info.nbytes}\0"
+                 f"{source_stat.st_size}:{source_stat.st_mtime_ns}").encode()
+            ).hexdigest()
+            suffix = ".zst" if _zstd is not None else ".raw"
+            data_path = checkpoint.quant_cache_dir / f"{cache_key}.data{suffix}"
+            scale_path = checkpoint.quant_cache_dir / f"{cache_key}.scales{suffix}"
         data_size = out_dim * in_dim * (2 if bits == 16 else 1) // (2 if bits == 4 else 1)
         scale_size = 0 if bits == 16 else out_dim * 2
         if (data_path.is_file()
@@ -753,11 +851,14 @@ class AneNormProjection:
         if bits != 16:
             blobs["ps.bin"] = b"".join(part["ps.bin"] for part in parts)
         blobs["norm.bin"] = norm.tobytes()
+        blobs["mean.bin"] = np.full((1, self.hidden), 1 / self.hidden, np.float16).tobytes()
 
         H, O, S = self.hidden, self.output, self.width
         decl = _dense_decl("p", O, H, bits)
-        norm_body = _stable_rms_block(
-            "x", "norm", H, S, "nw", "nr", active_lanes
+        # macOS 27 rejects the reshape-reduce RMS fused with this projection.
+        # Conv-mean RMS is the bank spelling that still verifies.
+        norm_body = _conv_rms_block(
+            "x", "norm", H, S, "nw", "mw", "nr", scale=norm_scale
         )
         mil = f'''program(1.3)
 {driver.module._BUILD_INFO}
@@ -769,12 +870,13 @@ class AneNormProjection:
     tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
     int32 gr = const()[name=string("gr"), val=int32(1)];
     tensor<fp16, [1, {H}, 1, 1]> nw = const()[name=string("nw"), val=tensor<fp16, [1, {H}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/norm.bin"), offset=uint64(64)))];
+    tensor<fp16, [1, {H}, 1, 1]> mw = const()[name=string("mw"), val=tensor<fp16, [1, {H}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/mean.bin"), offset=uint64(64)))];
 {decl}
 {norm_body}
     tensor<fp16, [1, {O}, 1, {S}]> y = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=pw, x=norm)[name=string("{tag}")];
   }} -> (y);
 }}
-// pure_ane_{tag}_{H}_{O}_int{bits}
+// pure_ane_{tag}_{H}_{O}_int{bits}_convrms
 '''
         capture = io.StringIO()
         t0 = time.time()
@@ -786,6 +888,10 @@ class AneNormProjection:
             tail = "\n".join(capture.getvalue().strip().splitlines()[-8:])
             raise RuntimeError(f"ANE norm+projection compile failed:\n{tail}")
         driver.engine._ensure_io(self.program)
+        with self.driver.view(
+            self.program._in_surf, (self.hidden, self.width), np.float16
+        ) as dst:
+            dst[:] = 0
         self.nbytes = sum(len(x) for x in blobs.values())
         self.compile_seconds = time.time() - t0
         assert_standalone("norm+projection compile")
@@ -795,7 +901,6 @@ class AneNormProjection:
         with self.driver.view(
             self.program._in_surf, (self.hidden, self.width), np.float16
         ) as dst:
-            dst[:] = 0
             if self.active_lanes == 1:
                 # The legacy one-lane graph broadcasts lane zero internally.
                 dst[:] = hidden[:, :1]
@@ -855,8 +960,29 @@ class AneGdnConv:
     def reset(self) -> None:
         self.cache[:] = 0
 
+    def _host_forward(self, current: np.ndarray, lanes: int) -> np.ndarray:
+        """Depthwise K=4 + SiLU on the host.
+
+        Isolated ANE time for this shape is ~0.15 ms; production is ~0.44 ms
+        because each of the 48 layers is its own program. 10240×4 FMAs are
+        cheaper in NumPy than that dispatch. Prefill's 16-lane batches stay
+        on ANE; decode (1 lane) and MTP verify (≤4) use this path.
+        """
+        t = lanes
+        x = np.empty((self.channels, 3 + t), np.float32)
+        x[:, :3] = self.cache
+        x[:, 3:] = current
+        w = self.weight
+        acc = (w[:, :1] * x[:, :t] + w[:, 1:2] * x[:, 1:t + 1]
+               + w[:, 2:3] * x[:, 2:t + 2] + w[:, 3:4] * x[:, 3:t + 3])
+        y = (acc / (1.0 + np.exp(-acc))).astype(np.float16)
+        self.cache[:] = x[:, -3:]
+        return _restore_lane_rank(y, lanes)
+
     def __call__(self, qkv: np.ndarray) -> np.ndarray:
         current, lanes = _lane_matrix(qkv, self.channels, self.width-3)
+        if lanes <= 4:
+            return self._host_forward(current, lanes)
         with self.driver.view(
             self.program._in_surf, (self.channels, self.width), np.float16
         ) as dst:
@@ -1033,6 +1159,8 @@ class AneGdnRecurrence:
         self.input_surface = self.E._create_iosurface(
             self.E._iosurface_alloc_size(CIN * W)
         )
+        with self.driver.view(self.input_surface, (CIN, W), np.float16) as dst:
+            dst[:] = 0
         self.y_surface = self.E._create_iosurface(
             self.E._iosurface_alloc_size(H * Dv)
         )
@@ -1114,13 +1242,12 @@ class AneGdnRecurrence:
         ) as state_src, self.driver.view(
             self.input_surface, (self.CIN, self.W), np.float16
         ) as dst:
-            dst[:] = 0
             dst[:self.HK, :self.Dv] = state_src
             dst[:self.HK, self.Dv] = k48.reshape(-1)
             dst[:self.HK, self.Dv+1] = q48.reshape(-1)
             dst[:self.HK, self.Dv+2] = np.repeat(a, self.Dk)
-            dst[:self.HK, self.Dv+3] = np.repeat(dt_bias, self.Dk)
-            dst[:self.HK, self.Dv+4] = np.repeat(a_log, self.Dk)
+            dst[:self.HK, self.Dv+3] = dt_bias if dt_bias.size == self.HK else np.repeat(dt_bias, self.Dk)
+            dst[:self.HK, self.Dv+4] = a_log if a_log.size == self.HK else np.repeat(a_log, self.Dk)
             dst[self.HK:self.HK+self.H, :self.Dv] = v
             dst[self.HK+self.H:self.HK+2*self.H, 0] = beta_logits
         error = ctypes.c_void_p(0)
@@ -1141,7 +1268,13 @@ class AneGdnRecurrence:
 
 
 class AneGdnTail:
-    """GDN gated norm through residual MLP, fused into one ANE program."""
+    """GDN tail split for macOS 27 Exclave.
+
+    Grouped-48 RMS fused with ``out_proj`` is Code=10. Host does gated RMS+SiLU
+    and the post-RMS / MLP SiLU; ANE runs three graphs that verify on this OS:
+    ``out_proj``, fused gate+up named ``mux`` (the name ``gu`` is rejected),
+    and packed ``down_proj``.
+    """
 
     def __init__(self, driver: AneDriver, checkpoint: Checkpoint,
                  layer: int, bits: int = 4, width: int = 32,
@@ -1167,127 +1300,153 @@ class AneGdnTail:
         if oi.shape[1] != 6144 or gi.shape != ui.shape \
                 or gi.shape[1] != self.H or di.shape != (self.H, self.I):
             raise ValueError(f"unexpected layer {layer} tail shapes")
-        self.input = 2*self.Dc + self.H
         H, Dc, I, S = self.H, self.Dc, self.I, self.width
         self.down_proj_parts = down_proj_parts
-
-        blobs = {}
-        for key in ("o", "d"):
-            blobs.update(_quantize_matrix(checkpoint, names[key], key, bits))
-        gp = _quantize_matrix(checkpoint, names["g"], "gu", bits)
-        up = _quantize_matrix(checkpoint, names["u"], "gu", bits)
-        blobs["gu.bin"] = gp["gu.bin"] + up["gu.bin"]
-        if bits != 16:
-            blobs["gus.bin"] = gp["gus.bin"] + up["gus.bin"]
+        self.input = Dc + H
         gated_norm = checkpoint.tensor(
             f"{p}.linear_attn.norm.weight", np.float16
         )
         if gated_norm.shape != (128,):
             raise ValueError(f"unexpected gated norm {gated_norm.shape}")
-        blobs["gn.bin"] = np.tile(gated_norm, 48).astype(np.float16).tobytes()
-        blobs["gmean.bin"] = np.full((48, 128), 1/128, np.float16).tobytes()
-        blobs["grep.bin"] = np.ones((Dc, 1), np.float16).tobytes()
-        blobs["pn.bin"] = checkpoint.tensor(
-            f"{p}.post_attention_layernorm.weight", np.float16
-        ).tobytes()
-        if (next_norm_name is None)!=(next_projection_names is None):
+        self.gate_norm = np.tile(gated_norm, 48).astype(np.float16)
+        self.has_next = next_norm_name is not None
+        if (next_norm_name is None) != (next_projection_names is None):
             raise ValueError("next norm and projection must be supplied together")
-        self.has_next=next_norm_name is not None
-        self.next_output=0
-        if self.has_next:
-            blobs["next.bin"]=checkpoint.tensor(next_norm_name,np.float16).tobytes()
-            next_infos=[checkpoint.info(name) for name in next_projection_names]
-            if any(info.shape[1]!=H for info in next_infos):
-                raise ValueError("next projection input dimensions do not match")
-            self.next_output=sum(info.shape[0] for info in next_infos)
-            parts=[_quantize_matrix(checkpoint,name,"np",bits)
-                   for name in next_projection_names]
-            blobs["np.bin"]=b"".join(part["np.bin"] for part in parts)
-            if bits!=16:
-                blobs["nps.bin"]=b"".join(part["nps.bin"] for part in parts)
-        next_decl=(f'''    tensor<fp16, [1, {H}, 1, 1]> nnw = const()[name=string("nnw"), val=tensor<fp16, [1, {H}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/next.bin"), offset=uint64(64)))];
-{_dense_decl("np",self.next_output,H,bits)}''' if self.has_next else '')
-        post_norm = _stable_rms_block(
-            "h", "hn", H, S, "pn", f"hp{layer}_", active_lanes
+        self.next_output = 0
+
+        self.post_norm = checkpoint.tensor(
+            f"{p}.post_attention_layernorm.weight", np.float16
         )
-        next_norm = _stable_rms_block(
-            "o0", "nn", H, S, "nnw", f"np{layer}_", active_lanes
+        out_blobs = _quantize_matrix(checkpoint, names["o"], "o", bits)
+        gp = _quantize_matrix(checkpoint, names["g"], "mux", bits)
+        up = _quantize_matrix(checkpoint, names["u"], "mux", bits)
+        mux_blobs = {"mux.bin": gp["mux.bin"] + up["mux.bin"]}
+        if bits != 16:
+            mux_blobs["muxs.bin"] = gp["muxs.bin"] + up["muxs.bin"]
+        down_blobs = _quantize_matrix(checkpoint, names["d"], "d", bits)
+        down_decl, down_body, down_raw = _packed_split_down_projection(
+            driver.module, down_blobs, H, I, S, bits, down_proj_parts
         )
-        next_body=(f'''    tensor<fp16, [1, {H}, 1, {S}]> y = identity(x=o0)[name=string("y")];
-{next_norm}
-    tensor<fp16, [1, {self.next_output}, 1, {S}]> y2 = conv(dilations=dl, groups=g1, pad=pd, pad_type=pt, strides=st, weight=npw, x=nn)[name=string("y2")];''' if self.has_next else '')
-        down_decl, down_body, raw_weight_files = _packed_split_down_projection(
-            driver.module, blobs, H, I, S, bits, down_proj_parts
-        )
-        decl = "\n".join((
-            _dense_decl("o", H, Dc, bits),
-            _dense_decl("gu", 2*I, H, bits),
-            down_decl,
-        ))
-        mil = f'''program(1.3)
+
+        t0 = time.time()
+        out_mil = f'''program(1.3)
 {driver.module._BUILD_INFO}
 {{
   func main<ios18>(tensor<fp16, [1, {self.input}, 1, {S}]> x) {{
+{_mil_conv_prelude(self.input, S)}
+{_dense_decl("o", H, Dc, bits)}
+    tensor<fp16, [1, {Dc}, 1, {S}]> gated = slice_by_index(begin=tensor<int32, [4]>([0,0,0,0]), end=tensor<int32, [4]>([1,{Dc},1,{S}]), x=x)[name=string("gated")];
+    tensor<fp16, [1, {H}, 1, {S}]> residual = slice_by_index(begin=tensor<int32, [4]>([0,{Dc},0,0]), end=tensor<int32, [4]>([1,{self.input},1,{S}]), x=x)[name=string("residual")];
+    tensor<fp16, [1, {H}, 1, {S}]> attn = conv(dilations=dl, groups=g1, pad=pd, pad_type=pt, strides=st, weight=ow, x=gated)[name=string("out_proj")];
+    tensor<fp16, [1, {H}, 1, {S}]> y = add(x=residual, y=attn)[name=string("y")];
+  }} -> (y);
+}}
+// pure_ane_gdn_out_layer{layer}_int{bits}
+'''
+        self.out_program = _compile_ane_program(
+            driver, out_mil, out_blobs, self.input, H, S,
+            error="ANE GDN out_proj compile failed"
+        )
+
+        mux_mil = f'''program(1.3)
+{driver.module._BUILD_INFO}
+{{
+  func main<ios18>(tensor<fp16, [1, {H}, 1, {S}]> x) {{
+    string pt = const()[name=string("pt"), val=string("valid")];
+    tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+    tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+    tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+    int32 gr = const()[name=string("gr"), val=int32(1)];
+{_dense_decl("mux", 2*I, H, bits)}
+    tensor<fp16, [1, {2*I}, 1, {S}]> y = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=muxw, x=x)[name=string("y")];
+  }} -> (y);
+}}
+// pure_ane_gdn_mux_layer{layer}_int{bits}
+'''
+        self.up_program = _compile_ane_program(
+            driver, mux_mil, mux_blobs, H, 2 * I, S,
+            error="ANE GDN MLP mux compile failed"
+        )
+
+        down_mil = f'''program(1.3)
+{driver.module._BUILD_INFO}
+{{
+  func main<ios18>(tensor<fp16, [1, {I}, 1, {S}]> x) {{
     string pt = const()[name=string("pt"), val=string("valid")];
     tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
     tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
     tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
     int32 g1 = const()[name=string("g1"), val=int32(1)];
-    int32 g48 = const()[name=string("g48"), val=int32(48)];
-{decl}
-{next_decl}
-    tensor<fp16, [1, {Dc}, 1, 1]> gn = const()[name=string("gn"), val=tensor<fp16, [1, {Dc}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/gn.bin"), offset=uint64(64)))];
-    tensor<fp16, [48, 128, 1, 1]> gm = const()[name=string("gm"), val=tensor<fp16, [48, 128, 1, 1]>(BLOBFILE(path=string("@model_path/weights/gmean.bin"), offset=uint64(64)))];
-    tensor<fp16, [{Dc}, 1, 1, 1]> gr = const()[name=string("gr"), val=tensor<fp16, [{Dc}, 1, 1, 1]>(BLOBFILE(path=string("@model_path/weights/grep.bin"), offset=uint64(64)))];
-    tensor<fp16, [1, {H}, 1, 1]> pn = const()[name=string("pn"), val=tensor<fp16, [1, {H}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/pn.bin"), offset=uint64(64)))];
-    tensor<fp16, [1, {Dc}, 1, {S}]> core = slice_by_index(begin=tensor<int32, [4]>([0,0,0,0]), end=tensor<int32, [4]>([1,{Dc},1,{S}]), x=x)[name=string("core")];
-    tensor<fp16, [1, {Dc}, 1, {S}]> z = slice_by_index(begin=tensor<int32, [4]>([0,{Dc},0,0]), end=tensor<int32, [4]>([1,{2*Dc},1,{S}]), x=x)[name=string("z")];
-    tensor<fp16, [1, {H}, 1, {S}]> residual = slice_by_index(begin=tensor<int32, [4]>([0,{2*Dc},0,0]), end=tensor<int32, [4]>([1,{self.input},1,{S}]), x=x)[name=string("residual")];
-    tensor<fp16, [1, {Dc}, 1, {S}]> csq = mul(x=core, y=core)[name=string("csq")];
-    tensor<fp16, [1, 48, 1, {S}]> cms = conv(dilations=dl, groups=g48, pad=pd, pad_type=pt, strides=st, weight=gm, x=csq)[name=string("cms")];
-    tensor<fp16, [1, 48, 1, {S}]> cmse = add(x=cms, y=fp16(0x1.0c8p-8))[name=string("cmse")];
-    tensor<fp16, [1, 48, 1, {S}]> csd = sqrt(x=cmse)[name=string("csd")];
-    tensor<fp16, [1, {Dc}, 1, {S}]> csdr = conv(dilations=dl, groups=g48, pad=pd, pad_type=pt, strides=st, weight=gr, x=csd)[name=string("csdr")];
-    tensor<fp16, [1, {Dc}, 1, {S}]> cn = real_div(x=core, y=csdr)[name=string("cn")];
-    tensor<fp16, [1, {Dc}, 1, {S}]> cnw = mul(x=cn, y=gn)[name=string("cnw")];
-    tensor<fp16, [1, {Dc}, 1, {S}]> nz = mul(x=z, y=fp16(-0x1p+0))[name=string("nz")];
-    tensor<fp16, [1, {Dc}, 1, {S}]> ez = exp(x=nz)[name=string("ez")];
-    tensor<fp16, [1, {Dc}, 1, {S}]> zd = add(x=ez, y=fp16(0x1p+0))[name=string("zd")];
-    tensor<fp16, [1, {Dc}, 1, {S}]> zs = real_div(x=z, y=zd)[name=string("zs")];
-    tensor<fp16, [1, {Dc}, 1, {S}]> gated = mul(x=cnw, y=zs)[name=string("gated")];
-    tensor<fp16, [1, {H}, 1, {S}]> attn = conv(dilations=dl, groups=g1, pad=pd, pad_type=pt, strides=st, weight=ow, x=gated)[name=string("out_proj")];
-    tensor<fp16, [1, {H}, 1, {S}]> h = add(x=residual, y=attn)[name=string("h")];
-{post_norm}
-    tensor<fp16, [1, {2*I}, 1, {S}]> gu = conv(dilations=dl, groups=g1, pad=pd, pad_type=pt, strides=st, weight=guw, x=hn)[name=string("gu")];
-    tensor<fp16, [1, {I}, 1, {S}]> gate = slice_by_index(begin=tensor<int32, [4]>([0,0,0,0]), end=tensor<int32, [4]>([1,{I},1,{S}]), x=gu)[name=string("gate")];
-    tensor<fp16, [1, {I}, 1, {S}]> up = slice_by_index(begin=tensor<int32, [4]>([0,{I},0,0]), end=tensor<int32, [4]>([1,{2*I},1,{S}]), x=gu)[name=string("up")];
-    tensor<fp16, [1, {I}, 1, {S}]> ng = mul(x=gate, y=fp16(-0x1p+0))[name=string("ng")];
-    tensor<fp16, [1, {I}, 1, {S}]> eg = exp(x=ng)[name=string("eg")];
-    tensor<fp16, [1, {I}, 1, {S}]> gd = add(x=eg, y=fp16(0x1p+0))[name=string("gd")];
-    tensor<fp16, [1, {I}, 1, {S}]> gs = real_div(x=gate, y=gd)[name=string("gs")];
-    tensor<fp16, [1, {I}, 1, {S}]> act = mul(x=gs, y=up)[name=string("act")];
+{down_decl}
+    tensor<fp16, [1, {I}, 1, {S}]> act = identity(x=x)[name=string("act")];
 {down_body}
-    tensor<fp16, [1, {H}, 1, {S}]> {'o0' if self.has_next else 'y'} = add(x=h, y=mlp)[name=string("{'o0' if self.has_next else 'y'}")];
-{next_body}
-  }} -> ({'y, y2' if self.has_next else 'y'});
+    tensor<fp16, [1, {H}, 1, {S}]> y = identity(x=mlp)[name=string("y")];
+  }} -> (y);
 }}
-// pure_ane_gdn_tail_layer{layer}_int{bits}_down{down_proj_parts}
+// pure_ane_gdn_down_layer{layer}_int{bits}_down{down_proj_parts}
 '''
-        capture = io.StringIO()
-        t0 = time.time()
-        with contextlib.redirect_stdout(capture), contextlib.redirect_stderr(capture):
-            self.program = driver.engine.compile_multiproc(
-                mil, blobs, self.input, H, S,
-                raw_weight_files=raw_weight_files
+        self.down_program = _compile_ane_program(
+            driver, down_mil, down_blobs, I, H, S,
+            raw_weight_files=down_raw,
+            error="ANE GDN MLP-down compile failed"
+        )
+
+        self.next_program = None
+        if self.has_next:
+            next_blobs = {
+                "norm.bin": checkpoint.tensor(next_norm_name, np.float16).tobytes(),
+                "mean.bin": np.full((1, H), 1 / H, np.float16).tobytes(),
+            }
+            next_infos = [checkpoint.info(name) for name in next_projection_names]
+            if any(info.shape[1] != H for info in next_infos):
+                raise ValueError("next projection input dimensions do not match")
+            self.next_output = sum(info.shape[0] for info in next_infos)
+            parts = [_quantize_matrix(checkpoint, name, "p", bits)
+                     for name in next_projection_names]
+            next_blobs["p.bin"] = b"".join(part["p.bin"] for part in parts)
+            if bits != 16:
+                next_blobs["ps.bin"] = b"".join(part["ps.bin"] for part in parts)
+            next_norm = _conv_rms_block(
+                "x", "n", H, S, "nw", "mw", f"nx{layer}_", scale=2.0
             )
-        if self.program is None:
-            tail = "\n".join(capture.getvalue().strip().splitlines()[-10:])
-            raise RuntimeError(f"ANE GDN tail compile failed:\n{tail}")
-        driver.engine._ensure_io(self.program)
-        if self.has_next:self.next_surface,self.request=_bind_secondary_output(driver,self.program,self.next_output,self.width)
-        self.nbytes = sum(len(x) for x in blobs.values())
+            next_mil = f'''program(1.3)
+{driver.module._BUILD_INFO}
+{{
+  func main<ios18>(tensor<fp16, [1, {H}, 1, {S}]> x) {{
+    string pt = const()[name=string("pt"), val=string("valid")];
+    tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+    tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+    tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+    int32 gr = const()[name=string("gr"), val=int32(1)];
+{_dense_decl("p", self.next_output, H, bits)}
+    tensor<fp16, [1, {H}, 1, 1]> nw = const()[name=string("nw"), val=tensor<fp16, [1, {H}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/norm.bin"), offset=uint64(64)))];
+    tensor<fp16, [1, {H}, 1, 1]> mw = const()[name=string("mw"), val=tensor<fp16, [1, {H}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/mean.bin"), offset=uint64(64)))];
+{next_norm}
+    tensor<fp16, [1, {self.next_output}, 1, {S}]> y = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=pw, x=n)[name=string("y")];
+  }} -> (y);
+}}
+// pure_ane_gdn_next_layer{layer}_int{bits}
+'''
+            self.next_program = _compile_ane_program(
+                driver, next_mil, next_blobs, H, self.next_output, S,
+                error="ANE GDN next-projection compile failed"
+            )
+
+        self.programs = [self.out_program, self.up_program, self.down_program]
+        if self.next_program is not None:
+            self.programs.append(self.next_program)
+        self.program = self.out_program
+        self.nbytes = (
+            sum(len(x) for x in out_blobs.values())
+            + sum(len(x) for x in mux_blobs.values())
+            + sum(len(x) for x in down_blobs.values())
+        )
         self.compile_seconds = time.time() - t0
         assert_standalone("GDN tail compile")
+
+    def _submit(self, program, name: str) -> None:
+        if not self.driver.engine.submit(program, procedure_index=0):
+            raise RuntimeError(f"ANE GDN {name} submission failed")
 
     def __call__(self, core: np.ndarray, z: np.ndarray,
                  residual: np.ndarray) -> np.ndarray:
@@ -1296,25 +1455,66 @@ class AneGdnTail:
         residual, rlanes = _lane_matrix(residual, self.H, self.active_lanes)
         if zlanes != lanes or rlanes != lanes:
             raise ValueError("GDN tail lane counts differ")
+        core_f = core.astype(np.float32).reshape(48, 128, lanes) / 64.0
+        gn = self.gate_norm.astype(np.float32).reshape(48, 128, 1)
+        cn = core_f / np.sqrt(np.mean(core_f * core_f, axis=1, keepdims=True) + 1e-6) * gn
+        zw = z.astype(np.float32).reshape(48, 128, lanes)
+        gated = (cn * (zw / (1.0 + np.exp(-zw)))).reshape(self.Dc, lanes).astype(np.float16)
         with self.driver.view(
-            self.program._in_surf, (self.input, self.width), np.float16
+            self.out_program._in_surf, (self.input, self.width), np.float16
         ) as dst:
             dst[:] = 0
-            dst[:self.Dc, :lanes] = core
-            dst[self.Dc:2*self.Dc, :lanes] = z
-            dst[2*self.Dc:, :lanes] = residual
-        if self.has_next:_submit_bound(self.driver,self.program,self.request)
-        elif not self.driver.engine.submit(self.program, procedure_index=0):raise RuntimeError("ANE GDN tail submission failed")
+            dst[:self.Dc, :lanes] = gated
+            dst[self.Dc:, :lanes] = residual
+        self._submit(self.out_program, "out_proj")
         with self.driver.view(
-            self.program._out_surf, (self.H, self.width), np.float16
+            self.out_program._out_surf, (self.H, self.width), np.float16
         ) as src:
-            out = np.array(src[:, :lanes], np.float16)
-        if self.has_next:
-            with self.driver.view(self.next_surface,(self.next_output,self.width),np.float16) as src:nxt=np.array(src[:,:lanes],np.float16)
+            hidden = np.array(src[:, :lanes], np.float16)
+        h = hidden.astype(np.float32)
+        pn = self.post_norm.astype(np.float32).reshape(-1, 1)
+        hn = (h / np.sqrt(np.mean(h * h, axis=0, keepdims=True) + 1e-6) * pn).astype(np.float16)
+        with self.driver.view(
+            self.up_program._in_surf, (self.H, self.width), np.float16
+        ) as dst:
+            dst[:] = 0
+            dst[:, :lanes] = hn
+        self._submit(self.up_program, "mlp-mux")
+        with self.driver.view(
+            self.up_program._out_surf, (2 * self.I, self.width), np.float16
+        ) as src:
+            mux = np.array(src[:, :lanes], np.float32)
+        gate, upp = mux[:self.I], mux[self.I:]
+        act = (gate / (1.0 + np.exp(-gate)) * upp).astype(np.float16)
+        with self.driver.view(
+            self.down_program._in_surf, (self.I, self.width), np.float16
+        ) as dst:
+            dst[:] = 0
+            dst[:, :lanes] = act
+        self._submit(self.down_program, "mlp-down")
+        with self.driver.view(
+            self.down_program._out_surf, (self.H, self.width), np.float16
+        ) as src:
+            mlp = np.array(src[:, :lanes], np.float16)
+        out = (hidden.astype(np.float32) + mlp.astype(np.float32)).astype(np.float16)
+        nxt = None
+        if self.next_program is not None:
+            with self.driver.view(
+                self.next_program._in_surf, (self.H, self.width), np.float16
+            ) as dst:
+                dst[:] = 0
+                dst[:, :lanes] = out
+            self._submit(self.next_program, "next")
+            with self.driver.view(
+                self.next_program._out_surf, (self.next_output, self.width), np.float16
+            ) as src:
+                nxt = np.array(src[:, :lanes], np.float16)
         assert_standalone("GDN tail dispatch")
-        out=_restore_lane_rank(out,lanes)
-        if self.has_next:nxt=_restore_lane_rank(nxt,lanes)
-        return (out,nxt) if self.has_next else out
+        out = _restore_lane_rank(out, lanes)
+        if self.has_next:
+            nxt = _restore_lane_rank(nxt, lanes)
+            return out, nxt
+        return out
 
 
 class AneAttentionPrepare:
@@ -1776,6 +1976,9 @@ class AneAttentionPrepareDynamic:
         self.identity=np.eye(256,dtype=np.float16)
         self.rotations:dict[int,np.ndarray]={}
         self.rotation_order:list[int]=[]
+        self.host = os.environ.get("Q38_ANE_HOST_PREPARE", "1") not in (
+            "0", "", "false", "False"
+        )
     def _rotation(self,pos:int)->np.ndarray:
         if not 0<=pos<self.positions:
             raise RuntimeError(
@@ -1792,10 +1995,37 @@ class AneAttentionPrepareDynamic:
             old=self.rotation_order.pop(0);del self.rotations[old]
         return r
     def run(self,q,k,pos,qw,kw):
+        if self.host:
+            return self._host_run(q,k,pos,qw,kw)
         with self.driver.view(self.program._in_surf,(286,256),np.float16) as d:d[:24]=q;d[24:28]=k;d[28]=qw;d[29]=kw;d[30:]=self._rotation(pos)
         if not self.driver.engine.submit(self.program):raise RuntimeError("dynamic attention prepare submit failed")
         with self.driver.view(self.program._out_surf,(28,256),np.float16) as o:y=np.array(o,np.float16)
         return y[:24],y[24:]
+
+    def _host_run(self,q,k,pos,qw,kw):
+        """RMSNorm + partial RoPE in NumPy.
+
+        Prefill submits this graph once per attention position (~0.18 ms, 8%
+        of TTFT at 16-wide). The arithmetic is 24+4 RMS rows and a 64-dim
+        rotate; cheaper on the host than an ANE round-trip.
+        """
+        return (
+            self._host_rms_rope(q, qw, pos),
+            self._host_rms_rope(k, kw, pos),
+        )
+
+    @staticmethod
+    def _host_rms_rope(x, weight, pos):
+        x32 = np.asarray(x, np.float32)
+        rms = np.sqrt(np.mean(x32 * x32, axis=-1, keepdims=True) + 1e-6)
+        n = x32 / rms * np.asarray(weight, np.float32)
+        co, si = AneAttentionPrepare.rope_table(pos)
+        co = co.astype(np.float32)
+        si = si.astype(np.float32)
+        a, b = n[:, :32].copy(), n[:, 32:64].copy()
+        n[:, :32] = a * co - b * si
+        n[:, 32:64] = a * si + b * co
+        return n.astype(np.float16)
 
 
 class _DynamicPrepareLayer:
@@ -1845,9 +2075,20 @@ class AneAttentionCore:
             tail = "\n".join(capture.getvalue().strip().splitlines()[-10:])
             raise RuntimeError(f"ANE attention core compile failed:\n{tail}")
         driver.engine._ensure_io(self.program)
+        with self.driver.view(self.program._in_surf, (C, D), np.float16) as dst:
+            dst[:] = 0
         self.keys = np.zeros((K, L, D), np.float16)
         self.values = np.zeros((K, L, D), np.float16)
         self.offset = 0
+        self.batched_T = 0
+        self.batched_program = None
+        self.batched_input = 0
+        want = os.environ.get("Q38_ANE_BATCH_ATTN", "16")
+        if want not in ("0", "", "false", "False"):
+            self.batched_T = 16 if want in ("1", "true", "True") else int(want)
+            if self.batched_T < 2:
+                raise ValueError("Q38_ANE_BATCH_ATTN must be 0 or >= 2")
+            self._compile_batched()
         assert_standalone("attention core compile")
 
     def reset(self) -> None:
@@ -1855,12 +2096,122 @@ class AneAttentionCore:
         self.values[:] = 0
         self.offset = 0
 
+    def _compile_batched(self) -> None:
+        """One softmax over T queries against the same KV cache.
+
+        Prefill still loops prepare+core per lane. The core submit copies the
+        full 256-token cache each time; collapsing 16 queries into one
+        dispatch is the 22% TTFT term. T is padded to batched_T.
+        """
+        T, H, K, D, L = self.batched_T, self.Hq, self.Hkv, self.D, self.L
+        QH = T * H
+        C = QH + 2 * K * L + QH
+        k0, k1 = QH, QH + K * L
+        v0, v1 = k1, k1 + K * L
+        m0 = v1
+        mil = f'''program(1.3)
+{self.driver.module._BUILD_INFO}
+{{
+  func main<ios18>(tensor<fp16, [1, {C}, 1, {D}]> x) {{
+    tensor<fp16, [1, {QH}, 1, {D}]> q4 = slice_by_index(begin=tensor<int32, [4]>([0,0,0,0]), end=tensor<int32, [4]>([1,{QH},1,{D}]), x=x)[name=string("q4")];
+    tensor<fp16, [1, {K*L}, 1, {D}]> kf = slice_by_index(begin=tensor<int32, [4]>([0,{k0},0,0]), end=tensor<int32, [4]>([1,{k1},1,{D}]), x=x)[name=string("kf")];
+    tensor<fp16, [1, {K*L}, 1, {D}]> vf = slice_by_index(begin=tensor<int32, [4]>([0,{v0},0,0]), end=tensor<int32, [4]>([1,{v1},1,{D}]), x=x)[name=string("vf")];
+    tensor<fp16, [1, {QH}, 1, {L}]> mask = slice_by_index(begin=tensor<int32, [4]>([0,{m0},0,0]), end=tensor<int32, [4]>([1,{m0+QH},1,{L}]), x=x)[name=string("mask")];
+    tensor<fp16, [1, {K}, {T*(H//K)}, {D}]> q = reshape(shape=tensor<int32, [4]>([1,{K},{T*(H//K)},{D}]), x=q4)[name=string("q")];
+    tensor<fp16, [1, {K}, {L}, {D}]> k = reshape(shape=tensor<int32, [4]>([1,{K},{L},{D}]), x=kf)[name=string("k")];
+    tensor<fp16, [1, {K}, {L}, {D}]> v = reshape(shape=tensor<int32, [4]>([1,{K},{L},{D}]), x=vf)[name=string("v")];
+    tensor<fp16, [1, {K}, {T*(H//K)}, {L}]> rawg = matmul(transpose_x=bool(false), transpose_y=bool(true), x=q, y=k)[name=string("rawg")];
+    tensor<fp16, [1, {QH}, 1, {L}]> raw = reshape(shape=tensor<int32, [4]>([1,{QH},1,{L}]), x=rawg)[name=string("raw")];
+    tensor<fp16, [1, {QH}, 1, {L}]> scaled = mul(x=raw, y=fp16(0x1p-4))[name=string("scaled")];
+    tensor<fp16, [1, {QH}, 1, {L}]> scores = add(x=scaled, y=mask)[name=string("scores")];
+    tensor<fp16, [1, {QH}, 1, {L}]> prob = softmax(axis=int32(-1), x=scores)[name=string("prob")];
+    tensor<fp16, [1, {K}, {T*(H//K)}, {L}]> pg = reshape(shape=tensor<int32, [4]>([1,{K},{T*(H//K)},{L}]), x=prob)[name=string("pg")];
+    tensor<fp16, [1, {K}, {T*(H//K)}, {D}]> yg = matmul(transpose_x=bool(false), transpose_y=bool(false), x=pg, y=v)[name=string("yg")];
+    tensor<fp16, [1, {QH}, 1, {D}]> y = reshape(shape=tensor<int32, [4]>([1,{QH},1,{D}]), x=yg)[name=string("y")];
+  }} -> (y);
+}}
+// pure_ane_attention_L{L}_T{T}
+'''
+        capture = io.StringIO()
+        with contextlib.redirect_stdout(capture), contextlib.redirect_stderr(capture):
+            self.batched_program = self.driver.engine.compile_multiproc(mil, {}, C, QH, D)
+        if self.batched_program is None:
+            tail = "\n".join(capture.getvalue().strip().splitlines()[-10:])
+            raise RuntimeError(f"ANE batched attention compile failed:\n{tail}")
+        self.driver.engine._ensure_io(self.batched_program)
+        self.batched_input = C
+
+    def _pack_queries(self, qs: np.ndarray) -> np.ndarray:
+        T = qs.shape[0]
+        packed = np.zeros((self.Hkv, self.batched_T * (self.Hq // self.Hkv), self.D), np.float16)
+        for t in range(T):
+            packed[:, t * 6:(t + 1) * 6] = qs[t].reshape(self.Hkv, self.Hq // self.Hkv, self.D)
+        return packed.reshape(-1, self.D)
+
+    def _unpack_queries(self, packed: np.ndarray, T: int) -> np.ndarray:
+        grouped = packed.reshape(self.Hkv, self.batched_T * (self.Hq // self.Hkv), self.D)
+        out = np.empty((T, self.Hq, self.D), np.float16)
+        for t in range(T):
+            out[t] = grouped[:, t * 6:(t + 1) * 6].reshape(self.Hq, self.D)
+        return out
+
+    def _run_batched(self, qs: np.ndarray, start: int) -> np.ndarray:
+        T = qs.shape[0]
+        QH = self.batched_T * self.Hq
+        packed = self._pack_queries(qs)
+        grouped_mask = np.zeros(
+            (self.Hkv, self.batched_T * (self.Hq // self.Hkv), self.L), np.float16
+        )
+        for t in range(self.batched_T):
+            valid = start + t + 1 if t < T else 0
+            row = np.zeros(self.L, np.float16)
+            row[max(valid, 0):] = np.float16(-1e4)
+            grouped_mask[:, t * 6:(t + 1) * 6] = row
+        with self.driver.view(
+            self.batched_program._in_surf, (self.batched_input, self.D), np.float16
+        ) as dst:
+            dst[:] = 0
+            dst[:QH] = packed
+            p = QH
+            dst[p:p + self.Hkv * self.L] = self.keys.reshape(-1, self.D); p += self.Hkv * self.L
+            dst[p:p + self.Hkv * self.L] = self.values.reshape(-1, self.D); p += self.Hkv * self.L
+            dst[p:p + QH] = grouped_mask.reshape(-1, self.L)
+        if not self.driver.engine.submit(self.batched_program):
+            raise RuntimeError("ANE batched attention submission failed")
+        with self.driver.view(
+            self.batched_program._out_surf, (QH, self.D), np.float16
+        ) as src:
+            return self._unpack_queries(np.array(src, np.float16), T)
+
+    def call_many(self, qs: np.ndarray, ks: np.ndarray, vs: np.ndarray) -> np.ndarray:
+        T = int(qs.shape[0])
+        if T < 1:
+            raise ValueError("call_many requires at least one query")
+        start = self.offset
+        if start + T > self.L:
+            raise RuntimeError(f"attention cache exceeds direct limit {self.L}")
+        for t in range(T):
+            self.keys[:, start + t] = ks[t]
+            self.values[:, start + t] = vs[t]
+        if self.batched_program is not None and T <= self.batched_T:
+            out = self._run_batched(qs, start)
+            self.offset = start + T
+            return out
+        outs = np.empty((T, self.Hq, self.D), np.float16)
+        self.offset = start
+        for t in range(T):
+            outs[t] = self.__call__(qs[t], ks[t], vs[t])
+        return outs
+
     def fork_cache(self) -> "AneAttentionCore":
         """Share the loaded program while giving another layer its own KV cache."""
         other=object.__new__(AneAttentionCore)
         other.driver=self.driver
         other.Hq,other.Hkv,other.D,other.L=(self.Hq,self.Hkv,self.D,self.L)
         other.input=self.input; other.program=self.program
+        other.batched_T=self.batched_T
+        other.batched_program=self.batched_program
+        other.batched_input=self.batched_input
         other.keys=np.zeros_like(self.keys); other.values=np.zeros_like(self.values)
         other.offset=0
         return other
@@ -1874,11 +2225,11 @@ class AneAttentionCore:
         with self.driver.view(
             self.program._in_surf, (self.input, self.D), np.float16
         ) as dst:
-            dst[:] = 0
             dst[:self.Hq] = q
             p = self.Hq
             dst[p:p+self.Hkv*self.L] = self.keys.reshape(-1, self.D); p += self.Hkv*self.L
             dst[p:p+self.Hkv*self.L] = self.values.reshape(-1, self.D); p += self.Hkv*self.L
+            dst[p, :valid] = 0
             dst[p, valid:self.L] = np.float16(-1e4)
         if not self.driver.engine.submit(self.program, procedure_index=0):
             raise RuntimeError("ANE attention submission failed")
@@ -2068,6 +2419,9 @@ class AneLongContextAttentionCore:
         self.capacity=-(-length//block)*block
         direct=AneAttentionCore(driver,block)
         self.direct_program=direct.program;self.direct_input=direct.input
+        self.batched_T=direct.batched_T
+        self.batched_program=direct.batched_program
+        self.batched_input=direct.batched_input
         H,K,D,B=self.Hq,self.Hkv,self.D,self.B
         self.input=H+2*K*B+1;C=self.input
         k0,k1=H,H+K*B;v0,v1=k1,k1+K*B;m0=v1
@@ -2124,6 +2478,8 @@ class AneLongContextAttentionCore:
                      for n in group_sizes}
         self.programs=[self.direct_program,self.program,self.combine.program]
         self.programs.extend(group.program for group in self.groups.values())
+        if self.batched_program is not None:
+            self.programs.append(self.batched_program)
         self.blocks=self.capacity//B
         # Block-major makes every 256-token K/V submission contiguous.  At
         # 256K this avoids materializing a strided copy for every KV head and
@@ -2142,7 +2498,8 @@ class AneLongContextAttentionCore:
         other=object.__new__(AneLongContextAttentionCore)
         for name in ("driver","Hq","Hkv","D","L","B","capacity","blocks",
                      "direct_program","direct_input","input","program",
-                     "combine","groups","programs"):
+                     "combine","groups","programs",
+                     "batched_T","batched_program","batched_input"):
             setattr(other,name,getattr(self,name))
         # np.zeros_like eagerly faults these multi-GiB arrays on macOS. Fresh
         # calloc-backed arrays preserve sparse virtual allocation until a KV
@@ -2151,6 +2508,64 @@ class AneLongContextAttentionCore:
         other.values=np.zeros(self.values.shape,self.values.dtype)
         other.offset=0
         return other
+
+    def _run_direct_many(self, qs: np.ndarray, start: int) -> np.ndarray:
+        T = qs.shape[0]
+        QH = self.batched_T * self.Hq
+        packed = np.zeros((self.Hkv, self.batched_T * (self.Hq // self.Hkv), self.D), np.float16)
+        grouped_mask = np.zeros(
+            (self.Hkv, self.batched_T * (self.Hq // self.Hkv), self.B), np.float16
+        )
+        for t in range(T):
+            packed[:, t * 6:(t + 1) * 6] = qs[t].reshape(self.Hkv, self.Hq // self.Hkv, self.D)
+        for t in range(self.batched_T):
+            valid = start + t + 1 if t < T else 0
+            row = np.zeros(self.B, np.float16)
+            row[max(valid, 0):] = np.float16(-1e4)
+            grouped_mask[:, t * 6:(t + 1) * 6] = row
+        with self.driver.view(
+            self.batched_program._in_surf, (self.batched_input, self.D), np.float16
+        ) as dst:
+            dst[:] = 0
+            dst[:QH] = packed.reshape(-1, self.D)
+            p = QH
+            dst[p:p + self.Hkv * self.B] = self.keys[0].reshape(-1, self.D); p += self.Hkv * self.B
+            dst[p:p + self.Hkv * self.B] = self.values[0].reshape(-1, self.D); p += self.Hkv * self.B
+            dst[p:p + QH] = grouped_mask.reshape(-1, self.B)
+        if not self.driver.engine.submit(self.batched_program):
+            raise RuntimeError("ANE batched direct attention submission failed")
+        with self.driver.view(
+            self.batched_program._out_surf, (QH, self.D), np.float16
+        ) as src:
+            grouped = np.array(src, np.float16).reshape(
+                self.Hkv, self.batched_T * (self.Hq // self.Hkv), self.D
+            )
+            out = np.empty((T, self.Hq, self.D), np.float16)
+            for t in range(T):
+                out[t] = grouped[:, t * 6:(t + 1) * 6].reshape(self.Hq, self.D)
+            return out
+
+    def call_many(self, qs: np.ndarray, ks: np.ndarray, vs: np.ndarray) -> np.ndarray:
+        T = int(qs.shape[0])
+        start = self.offset
+        end = start + T
+        if end > self.L:
+            raise RuntimeError(f"attention cache exceeds configured limit {self.L}")
+        for t in range(T):
+            block_index, token_index = divmod(start + t, self.B)
+            self.keys[block_index, :, token_index] = ks[t]
+            self.values[block_index, :, token_index] = vs[t]
+        if (self.batched_program is not None and T <= self.batched_T
+                and start < self.B and end <= self.B):
+            out = self._run_direct_many(qs, start)
+            self.offset = end
+            assert_standalone("long-context batched attention dispatch")
+            return out
+        outs = np.empty((T, self.Hq, self.D), np.float16)
+        self.offset = start
+        for t in range(T):
+            outs[t] = self.__call__(qs[t], ks[t], vs[t])
+        return outs
 
     def _run_direct(self,q:np.ndarray,valid:int)->np.ndarray:
         with self.driver.view(
@@ -2219,7 +2634,7 @@ class AneLongContextAttentionCore:
 
 
 class AneAttentionTail:
-    """Attention output gate through residual MLP in one ANE program."""
+    """Attention tail split like AneGdnTail: host gate/RMS/SiLU, ANE out/mux/down."""
 
     def __init__(self, driver: AneDriver, checkpoint: Checkpoint,
                  layer: int, bits: int = 4, width: int = 32,
@@ -2233,7 +2648,6 @@ class AneAttentionTail:
         self.width = max(32, width)
         self.active_lanes = active_lanes
         p = prefix or f"model.language_model.layers.{layer}"
-        label = tag or f"layer{layer}"
         names = {
             "o": f"{p}.self_attn.o_proj.weight",
             "g": f"{p}.mlp.gate_proj.weight",
@@ -2243,144 +2657,230 @@ class AneAttentionTail:
         oi, gi, ui, di = (checkpoint.info(names[k]) for k in ("o", "g", "u", "d"))
         self.H, self.Dc = oi.shape
         self.I = gi.shape[0]
-        self.input = 2*self.Dc + self.H
+        if gi.shape != ui.shape or gi.shape[1] != self.H or di.shape != (self.H, self.I):
+            raise ValueError(f"unexpected attention tail shapes at {p}")
         H, Dc, I, S = self.H, self.Dc, self.I, self.width
         self.down_proj_parts = down_proj_parts
-        blobs = {}
-        for key in ("o", "d"):
-            blobs.update(_quantize_matrix(checkpoint, names[key], key, bits))
-        gp = _quantize_matrix(checkpoint, names["g"], "gu", bits)
-        up = _quantize_matrix(checkpoint, names["u"], "gu", bits)
-        blobs["gu.bin"] = gp["gu.bin"] + up["gu.bin"]
-        if bits != 16:
-            blobs["gus.bin"] = gp["gus.bin"] + up["gus.bin"]
-        blobs["pn.bin"] = checkpoint.tensor(
+        self.input = Dc + H
+        self.post_norm = checkpoint.tensor(
             f"{p}.post_attention_layernorm.weight", np.float16
-        ).tobytes()
-        if (next_norm_name is None)!=(next_projection_names is None):
+        )
+        self.has_next = next_norm_name is not None
+        if (next_norm_name is None) != (next_projection_names is None):
             raise ValueError("next norm and projection must be supplied together")
-        self.has_next=next_norm_name is not None
-        self.next_output=0
-        if self.has_next:
-            blobs["next.bin"]=checkpoint.tensor(next_norm_name,np.float16).tobytes()
-            next_infos=[checkpoint.info(name) for name in next_projection_names]
-            if any(info.shape[1]!=H for info in next_infos):
-                raise ValueError("next projection input dimensions do not match")
-            self.next_output=sum(info.shape[0] for info in next_infos)
-            parts=[_quantize_matrix(checkpoint,name,"np",bits)
-                   for name in next_projection_names]
-            blobs["np.bin"]=b"".join(part["np.bin"] for part in parts)
-            if bits!=16:
-                blobs["nps.bin"]=b"".join(part["nps.bin"] for part in parts)
-        next_decl=(f'''    tensor<fp16, [1, {H}, 1, 1]> nnw = const()[name=string("nnw"), val=tensor<fp16, [1, {H}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/next.bin"), offset=uint64(64)))];
-{_dense_decl("np",self.next_output,H,bits)}''' if self.has_next else '')
-        post_norm = _stable_rms_block(
-            "h", "hn", H, S, "pn", f"ha{label}_", active_lanes
+        self.next_output = 0
+
+        out_blobs = _quantize_matrix(checkpoint, names["o"], "o", bits)
+        gp = _quantize_matrix(checkpoint, names["g"], "mux", bits)
+        up = _quantize_matrix(checkpoint, names["u"], "mux", bits)
+        mux_blobs = {"mux.bin": gp["mux.bin"] + up["mux.bin"]}
+        if bits != 16:
+            mux_blobs["muxs.bin"] = gp["muxs.bin"] + up["muxs.bin"]
+        down_blobs = _quantize_matrix(checkpoint, names["d"], "d", bits)
+        down_decl, down_body, down_raw = _packed_split_down_projection(
+            driver.module, down_blobs, H, I, S, bits, down_proj_parts
         )
-        next_norm = _stable_rms_block(
-            "o0", "nn", H, S, "nnw", f"na{label}_", active_lanes
-        )
-        next_body=(f'''    tensor<fp16, [1, {H}, 1, {S}]> y = identity(x=o0)[name=string("y")];
-{next_norm}
-    tensor<fp16, [1, {self.next_output}, 1, {S}]> y2 = conv(dilations=dl, groups=g1, pad=pd, pad_type=pt, strides=st, weight=npw, x=nn)[name=string("y2")];''' if self.has_next else '')
-        down_decl, down_body, raw_weight_files = _packed_split_down_projection(
-            driver.module, blobs, H, I, S, bits, down_proj_parts
-        )
-        decl = "\n".join((
-            _dense_decl("o", H, Dc, bits),
-            _dense_decl("gu", 2*I, H, bits),
-            down_decl,
-        ))
-        mil = f'''program(1.3)
+
+        t0 = time.time()
+        out_mil = f'''program(1.3)
 {driver.module._BUILD_INFO}
 {{
   func main<ios18>(tensor<fp16, [1, {self.input}, 1, {S}]> x) {{
+{_mil_conv_prelude(self.input, S)}
+{_dense_decl("o", H, Dc, bits)}
+    tensor<fp16, [1, {Dc}, 1, {S}]> gated = slice_by_index(begin=tensor<int32, [4]>([0,0,0,0]), end=tensor<int32, [4]>([1,{Dc},1,{S}]), x=x)[name=string("gated")];
+    tensor<fp16, [1, {H}, 1, {S}]> residual = slice_by_index(begin=tensor<int32, [4]>([0,{Dc},0,0]), end=tensor<int32, [4]>([1,{self.input},1,{S}]), x=x)[name=string("residual")];
+    tensor<fp16, [1, {H}, 1, {S}]> attn = conv(dilations=dl, groups=g1, pad=pd, pad_type=pt, strides=st, weight=ow, x=gated)[name=string("out_proj")];
+    tensor<fp16, [1, {H}, 1, {S}]> y = add(x=residual, y=attn)[name=string("y")];
+  }} -> (y);
+}}
+// pure_ane_attn_out_{tag or f"layer{layer}"}_int{bits}
+'''
+        self.out_program = _compile_ane_program(
+            driver, out_mil, out_blobs, self.input, H, S,
+            error="ANE attention out_proj compile failed"
+        )
+        mux_mil = f'''program(1.3)
+{driver.module._BUILD_INFO}
+{{
+  func main<ios18>(tensor<fp16, [1, {H}, 1, {S}]> x) {{
+    string pt = const()[name=string("pt"), val=string("valid")];
+    tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+    tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+    tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+    int32 gr = const()[name=string("gr"), val=int32(1)];
+{_dense_decl("mux", 2*I, H, bits)}
+    tensor<fp16, [1, {2*I}, 1, {S}]> y = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=muxw, x=x)[name=string("y")];
+  }} -> (y);
+}}
+// pure_ane_attn_mux_{tag or f"layer{layer}"}_int{bits}
+'''
+        self.up_program = _compile_ane_program(
+            driver, mux_mil, mux_blobs, H, 2 * I, S,
+            error="ANE attention MLP mux compile failed"
+        )
+        down_mil = f'''program(1.3)
+{driver.module._BUILD_INFO}
+{{
+  func main<ios18>(tensor<fp16, [1, {I}, 1, {S}]> x) {{
     string pt = const()[name=string("pt"), val=string("valid")];
     tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
     tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
     tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
     int32 g1 = const()[name=string("g1"), val=int32(1)];
-{decl}
-{next_decl}
-    tensor<fp16, [1, {H}, 1, 1]> pn = const()[name=string("pn"), val=tensor<fp16, [1, {H}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/pn.bin"), offset=uint64(64)))];
-    tensor<fp16, [1, {Dc}, 1, {S}]> core = slice_by_index(begin=tensor<int32, [4]>([0,0,0,0]), end=tensor<int32, [4]>([1,{Dc},1,{S}]), x=x)[name=string("core")];
-    tensor<fp16, [1, {Dc}, 1, {S}]> gate0 = slice_by_index(begin=tensor<int32, [4]>([0,{Dc},0,0]), end=tensor<int32, [4]>([1,{2*Dc},1,{S}]), x=x)[name=string("gate0")];
-    tensor<fp16, [1, {H}, 1, {S}]> residual = slice_by_index(begin=tensor<int32, [4]>([0,{2*Dc},0,0]), end=tensor<int32, [4]>([1,{self.input},1,{S}]), x=x)[name=string("residual")];
-    tensor<fp16, [1, {Dc}, 1, {S}]> ng0 = mul(x=gate0, y=fp16(-0x1p+0))[name=string("ng0")];
-    tensor<fp16, [1, {Dc}, 1, {S}]> eg0 = exp(x=ng0)[name=string("eg0")];
-    tensor<fp16, [1, {Dc}, 1, {S}]> gd0 = add(x=eg0, y=fp16(0x1p+0))[name=string("gd0")];
-    tensor<fp16, [1, {Dc}, 1, {S}]> gated = real_div(x=core, y=gd0)[name=string("gated")];
-    tensor<fp16, [1, {H}, 1, {S}]> attn = conv(dilations=dl, groups=g1, pad=pd, pad_type=pt, strides=st, weight=ow, x=gated)[name=string("out_proj")];
-    tensor<fp16, [1, {H}, 1, {S}]> h = add(x=residual, y=attn)[name=string("h")];
-{post_norm}
-    tensor<fp16, [1, {2*I}, 1, {S}]> gu = conv(dilations=dl, groups=g1, pad=pd, pad_type=pt, strides=st, weight=guw, x=hn)[name=string("gu")];
-    tensor<fp16, [1, {I}, 1, {S}]> gate = slice_by_index(begin=tensor<int32, [4]>([0,0,0,0]), end=tensor<int32, [4]>([1,{I},1,{S}]), x=gu)[name=string("gate")];
-    tensor<fp16, [1, {I}, 1, {S}]> up = slice_by_index(begin=tensor<int32, [4]>([0,{I},0,0]), end=tensor<int32, [4]>([1,{2*I},1,{S}]), x=gu)[name=string("up")];
-    tensor<fp16, [1, {I}, 1, {S}]> ng = mul(x=gate, y=fp16(-0x1p+0))[name=string("ng")];
-    tensor<fp16, [1, {I}, 1, {S}]> eg = exp(x=ng)[name=string("eg")];
-    tensor<fp16, [1, {I}, 1, {S}]> gd = add(x=eg, y=fp16(0x1p+0))[name=string("gd")];
-    tensor<fp16, [1, {I}, 1, {S}]> gs = real_div(x=gate, y=gd)[name=string("gs")];
-    tensor<fp16, [1, {I}, 1, {S}]> act = mul(x=gs, y=up)[name=string("act")];
+{down_decl}
+    tensor<fp16, [1, {I}, 1, {S}]> act = identity(x=x)[name=string("act")];
 {down_body}
-    tensor<fp16, [1, {H}, 1, {S}]> {'o0' if self.has_next else 'y'} = add(x=h, y=mlp)[name=string("{'o0' if self.has_next else 'y'}")];
-{next_body}
-  }} -> ({'y, y2' if self.has_next else 'y'});
+    tensor<fp16, [1, {H}, 1, {S}]> y = identity(x=mlp)[name=string("y")];
+  }} -> (y);
 }}
-// pure_ane_attention_tail_{label}_int{bits}_down{down_proj_parts}
+// pure_ane_attn_down_{tag or f"layer{layer}"}_int{bits}_down{down_proj_parts}
 '''
-        capture = io.StringIO(); t0 = time.time()
-        with contextlib.redirect_stdout(capture), contextlib.redirect_stderr(capture):
-            self.program = driver.engine.compile_multiproc(
-                mil, blobs, self.input, H, S,
-                raw_weight_files=raw_weight_files
+        self.down_program = _compile_ane_program(
+            driver, down_mil, down_blobs, I, H, S,
+            raw_weight_files=down_raw,
+            error="ANE attention MLP-down compile failed"
+        )
+        self.next_program = None
+        if self.has_next:
+            next_blobs = {
+                "norm.bin": checkpoint.tensor(next_norm_name, np.float16).tobytes(),
+                "mean.bin": np.full((1, H), 1 / H, np.float16).tobytes(),
+            }
+            next_infos = [checkpoint.info(name) for name in next_projection_names]
+            if any(info.shape[1] != H for info in next_infos):
+                raise ValueError("next projection input dimensions do not match")
+            self.next_output = sum(info.shape[0] for info in next_infos)
+            parts = [_quantize_matrix(checkpoint, name, "p", bits)
+                     for name in next_projection_names]
+            next_blobs["p.bin"] = b"".join(part["p.bin"] for part in parts)
+            if bits != 16:
+                next_blobs["ps.bin"] = b"".join(part["ps.bin"] for part in parts)
+            next_norm = _conv_rms_block(
+                "x", "n", H, S, "nw", "mw", f"na{layer}_", scale=2.0
             )
-        if self.program is None:
-            tail = "\n".join(capture.getvalue().strip().splitlines()[-10:])
-            raise RuntimeError(f"ANE attention tail compile failed:\n{tail}")
-        driver.engine._ensure_io(self.program)
-        if self.has_next:self.next_surface,self.request=_bind_secondary_output(driver,self.program,self.next_output,self.width)
-        self.nbytes = sum(len(x) for x in blobs.values())
-        self.compile_seconds = time.time()-t0
+            next_mil = f'''program(1.3)
+{driver.module._BUILD_INFO}
+{{
+  func main<ios18>(tensor<fp16, [1, {H}, 1, {S}]> x) {{
+    string pt = const()[name=string("pt"), val=string("valid")];
+    tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+    tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+    tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+    int32 gr = const()[name=string("gr"), val=int32(1)];
+{_dense_decl("p", self.next_output, H, bits)}
+    tensor<fp16, [1, {H}, 1, 1]> nw = const()[name=string("nw"), val=tensor<fp16, [1, {H}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/norm.bin"), offset=uint64(64)))];
+    tensor<fp16, [1, {H}, 1, 1]> mw = const()[name=string("mw"), val=tensor<fp16, [1, {H}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/mean.bin"), offset=uint64(64)))];
+{next_norm}
+    tensor<fp16, [1, {self.next_output}, 1, {S}]> y = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=pw, x=n)[name=string("y")];
+  }} -> (y);
+}}
+// pure_ane_attn_next_{tag or f"layer{layer}"}_int{bits}
+'''
+            self.next_program = _compile_ane_program(
+                driver, next_mil, next_blobs, H, self.next_output, S,
+                error="ANE attention next-projection compile failed"
+            )
+
+        self.programs = [self.out_program, self.up_program, self.down_program]
+        if self.next_program is not None:
+            self.programs.append(self.next_program)
+        self.program = self.out_program
+        self.nbytes = (
+            sum(len(x) for x in out_blobs.values())
+            + sum(len(x) for x in mux_blobs.values())
+            + sum(len(x) for x in down_blobs.values())
+        )
+        self.compile_seconds = time.time() - t0
         assert_standalone("attention tail compile")
+
+    def _submit(self, program, name: str) -> None:
+        if not self.driver.engine.submit(program, procedure_index=0):
+            raise RuntimeError(f"ANE attention {name} submission failed")
 
     def __call__(self, core: np.ndarray, gate: np.ndarray,
                  residual: np.ndarray) -> np.ndarray:
-        core=np.asarray(core,np.float16)
-        if core.ndim==3:
-            core=core.reshape(-1,core.shape[-1])
-        elif core.ndim==2 and core.shape==(24,256):
-            core=core.reshape(-1)
-        core,lanes=_lane_matrix(core,self.Dc,self.active_lanes)
-        gate=np.asarray(gate,np.float16)
-        if gate.ndim==3:gate=gate.reshape(-1,gate.shape[-1])
-        elif gate.ndim==2 and gate.shape==(24,256):gate=gate.reshape(-1)
-        gate,glanes=_lane_matrix(gate,self.Dc,self.active_lanes)
-        residual,rlanes=_lane_matrix(residual,self.H,self.active_lanes)
-        if glanes!=lanes or rlanes!=lanes:
+        core = np.asarray(core, np.float16)
+        if core.ndim == 3:
+            core = core.reshape(-1, core.shape[-1])
+        elif core.ndim == 2 and core.shape == (24, 256):
+            core = core.reshape(-1)
+        core, lanes = _lane_matrix(core, self.Dc, self.active_lanes)
+        gate = np.asarray(gate, np.float16)
+        if gate.ndim == 3:
+            gate = gate.reshape(-1, gate.shape[-1])
+        elif gate.ndim == 2 and gate.shape == (24, 256):
+            gate = gate.reshape(-1)
+        gate, glanes = _lane_matrix(gate, self.Dc, self.active_lanes)
+        residual, rlanes = _lane_matrix(residual, self.H, self.active_lanes)
+        if glanes != lanes or rlanes != lanes:
             raise ValueError("attention tail lane counts differ")
+        cf = core.astype(np.float32)
+        gf = gate.astype(np.float32)
+        gated = (cf / (1.0 + np.exp(-gf))).astype(np.float16)
         with self.driver.view(
-            self.program._in_surf, (self.input, self.width), np.float16
+            self.out_program._in_surf, (self.input, self.width), np.float16
         ) as dst:
-            dst[:]=0
-            dst[:self.Dc,:lanes]=core
-            dst[self.Dc:2*self.Dc,:lanes]=gate
-            dst[2*self.Dc:,:lanes]=residual
-        if self.has_next:_submit_bound(self.driver,self.program,self.request)
-        elif not self.driver.engine.submit(self.program, procedure_index=0):raise RuntimeError("ANE attention tail submission failed")
+            dst[:] = 0
+            dst[:self.Dc, :lanes] = gated
+            dst[self.Dc:, :lanes] = residual
+        self._submit(self.out_program, "out_proj")
         with self.driver.view(
-            self.program._out_surf, (self.H, self.width), np.float16
+            self.out_program._out_surf, (self.H, self.width), np.float16
         ) as src:
-            out = np.array(src[:, :lanes], np.float16)
-        if self.has_next:
-            with self.driver.view(self.next_surface,(self.next_output,self.width),np.float16) as src:nxt=np.array(src[:,:lanes],np.float16)
+            hidden = np.array(src[:, :lanes], np.float16)
+        h = hidden.astype(np.float32)
+        pn = self.post_norm.astype(np.float32).reshape(-1, 1)
+        hn = (h / np.sqrt(np.mean(h * h, axis=0, keepdims=True) + 1e-6) * pn).astype(np.float16)
+        with self.driver.view(
+            self.up_program._in_surf, (self.H, self.width), np.float16
+        ) as dst:
+            dst[:] = 0
+            dst[:, :lanes] = hn
+        self._submit(self.up_program, "mlp-mux")
+        with self.driver.view(
+            self.up_program._out_surf, (2 * self.I, self.width), np.float16
+        ) as src:
+            mux = np.array(src[:, :lanes], np.float32)
+        gt0, upp = mux[:self.I], mux[self.I:]
+        act = (gt0 / (1.0 + np.exp(-gt0)) * upp).astype(np.float16)
+        with self.driver.view(
+            self.down_program._in_surf, (self.I, self.width), np.float16
+        ) as dst:
+            dst[:] = 0
+            dst[:, :lanes] = act
+        self._submit(self.down_program, "mlp-down")
+        with self.driver.view(
+            self.down_program._out_surf, (self.H, self.width), np.float16
+        ) as src:
+            mlp = np.array(src[:, :lanes], np.float16)
+        out = (hidden.astype(np.float32) + mlp.astype(np.float32)).astype(np.float16)
+        nxt = None
+        if self.next_program is not None:
+            with self.driver.view(
+                self.next_program._in_surf, (self.H, self.width), np.float16
+            ) as dst:
+                dst[:] = 0
+                dst[:, :lanes] = out
+            self._submit(self.next_program, "next")
+            with self.driver.view(
+                self.next_program._out_surf, (self.next_output, self.width), np.float16
+            ) as src:
+                nxt = np.array(src[:, :lanes], np.float16)
         assert_standalone("attention tail dispatch")
-        out=_restore_lane_rank(out,lanes)
-        if self.has_next:nxt=_restore_lane_rank(nxt,lanes)
-        return (out,nxt) if self.has_next else out
+        out = _restore_lane_rank(out, lanes)
+        if self.has_next:
+            nxt = _restore_lane_rank(nxt, lanes)
+            return out, nxt
+        return out
 
 
 class AneFinalHead:
-    """Final RMSNorm and vocabulary projection, chunked across four programs."""
+    """Final RMSNorm (host) and vocabulary projection, chunked across ANE programs.
+
+    macOS 27 rejects ``_stable_rms_block`` fused with these vocab chunks, so
+    RMS stays on the host and each chunk is a single int4 conv.
+    """
 
     def __init__(self, driver: AneDriver, checkpoint: Checkpoint,
                  bits: int = 4, chunks: int = 4, width: int = 32,
@@ -2400,38 +2900,28 @@ class AneFinalHead:
             v1 = min(self.V, v0+step)
             O = v1-v0
             blobs = _quantize_matrix(
-                checkpoint, head_name, "h", bits,
+                checkpoint, head_name, "p", bits,
                 row_start=v0, row_end=v1
-            )
-            decl = _dense_decl("h", O, H, bits)
-            norm_body = _stable_rms_block(
-                "hidden", "n", H, S, "nw", f"fh{ci}_", active_lanes
             )
             mil = f'''program(1.3)
 {driver.module._BUILD_INFO}
 {{
-  func main<ios18>(tensor<fp16, [1, {2*H}, 1, {S}]> x) {{
+  func main<ios18>(tensor<fp16, [1, {H}, 1, {S}]> x) {{
     string pt = const()[name=string("pt"), val=string("valid")];
     tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
     tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
     tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
-    int32 g1 = const()[name=string("g1"), val=int32(1)];
-{decl}
-    tensor<fp16, [1, {H}, 1, {S}]> hidden = slice_by_index(begin=tensor<int32, [4]>([0,0,0,0]), end=tensor<int32, [4]>([1,{H},1,{S}]), x=x)[name=string("hidden")];
-    tensor<fp16, [1, {H}, 1, 1]> nw = slice_by_index(begin=tensor<int32, [4]>([0,{H},0,0]), end=tensor<int32, [4]>([1,{2*H},1,1]), x=x)[name=string("nw")];
-{norm_body}
-    tensor<fp16, [1, {O}, 1, {S}]> y = conv(dilations=dl, groups=g1, pad=pd, pad_type=pt, strides=st, weight=hw, x=n)[name=string("head{ci}")];
+    int32 gr = const()[name=string("gr"), val=int32(1)];
+{_dense_decl("p", O, H, bits)}
+    tensor<fp16, [1, {O}, 1, {S}]> y = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=pw, x=x)[name=string("y")];
   }} -> (y);
 }}
 // pure_ane_final_head_{ci}_int{bits}
 '''
-            capture=io.StringIO()
-            with contextlib.redirect_stdout(capture), contextlib.redirect_stderr(capture):
-                program=driver.engine.compile_multiproc(mil,blobs,2*H,O,S)
-            if program is None:
-                tail="\n".join(capture.getvalue().strip().splitlines()[-8:])
-                raise RuntimeError(f"ANE final head chunk {ci} failed:\n{tail}")
-            driver.engine._ensure_io(program)
+            program = _compile_ane_program(
+                driver, mil, blobs, H, O, S,
+                error=f"ANE final head chunk {ci} failed"
+            )
             self.programs.append(program); self.spans.append((v0,v1))
             self.nbytes += sum(len(x) for x in blobs.values())
             driver.discard_compiler_files(program)
@@ -2442,12 +2932,15 @@ class AneFinalHead:
         hidden,lanes=_lane_matrix(hidden,self.H,self.active_lanes)
         nw=self.norm if norm_weight is None else np.asarray(norm_weight,np.float16)
         if nw.shape!=(self.H,):raise ValueError(f"bad final norm shape {nw.shape}")
+        h=hidden.astype(np.float32)
+        n=h/np.sqrt(np.mean(h*h,axis=0,keepdims=True)+1e-6)*nw.astype(np.float32).reshape(-1,1)
+        n=n.astype(np.float16)
         logits=np.empty((self.V,lanes),np.float32)
         for program,(v0,v1) in zip(self.programs,self.spans):
             with self.driver.view(
-                program._in_surf,(2*self.H,self.width),np.float16
+                program._in_surf,(self.H,self.width),np.float16
             ) as dst:
-                dst[:]=0;dst[:self.H,:lanes]=hidden;dst[self.H:,0]=nw
+                dst[:,:lanes]=n
             if not self.driver.engine.submit(program,procedure_index=0):
                 raise RuntimeError("ANE final head submission failed")
             with self.driver.view(
@@ -2459,64 +2952,98 @@ class AneFinalHead:
 
 
 class AneMtpFusion:
-    """MTP embedding/hidden RMSNorm and protected fp16 fusion projection."""
+    """MTP embedding/hidden RMSNorm and fc fusion.
+
+    macOS 27 Exclave accepts separate-file conv-RMS + two 5120×5120 fp16
+    convs (packed int4 5120×10240 is Code=10). Compile failure falls back
+    to the host GEMM path.
+    """
 
     def __init__(self,driver:AneDriver,checkpoint:Checkpoint,
                  width:int=32,active_lanes:int=3):
         self.driver=driver;self.width=max(32,width);self.active_lanes=active_lanes
         self.H=checkpoint.info("mtp.pre_fc_norm_hidden.weight").shape[0]
-        H,S=self.H,self.width
         fc=checkpoint.tensor("mtp.fc.weight",np.float16)
-        if fc.shape!=(H,2*H):raise ValueError(f"unexpected MTP fc {fc.shape}")
+        if fc.shape!=(self.H,2*self.H):raise ValueError(f"unexpected MTP fc {fc.shape}")
+        self.fc_e=np.ascontiguousarray(fc[:,:self.H],np.float16)
+        self.fc_h=np.ascontiguousarray(fc[:,self.H:],np.float16)
+        self.en=checkpoint.tensor("mtp.pre_fc_norm_embedding.weight",np.float16)
+        self.hn=checkpoint.tensor("mtp.pre_fc_norm_hidden.weight",np.float16)
+        self.program=None
+        self.nbytes=self.fc_e.nbytes+self.fc_h.nbytes+self.en.nbytes+self.hn.nbytes
+        if os.environ.get("Q38_ANE_MTP_FUSION","1")!="0":
+            self._compile(checkpoint)
+
+    def _compile(self,checkpoint:Checkpoint) -> None:
+        H,S=self.H,self.width
+        mean=np.full((1,H),np.float16(1/H)).tobytes()
         blobs={
-            "fce.bin":np.ascontiguousarray(fc[:,:H]).tobytes(),
-            "fch.bin":np.ascontiguousarray(fc[:,H:]).tobytes(),
-            "en.bin":checkpoint.tensor(
-                "mtp.pre_fc_norm_embedding.weight",np.float16
-            ).tobytes(),
-            "hn.bin":checkpoint.tensor(
-                "mtp.pre_fc_norm_hidden.weight",np.float16
-            ).tobytes(),
+            "mw.bin":mean,
+            "enw.bin":self.en.reshape(1,H,1,1).tobytes(),
+            "hnw.bin":self.hn.reshape(1,H,1,1).tobytes(),
+            "few.bin":self.fc_e.tobytes(),
+            "fhw.bin":self.fc_h.tobytes(),
         }
-        en=_stable_rms_block("e","enorm",H,S,"enw","mtpe_",active_lanes)
-        hn=_stable_rms_block("h","hnorm",H,S,"hnw","mtph_",active_lanes)
         mil=f'''program(1.3)
-{driver.module._BUILD_INFO}
+{self.driver.module._BUILD_INFO}
 {{
-  func main<ios18>(tensor<fp16,[1,{2*H},1,{S}]> x) {{
-    string pt=const()[name=string("pt"),val=string("valid")]; tensor<int32,[2]> st=const()[name=string("st"),val=tensor<int32,[2]>([1,1])]; tensor<int32,[4]> pd=const()[name=string("pd"),val=tensor<int32,[4]>([0,0,0,0])]; tensor<int32,[2]> dl=const()[name=string("dl"),val=tensor<int32,[2]>([1,1])]; int32 g=const()[name=string("g"),val=int32(1)];
-    tensor<fp16,[{H},{H},1,1]> few=const()[name=string("few"),val=tensor<fp16,[{H},{H},1,1]>(BLOBFILE(path=string("@model_path/weights/fce.bin"),offset=uint64(64)))];
-    tensor<fp16,[{H},{H},1,1]> fhw=const()[name=string("fhw"),val=tensor<fp16,[{H},{H},1,1]>(BLOBFILE(path=string("@model_path/weights/fch.bin"),offset=uint64(64)))];
-    tensor<fp16,[1,{H},1,1]> enw=const()[name=string("enw"),val=tensor<fp16,[1,{H},1,1]>(BLOBFILE(path=string("@model_path/weights/en.bin"),offset=uint64(64)))];
-    tensor<fp16,[1,{H},1,1]> hnw=const()[name=string("hnw"),val=tensor<fp16,[1,{H},1,1]>(BLOBFILE(path=string("@model_path/weights/hn.bin"),offset=uint64(64)))];
-    tensor<fp16,[1,{H},1,{S}]> e=slice_by_index(begin=tensor<int32,[4]>([0,0,0,0]),end=tensor<int32,[4]>([1,{H},1,{S}]),x=x)[name=string("e")];
-    tensor<fp16,[1,{H},1,{S}]> h=slice_by_index(begin=tensor<int32,[4]>([0,{H},0,0]),end=tensor<int32,[4]>([1,{2*H},1,{S}]),x=x)[name=string("h")];
-{en}
-{hn}
-    tensor<fp16,[1,{H},1,{S}]> ef=conv(dilations=dl,groups=g,pad=pd,pad_type=pt,strides=st,weight=few,x=enorm)[name=string("ef")];
-    tensor<fp16,[1,{H},1,{S}]> hf=conv(dilations=dl,groups=g,pad=pd,pad_type=pt,strides=st,weight=fhw,x=hnorm)[name=string("hf")];
-    tensor<fp16,[1,{H},1,{S}]> y=add(x=ef,y=hf)[name=string("y")];
+  func main<ios18>(tensor<fp16, [1, {2*H}, 1, {S}]> x) {{
+{_mil_conv_prelude(2*H,S)}
+    tensor<fp16, [1, {H}, 1, 1]> mw = const()[name=string("mw"), val=tensor<fp16, [1, {H}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/mw.bin"), offset=uint64(64)))];
+    tensor<fp16, [1, {H}, 1, 1]> enw = const()[name=string("enw"), val=tensor<fp16, [1, {H}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/enw.bin"), offset=uint64(64)))];
+    tensor<fp16, [1, {H}, 1, 1]> hnw = const()[name=string("hnw"), val=tensor<fp16, [1, {H}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/hnw.bin"), offset=uint64(64)))];
+    tensor<fp16, [{H}, {H}, 1, 1]> few = const()[name=string("few"), val=tensor<fp16, [{H}, {H}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/few.bin"), offset=uint64(64)))];
+    tensor<fp16, [{H}, {H}, 1, 1]> fhw = const()[name=string("fhw"), val=tensor<fp16, [{H}, {H}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/fhw.bin"), offset=uint64(64)))];
+    tensor<fp16, [1, {H}, 1, {S}]> pe = slice_by_index(begin=tensor<int32, [4]>([0,0,0,0]), end=tensor<int32, [4]>([1,{H},1,{S}]), x=x)[name=string("pe")];
+    tensor<fp16, [1, {H}, 1, {S}]> ph = slice_by_index(begin=tensor<int32, [4]>([0,{H},0,0]), end=tensor<int32, [4]>([1,{2*H},1,{S}]), x=x)[name=string("ph")];
+{_conv_rms_block("pe","enorm",H,S,"enw","mw","mtpe_",scale=2.0,groups="g1")}
+{_conv_rms_block("ph","hnorm",H,S,"hnw","mw","mtph_",scale=2.0,groups="g1")}
+    tensor<fp16, [1, {H}, 1, {S}]> ef = conv(dilations=dl, groups=g1, pad=pd, pad_type=pt, strides=st, weight=few, x=enorm)[name=string("ef")];
+    tensor<fp16, [1, {H}, 1, {S}]> hf = conv(dilations=dl, groups=g1, pad=pd, pad_type=pt, strides=st, weight=fhw, x=hnorm)[name=string("hf")];
+    tensor<fp16, [1, {H}, 1, {S}]> y = add(x=ef, y=hf)[name=string("y")];
   }} -> (y);
 }}
-// pure_ane_mtp_fusion_fp16
+// pure_mtp_fusion
 '''
         cap=io.StringIO()
-        with contextlib.redirect_stdout(cap),contextlib.redirect_stderr(cap):
-            self.program=driver.engine.compile_multiproc(mil,blobs,2*H,H,S)
+        with contextlib.redirect_stdout(cap), contextlib.redirect_stderr(cap):
+            self.program=self.driver.engine.compile_multiproc(
+                mil,blobs,2*H,H,S
+            )
         if self.program is None:
-            raise RuntimeError("MTP fusion compile failed:\n"+"\n".join(cap.getvalue().splitlines()[-10:]))
-        driver.engine._ensure_io(self.program);self.nbytes=sum(map(len,blobs.values()))
+            print("  MTP fusion ANE compile failed; using host GEMM",flush=True)
+            return
+        self.driver.engine._ensure_io(self.program)
+        self.nbytes=sum(len(x) for x in blobs.values())
+
+    @staticmethod
+    def _rms(x:np.ndarray,weight:np.ndarray)->np.ndarray:
+        x32=x.astype(np.float32,copy=False)
+        scale=np.sqrt(np.mean(x32*x32,axis=0,keepdims=True)+1e-6)
+        return (x32/scale*weight.astype(np.float32).reshape(-1,1))
 
     def __call__(self,embedding:np.ndarray,hidden:np.ndarray)->np.ndarray:
         embedding,lanes=_lane_matrix(embedding,self.H,self.active_lanes)
         hidden,hlanes=_lane_matrix(hidden,self.H,self.active_lanes)
         if hlanes!=lanes:raise ValueError("MTP fusion lane counts differ")
-        with self.driver.view(self.program._in_surf,(2*self.H,self.width),np.float16) as d:
-            d[:]=0;d[:self.H,:lanes]=embedding;d[self.H:,:lanes]=hidden
-        if not self.driver.engine.submit(self.program):raise RuntimeError("MTP fusion submit failed")
-        with self.driver.view(self.program._out_surf,(self.H,self.width),np.float16) as o:
-            out=np.array(o[:,:lanes],np.float16)
-        return _restore_lane_rank(out,lanes)
+        if self.program is not None:
+            with self.driver.view(
+                self.program._in_surf,(2*self.H,self.width),np.float16
+            ) as dst:
+                dst[:]=0
+                dst[:self.H,:lanes]=embedding
+                dst[self.H:,:lanes]=hidden
+            if not self.driver.engine.submit(self.program):
+                raise RuntimeError("ANE MTP fusion submit failed")
+            with self.driver.view(
+                self.program._out_surf,(self.H,self.width),np.float16
+            ) as src:
+                out=np.array(src[:,:lanes],np.float16)
+            return _restore_lane_rank(out,lanes)
+        e=self._rms(embedding,self.en)
+        h=self._rms(hidden,self.hn)
+        out=self.fc_e.astype(np.float32)@e+self.fc_h.astype(np.float32)@h
+        return _restore_lane_rank(out.astype(np.float16),lanes)
 
 
 class PureAneMtp:
@@ -2657,49 +3184,816 @@ class AneLinearProjectionBank:
         self.program=driver.engine.compile_multiproc(mil,{"weight.bin":bytes(raw)},self.H,self.O,self.width,raw_weight_files=frozenset({"weight.bin"}))
         if self.program is None:raise RuntimeError(f"{tag} linear projection bank failed")
         driver.engine._ensure_io(self.program)
+        with self.driver.view(self.program._in_surf, (self.H, self.width), np.float16) as d:
+            d[:] = 0
     def run(self,index,hidden):
         hidden,lanes=_lane_matrix(hidden,self.H,self.active_lanes)
         with self.driver.view(self.program._in_surf,(self.H,self.width),np.float16) as d:
-            d[:]=0;d[:,:lanes]=hidden
+            d[:,:lanes]=hidden
         if not self.driver.engine.submit(self.program,procedure_index=index):raise RuntimeError("linear projection bank submit failed")
         with self.driver.view(self.program._out_surf,(self.O,self.width),np.float16) as o:
             out=np.array(o[:,:lanes],np.float16)
         return _restore_lane_rank(out,lanes)
 
 
-class AneGdnConvBank:
-    def __init__(self,driver:AneDriver,checkpoint:Checkpoint,layers:list[int]):
-        self.driver=driver;self.C=10240;self.width=32;blobs={};funcs=[]
-        for i,layer in enumerate(layers):
-            w=checkpoint.tensor(f"model.language_model.layers.{layer}.linear_attn.conv1d.weight",np.float16)
-            blobs[f"w{i}.bin"]=w.reshape(self.C,1,1,4).tobytes()
-            fn=f'''  func procedure{i:03d}<ios18>(tensor<fp16,[1,{self.C},1,32]> x) {{ tensor<fp16,[{self.C},1,1,4]> w=const()[name=string("w"),val=tensor<fp16,[{self.C},1,1,4]>(BLOBFILE(path=string("@model_path/weights/w{i}.bin"),offset=uint64(64)))]; tensor<int32,[2]> st=const()[name=string("st"),val=tensor<int32,[2]>([1,1])]; tensor<int32,[2]> dl=const()[name=string("dl"),val=tensor<int32,[2]>([1,1])]; tensor<int32,[4]> pd=const()[name=string("pd"),val=tensor<int32,[4]>([0,0,3,0])]; tensor<fp16,[1,{self.C},1,32]> c=conv(dilations=dl,groups=int32({self.C}),pad=pd,pad_type=string("custom"),strides=st,weight=w,x=x)[name=string("c")]; tensor<fp16,[1,{self.C},1,32]> nc=mul(x=c,y=fp16(-0x1p+0))[name=string("nc")]; tensor<fp16,[1,{self.C},1,32]> ex=exp(x=nc)[name=string("ex")]; tensor<fp16,[1,{self.C},1,32]> den=add(x=ex,y=fp16(0x1p+0))[name=string("den")]; tensor<fp16,[1,{self.C},1,32]> y=real_div(x=c,y=den)[name=string("y")]; }} -> (y);'''
-            funcs.append(fn.replace('name=string("',f'name=string("c{i}_'))
-        mil=f'''program(1.3)\n{driver.module._BUILD_INFO}\n{{\n{chr(10).join(funcs)}\n}}''';cap=io.StringIO()
-        with contextlib.redirect_stdout(cap),contextlib.redirect_stderr(cap):self.program=driver.engine.compile_multiproc(mil,blobs,self.C,self.C,32)
-        if self.program is None:raise RuntimeError("GDN conv bank failed:\n"+"\n".join(cap.getvalue().splitlines()[-8:]))
+class AneMlpBank:
+    """Fused gate+up SiLU and split ``down_proj`` as one procedure per layer.
+
+    The OSX 27 split tail copies the 34816-wide mux activation to the host
+    between two ANE submits. Putting SiLU and the packed down projection in
+    the same procedure removes that round trip (64 submits per token).
+    """
+
+    def __init__(self, driver, checkpoint, layers: list[int], bits: int,
+                 tag: str, width: int = 32, down_proj_parts: int = 4):
+        if bits not in (4, 8, 16):
+            raise ValueError("MLP banks require int4, int8, or fp16")
+        if width % 32:
+            raise ValueError("bank width must be a multiple of 32")
+        if down_proj_parts not in (1, 4):
+            raise ValueError("down_proj parts must be 1 or 4")
+        if not layers:
+            raise ValueError("MLP bank needs at least one layer")
+        self.driver = driver
+        self.width = width
+        self.active_lanes = 3
+        self.layers = list(layers)
+        p0 = f"model.language_model.layers.{layers[0]}"
+        gi = checkpoint.info(f"{p0}.mlp.gate_proj.weight")
+        di = checkpoint.info(f"{p0}.mlp.down_proj.weight")
+        self.H, self.I = gi.shape[1], gi.shape[0]
+        self.O = self.H
+        if di.shape != (self.H, self.I):
+            raise ValueError(f"unexpected down_proj {di.shape}")
+        H, I, S = self.H, self.I, width
+        packer = driver.module._BlobPacker()
+        funcs = []
+        path = "@model_path/weights/weight.bin"
+        for i, layer in enumerate(layers):
+            p = f"model.language_model.layers.{layer}"
+            gp = _quantize_matrix(checkpoint, f"{p}.mlp.gate_proj.weight", "mux", bits)
+            up = _quantize_matrix(checkpoint, f"{p}.mlp.up_proj.weight", "mux", bits)
+            mux_data = gp["mux.bin"] + up["mux.bin"]
+            mux_off = packer.append(mux_data) + 64
+            if bits == 16:
+                mux_decl = (
+                    f'    tensor<fp16, [{2*I}, {H}, 1, 1]> muxw = const()'
+                    f'[name=string("muxw"), val=tensor<fp16, [{2*I}, {H}, 1, 1]>'
+                    f'(BLOBFILE(path=string("{path}"), offset=uint64({mux_off})))];'
+                )
+            else:
+                mux_scale = gp["muxs.bin"] + up["muxs.bin"]
+                mux_soff = packer.append(mux_scale) + 64
+                mux_decl = f'''    tensor<int{bits}, [{2*I}, {H}, 1, 1]> muxq = const()[name=string("muxq"), val=tensor<int{bits}, [{2*I}, {H}, 1, 1]>(BLOBFILE(path=string("{path}"), offset=uint64({mux_off})))];
+    tensor<fp16, [{2*I}, 1, 1, 1]> muxsc = const()[name=string("muxsc"), val=tensor<fp16, [{2*I}, 1, 1, 1]>(BLOBFILE(path=string("{path}"), offset=uint64({mux_soff})))];
+    tensor<fp16, [{2*I}, {H}, 1, 1]> muxw = constexpr_blockwise_shift_scale(data=muxq, scale=muxsc)[name=string("muxdq")];'''
+            down = _quantize_matrix(checkpoint, f"{p}.mlp.down_proj.weight", "d", bits)
+            if down_proj_parts == 1:
+                doff = packer.append(down["d.bin"]) + 64
+                if bits == 16:
+                    down_decl = (
+                        f'    tensor<fp16, [{H}, {I}, 1, 1]> dw = const()'
+                        f'[name=string("dw"), val=tensor<fp16, [{H}, {I}, 1, 1]>'
+                        f'(BLOBFILE(path=string("{path}"), offset=uint64({doff})))];'
+                    )
+                else:
+                    soff = packer.append(down["ds.bin"]) + 64
+                    down_decl = f'''    tensor<int{bits}, [{H}, {I}, 1, 1]> dq = const()[name=string("dq"), val=tensor<int{bits}, [{H}, {I}, 1, 1]>(BLOBFILE(path=string("{path}"), offset=uint64({doff})))];
+    tensor<fp16, [{H}, 1, 1, 1]> dsc = const()[name=string("dsc"), val=tensor<fp16, [{H}, 1, 1, 1]>(BLOBFILE(path=string("{path}"), offset=uint64({soff})))];
+    tensor<fp16, [{H}, {I}, 1, 1]> dw = constexpr_blockwise_shift_scale(data=dq, scale=dsc)[name=string("ddq")];'''
+                down_body = (
+                    f'    tensor<fp16, [1, {H}, 1, {S}]> mlp = conv(dilations=dl, '
+                    f'groups=g1, pad=pd, pad_type=pt, strides=st, weight=dw, x=act)'
+                    f'[name=string("mlp")];'
+                )
+            else:
+                payloads, scales, part_in = _quantized_down_slices(
+                    down["d.bin"], down.get("ds.bin"), H, I, bits, down_proj_parts
+                )
+                decls = []
+                convs = []
+                for part, payload in enumerate(payloads):
+                    data_off = packer.append(payload) + 64
+                    name = f"dp{part}"
+                    if bits == 16:
+                        decls.append(
+                            f'    tensor<fp16, [{H}, {part_in}, 1, 1]> {name}w = const()'
+                            f'[name=string("{name}w"), val=tensor<fp16, [{H}, {part_in}, 1, 1]>'
+                            f'(BLOBFILE(path=string("{path}"), offset=uint64({data_off})))];'
+                        )
+                    else:
+                        scale_off = packer.append(scales) + 64
+                        decls.append(
+                            f'    tensor<int{bits}, [{H}, {part_in}, 1, 1]> {name}q = const()'
+                            f'[name=string("{name}q"), val=tensor<int{bits}, [{H}, {part_in}, 1, 1]>'
+                            f'(BLOBFILE(path=string("{path}"), offset=uint64({data_off})))];\n'
+                            f'    tensor<fp16, [{H}, 1, 1, 1]> {name}sc = const()'
+                            f'[name=string("{name}sc"), val=tensor<fp16, [{H}, 1, 1, 1]>'
+                            f'(BLOBFILE(path=string("{path}"), offset=uint64({scale_off})))];\n'
+                            f'    tensor<fp16, [{H}, {part_in}, 1, 1]> {name}w = '
+                            f'constexpr_blockwise_shift_scale(data={name}q, scale={name}sc)'
+                            f'[name=string("{name}dq")];'
+                        )
+                    begin = part * part_in
+                    end = begin + part_in
+                    convs.append(
+                        f'    tensor<fp16, [1, {part_in}, 1, {S}]> {name}x = slice_by_index('
+                        f'begin=tensor<int32, [4]>([0,{begin},0,0]), '
+                        f'end=tensor<int32, [4]>([1,{end},1,{S}]), x=act)'
+                        f'[name=string("{name}x")];\n'
+                        f'    tensor<fp16, [1, {H}, 1, {S}]> {name}y = conv(dilations=dl, '
+                        f'groups=g1, pad=pd, pad_type=pt, strides=st, weight={name}w, '
+                        f'x={name}x)[name=string("{name}y")];'
+                    )
+                convs.extend((
+                    f'    tensor<fp16, [1, {H}, 1, {S}]> dp01 = add(x=dp0y, y=dp1y)[name=string("dp01")];',
+                    f'    tensor<fp16, [1, {H}, 1, {S}]> dp23 = add(x=dp2y, y=dp3y)[name=string("dp23")];',
+                    f'    tensor<fp16, [1, {H}, 1, {S}]> mlp = add(x=dp01, y=dp23)[name=string("mlp")];',
+                ))
+                down_decl = "\n".join(decls)
+                down_body = "\n".join(convs)
+            fn = f'''  func procedure{i:03d}<ios18>(tensor<fp16, [1, {H}, 1, {S}]> x) {{
+{_mil_conv_prelude(H, S)}
+{mux_decl}
+{down_decl}
+    tensor<fp16, [1, {2*I}, 1, {S}]> mx = conv(dilations=dl, groups=g1, pad=pd, pad_type=pt, strides=st, weight=muxw, x=x)[name=string("mx")];
+    tensor<fp16, [1, {I}, 1, {S}]> gt0 = slice_by_index(begin=tensor<int32, [4]>([0,0,0,0]), end=tensor<int32, [4]>([1,{I},1,{S}]), x=mx)[name=string("gt0")];
+    tensor<fp16, [1, {I}, 1, {S}]> upp = slice_by_index(begin=tensor<int32, [4]>([0,{I},0,0]), end=tensor<int32, [4]>([1,{2*I},1,{S}]), x=mx)[name=string("upp")];
+    tensor<fp16, [1, {I}, 1, {S}]> ng = mul(x=gt0, y=fp16(-0x1p+0))[name=string("ng")];
+    tensor<fp16, [1, {I}, 1, {S}]> ex = exp(x=ng)[name=string("ex")];
+    tensor<fp16, [1, {I}, 1, {S}]> den = add(x=ex, y=fp16(0x1p+0))[name=string("den")];
+    tensor<fp16, [1, {I}, 1, {S}]> sl = real_div(x=gt0, y=den)[name=string("sl")];
+    tensor<fp16, [1, {I}, 1, {S}]> act = mul(x=sl, y=upp)[name=string("act")];
+{down_body}
+    tensor<fp16, [1, {H}, 1, {S}]> y = identity(x=mlp)[name=string("y")];
+  }} -> (y);'''
+            funcs.append(fn.replace('name=string("', f'name=string("p{i}_'))
+        mil = (
+            f"program(1.3)\n{driver.module._BUILD_INFO}\n{{\n"
+            + "\n".join(funcs) + f"\n}}\n// pure_{tag}_mlp_bank\n"
+        )
+        cap = io.StringIO()
+        with contextlib.redirect_stdout(cap), contextlib.redirect_stderr(cap):
+            self.program = driver.engine.compile_multiproc(
+                mil, {"weight.bin": packer.getvalue()}, H, H, S,
+                raw_weight_files=frozenset({"weight.bin"}),
+            )
+        if self.program is None:
+            raise RuntimeError(
+                f"{tag} fused MLP bank failed:\n"
+                + "\n".join(cap.getvalue().splitlines()[-12:])
+            )
         driver.engine._ensure_io(self.program)
-    def run(self,index,qkv,cache):
-        with self.driver.view(self.program._in_surf,(self.C,32),np.float16) as d:d[:]=0;d[:,:3]=cache;d[:,3]=qkv
-        if not self.driver.engine.submit(self.program,procedure_index=index):raise RuntimeError("conv bank submit failed")
-        with self.driver.view(self.program._out_surf,(self.C,32),np.float16) as o:y=np.array(o[:,3],np.float16)
-        cache[:,:2]=cache[:,1:3];cache[:,2]=qkv;return y
+        with self.driver.view(
+            self.program._in_surf, (self.H, self.width), np.float16
+        ) as d:
+            d[:] = 0
+        self.nbytes = len(packer)
+
+    def run(self, index, hidden):
+        hidden, lanes = _lane_matrix(hidden, self.H, self.active_lanes)
+        with self.driver.view(
+            self.program._in_surf, (self.H, self.width), np.float16
+        ) as d:
+            d[:, :lanes] = hidden
+        if not self.driver.engine.submit(self.program, procedure_index=index):
+            raise RuntimeError("fused MLP bank submit failed")
+        with self.driver.view(
+            self.program._out_surf, (self.H, self.width), np.float16
+        ) as o:
+            out = np.array(o[:, :lanes], np.float16)
+        return _restore_lane_rank(out, lanes)
+
+
+def _is_attention_layer(checkpoint: Checkpoint, layer: int) -> bool:
+    p = f"model.language_model.layers.{layer}"
+    if f"{p}.self_attn.o_proj.weight" in checkpoint.weight_map:
+        return True
+    if f"{p}.linear_attn.out_proj.weight" in checkpoint.weight_map:
+        return False
+    if checkpoint._quant_manifest:
+        if any(k.startswith(f"{p}.self_attn.") for k in checkpoint._quant_manifest):
+            return True
+        if any(k.startswith(f"{p}.linear_attn.") for k in checkpoint._quant_manifest):
+            return False
+    text = checkpoint.config.get("text_config", checkpoint.config)
+    types = text.get("layer_types")
+    if types and layer < len(types):
+        return types[layer] == "full_attention"
+    return (layer + 1) % 4 == 0
+
+
+def _layer_out_proj_name(checkpoint: Checkpoint, layer: int) -> str:
+    p = f"model.language_model.layers.{layer}"
+    if _is_attention_layer(checkpoint, layer):
+        return f"{p}.self_attn.o_proj.weight"
+    return f"{p}.linear_attn.out_proj.weight"
+
+
+def _layer_in_proj_names(checkpoint: Checkpoint, layer: int) -> list[str]:
+    p = f"model.language_model.layers.{layer}"
+    if _is_attention_layer(checkpoint, layer):
+        return [f"{p}.self_attn.{x}.weight" for x in ("q_proj", "k_proj", "v_proj")]
+    return [
+        f"{p}.linear_attn.{x}.weight"
+        for x in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+    ]
+
+
+def _pad_quantized_rows(data: bytes, scales: bytes | None, rows: int,
+                        target: int, in_dim: int, bits: int
+                        ) -> tuple[bytes, bytes | None]:
+    if rows == target:
+        return data, scales
+    if rows > target:
+        raise ValueError(f"cannot pad {rows} rows down to {target}")
+    extra = target - rows
+    if bits == 16:
+        return data + bytes(extra * in_dim * 2), None
+    row_bytes = in_dim // 2 if bits == 4 else in_dim
+    extra_scale = np.ones(extra, np.float16).tobytes()
+    return data + bytes(extra * row_bytes), (b"" if scales is None else scales) + extra_scale
+
+
+def _pack_layer_mlp_mil(packer, checkpoint: Checkpoint, layer: int, bits: int,
+                        H: int, I: int, S: int, down_proj_parts: int,
+                        path: str = "@model_path/weights/weight.bin"
+                        ) -> tuple[str, str, str]:
+    """Pack one layer's mux + split-down weights into ``packer``."""
+    p = f"model.language_model.layers.{layer}"
+    gp = _quantize_matrix(checkpoint, f"{p}.mlp.gate_proj.weight", "mux", bits)
+    up = _quantize_matrix(checkpoint, f"{p}.mlp.up_proj.weight", "mux", bits)
+    mux_data = gp["mux.bin"] + up["mux.bin"]
+    mux_off = packer.append(mux_data) + 64
+    if bits == 16:
+        mux_decl = (
+            f'    tensor<fp16, [{2*I}, {H}, 1, 1]> muxw = const()'
+            f'[name=string("muxw"), val=tensor<fp16, [{2*I}, {H}, 1, 1]>'
+            f'(BLOBFILE(path=string("{path}"), offset=uint64({mux_off})))];'
+        )
+    else:
+        mux_scale = gp["muxs.bin"] + up["muxs.bin"]
+        mux_soff = packer.append(mux_scale) + 64
+        mux_decl = f'''    tensor<int{bits}, [{2*I}, {H}, 1, 1]> muxq = const()[name=string("muxq"), val=tensor<int{bits}, [{2*I}, {H}, 1, 1]>(BLOBFILE(path=string("{path}"), offset=uint64({mux_off})))];
+    tensor<fp16, [{2*I}, 1, 1, 1]> muxsc = const()[name=string("muxsc"), val=tensor<fp16, [{2*I}, 1, 1, 1]>(BLOBFILE(path=string("{path}"), offset=uint64({mux_soff})))];
+    tensor<fp16, [{2*I}, {H}, 1, 1]> muxw = constexpr_blockwise_shift_scale(data=muxq, scale=muxsc)[name=string("muxdq")];'''
+    down = _quantize_matrix(checkpoint, f"{p}.mlp.down_proj.weight", "d", bits)
+    if down_proj_parts == 1:
+        doff = packer.append(down["d.bin"]) + 64
+        if bits == 16:
+            down_decl = (
+                f'    tensor<fp16, [{H}, {I}, 1, 1]> dw = const()'
+                f'[name=string("dw"), val=tensor<fp16, [{H}, {I}, 1, 1]>'
+                f'(BLOBFILE(path=string("{path}"), offset=uint64({doff})))];'
+            )
+        else:
+            soff = packer.append(down["ds.bin"]) + 64
+            down_decl = f'''    tensor<int{bits}, [{H}, {I}, 1, 1]> dq = const()[name=string("dq"), val=tensor<int{bits}, [{H}, {I}, 1, 1]>(BLOBFILE(path=string("{path}"), offset=uint64({doff})))];
+    tensor<fp16, [{H}, 1, 1, 1]> dsc = const()[name=string("dsc"), val=tensor<fp16, [{H}, 1, 1, 1]>(BLOBFILE(path=string("{path}"), offset=uint64({soff})))];
+    tensor<fp16, [{H}, {I}, 1, 1]> dw = constexpr_blockwise_shift_scale(data=dq, scale=dsc)[name=string("ddq")];'''
+        down_body = (
+            f'    tensor<fp16, [1, {H}, 1, {S}]> mlp = conv(dilations=dl, '
+            f'groups=g1, pad=pd, pad_type=pt, strides=st, weight=dw, x=act)'
+            f'[name=string("mlp")];'
+        )
+        return mux_decl, down_decl, down_body
+    payloads, scales, part_in = _quantized_down_slices(
+        down["d.bin"], down.get("ds.bin"), H, I, bits, down_proj_parts
+    )
+    decls = []
+    convs = []
+    for part, payload in enumerate(payloads):
+        data_off = packer.append(payload) + 64
+        name = f"dp{part}"
+        if bits == 16:
+            decls.append(
+                f'    tensor<fp16, [{H}, {part_in}, 1, 1]> {name}w = const()'
+                f'[name=string("{name}w"), val=tensor<fp16, [{H}, {part_in}, 1, 1]>'
+                f'(BLOBFILE(path=string("{path}"), offset=uint64({data_off})))];'
+            )
+        else:
+            scale_off = packer.append(scales) + 64
+            decls.append(
+                f'    tensor<int{bits}, [{H}, {part_in}, 1, 1]> {name}q = const()'
+                f'[name=string("{name}q"), val=tensor<int{bits}, [{H}, {part_in}, 1, 1]>'
+                f'(BLOBFILE(path=string("{path}"), offset=uint64({data_off})))];\n'
+                f'    tensor<fp16, [{H}, 1, 1, 1]> {name}sc = const()'
+                f'[name=string("{name}sc"), val=tensor<fp16, [{H}, 1, 1, 1]>'
+                f'(BLOBFILE(path=string("{path}"), offset=uint64({scale_off})))];\n'
+                f'    tensor<fp16, [{H}, {part_in}, 1, 1]> {name}w = '
+                f'constexpr_blockwise_shift_scale(data={name}q, scale={name}sc)'
+                f'[name=string("{name}dq")];'
+            )
+        begin = part * part_in
+        end = begin + part_in
+        convs.append(
+            f'    tensor<fp16, [1, {part_in}, 1, {S}]> {name}x = slice_by_index('
+            f'begin=tensor<int32, [4]>([0,{begin},0,0]), '
+            f'end=tensor<int32, [4]>([1,{end},1,{S}]), x=act)'
+            f'[name=string("{name}x")];\n'
+            f'    tensor<fp16, [1, {H}, 1, {S}]> {name}y = conv(dilations=dl, '
+            f'groups=g1, pad=pd, pad_type=pt, strides=st, weight={name}w, '
+            f'x={name}x)[name=string("{name}y")];'
+        )
+    convs.extend((
+        f'    tensor<fp16, [1, {H}, 1, {S}]> dp01 = add(x=dp0y, y=dp1y)[name=string("dp01")];',
+        f'    tensor<fp16, [1, {H}, 1, {S}]> dp23 = add(x=dp2y, y=dp3y)[name=string("dp23")];',
+        f'    tensor<fp16, [1, {H}, 1, {S}]> mlp = add(x=dp01, y=dp23)[name=string("mlp")];',
+    ))
+    return mux_decl, "\n".join(decls), "\n".join(convs)
+
+
+def _gdn_grouped_gate_mil(Dc: int, S: int, *, scale: float = 64.0) -> str:
+    """Grouped-48 RMS + SiLU on ``core``/``zz``, writing ``gated``.
+
+    Packed ``gmw``/``gew``/``gnw`` plus ``groups=gg``. Separate-file fusion
+    with int4 ``out_proj`` is Code=10; this spelling is for a packed fused
+    tail that already owns the int4 blobs.
+    """
+    G, D = 48, 128
+    hx = float(np.float16(scale)).hex()
+    eh = float(np.float16(1e-6 * scale * scale)).hex()
+    return f'''    int32 gg = const()[name=string("gg"), val=int32({G})];
+    tensor<fp16, [1, {Dc}, 1, {S}]> gxs = mul(x=core, y=fp16({hx}))[name=string("gxs")];
+    tensor<fp16, [1, {Dc}, 1, {S}]> gsq = mul(x=gxs, y=gxs)[name=string("gsq")];
+    tensor<fp16, [1, {G}, 1, {S}]> gms = conv(dilations=dl, groups=gg, pad=pd, pad_type=pt, strides=st, weight=gmw, x=gsq)[name=string("gms")];
+    tensor<fp16, [1, {G}, 1, {S}]> gme = add(x=gms, y=fp16({eh}))[name=string("gme")];
+    tensor<fp16, [1, {G}, 1, {S}]> gsd = sqrt(x=gme)[name=string("gsd")];
+    tensor<fp16, [1, {Dc}, 1, {S}]> gsp = conv(dilations=dl, groups=gg, pad=pd, pad_type=pt, strides=st, weight=gew, x=gsd)[name=string("gsp")];
+    tensor<fp16, [1, {Dc}, 1, {S}]> gnx = real_div(x=gxs, y=gsp)[name=string("gnx")];
+    tensor<fp16, [1, {Dc}, 1, {S}]> gnrm = mul(x=gnx, y=gnw)[name=string("gnrm")];
+    tensor<fp16, [1, {Dc}, 1, {S}]> gnz = mul(x=zz, y=fp16(-0x1p+0))[name=string("gnz")];
+    tensor<fp16, [1, {Dc}, 1, {S}]> gez = exp(x=gnz)[name=string("gez")];
+    tensor<fp16, [1, {Dc}, 1, {S}]> gdz = add(x=gez, y=fp16(0x1p+0))[name=string("gdz")];
+    tensor<fp16, [1, {Dc}, 1, {S}]> gsl = real_div(x=zz, y=gdz)[name=string("gsl")];
+    tensor<fp16, [1, {Dc}, 1, {S}]> gated = mul(x=gnrm, y=gsl)[name=string("gated")];'''
+
+
+def _attn_silu_gate_mil(Dc: int, S: int) -> str:
+    """``core * sigmoid(zz)``, matching host attention gating."""
+    return f'''    tensor<fp16, [1, {Dc}, 1, {S}]> gnz = mul(x=zz, y=fp16(-0x1p+0))[name=string("gnz")];
+    tensor<fp16, [1, {Dc}, 1, {S}]> gez = exp(x=gnz)[name=string("gez")];
+    tensor<fp16, [1, {Dc}, 1, {S}]> gdz = add(x=gez, y=fp16(0x1p+0))[name=string("gdz")];
+    tensor<fp16, [1, {Dc}, 1, {S}]> gated = real_div(x=core, y=gdz)[name=string("gated")];'''
+
+
+class AneFusedTailBank:
+    """One procedure per layer: ``out_proj`` + residual + conv-RMS + MLP.
+
+    ``_SharedDecoderTail`` currently pays two ANE submits (out_proj bank, then
+    fused MLP) plus a host RMS of the residual. Layer-0 ``AneNormProjection``
+    already compiles conv-RMS fused with a large int4 conv, and ``AneMlpBank``
+    already compiles mux+SiLU+split-down. This bank is that pair plus the
+    residual adds, so decode/prefill drop 64 tail round-trips.
+    """
+
+    def __init__(self, driver, checkpoint, layers: list[int], bits: int,
+                 tag: str, width: int = 32, down_proj_parts: int = 4,
+                 norm_scale: float = 2.0, chain_next: bool = False,
+                 n_layers: int = 64, fuse_gate: bool = False):
+        if bits not in (4, 8, 16):
+            raise ValueError("fused tail banks require int4, int8, or fp16")
+        if width % 32:
+            raise ValueError("bank width must be a multiple of 32")
+        if down_proj_parts not in (1, 4):
+            raise ValueError("down_proj parts must be 1 or 4")
+        if not layers:
+            raise ValueError("fused tail bank needs at least one layer")
+        self.driver = driver
+        self.width = width
+        self.active_lanes = 3
+        self.layers = list(layers)
+        p0 = f"model.language_model.layers.{layers[0]}"
+        oi = checkpoint.info(_layer_out_proj_name(checkpoint, layers[0]))
+        gi = checkpoint.info(f"{p0}.mlp.gate_proj.weight")
+        self.H, self.Dc = oi.shape
+        self.I = gi.shape[0]
+        self.chain_next = chain_next
+        self.next_pad = 16480 if chain_next else 0
+        self.next_rows: list[int] = []
+        self.O = self.H + self.next_pad
+        self.fuse_gate = fuse_gate
+        self.input = (2 * self.Dc + self.H) if fuse_gate else (self.Dc + self.H)
+        if gi.shape[1] != self.H:
+            raise ValueError(f"unexpected gate_proj {gi.shape}")
+        H, Dc, I, S = self.H, self.Dc, self.I, width
+        packer = driver.module._BlobPacker()
+        path = "@model_path/weights/weight.bin"
+        mean_off = packer.append(
+            np.full((1, H), 1 / H, np.float16).tobytes()
+        ) + 64
+        gmean_off = gexp_off = None
+        if fuse_gate:
+            gmean_off = packer.append(
+                np.full((48, 128, 1, 1), np.float16(1 / 128)).tobytes()
+            ) + 64
+            gexp_off = packer.append(
+                np.ones((Dc, 1, 1, 1), np.float16).tobytes()
+            ) + 64
+        funcs = []
+        for i, layer in enumerate(layers):
+            out_name = _layer_out_proj_name(checkpoint, layer)
+            info = checkpoint.info(out_name)
+            if info.shape != (H, Dc):
+                raise ValueError(f"layer {layer} out_proj {info.shape} != {(H, Dc)}")
+            op = _quantize_matrix(checkpoint, out_name, "o", bits)
+            o_off = packer.append(op["o.bin"]) + 64
+            if bits == 16:
+                o_decl = (
+                    f'    tensor<fp16, [{H}, {Dc}, 1, 1]> ow = const()'
+                    f'[name=string("ow"), val=tensor<fp16, [{H}, {Dc}, 1, 1]>'
+                    f'(BLOBFILE(path=string("{path}"), offset=uint64({o_off})))];'
+                )
+            else:
+                o_soff = packer.append(op["os.bin"]) + 64
+                o_decl = f'''    tensor<int{bits}, [{H}, {Dc}, 1, 1]> oq = const()[name=string("oq"), val=tensor<int{bits}, [{H}, {Dc}, 1, 1]>(BLOBFILE(path=string("{path}"), offset=uint64({o_off})))];
+    tensor<fp16, [{H}, 1, 1, 1]> osc = const()[name=string("osc"), val=tensor<fp16, [{H}, 1, 1, 1]>(BLOBFILE(path=string("{path}"), offset=uint64({o_soff})))];
+    tensor<fp16, [{H}, {Dc}, 1, 1]> ow = constexpr_blockwise_shift_scale(data=oq, scale=osc)[name=string("odq")];'''
+            p = f"model.language_model.layers.{layer}"
+            n_off = packer.append(
+                checkpoint.tensor(f"{p}.post_attention_layernorm.weight",
+                                  np.float16).tobytes()
+            ) + 64
+            is_gdn = not _is_attention_layer(checkpoint, layer)
+            gate_decl = gate_body = ""
+            if fuse_gate:
+                zin = 2 * Dc
+                if is_gdn:
+                    gnw = np.tile(
+                        checkpoint.tensor(f"{p}.linear_attn.norm.weight", np.float16),
+                        48,
+                    ).reshape(1, Dc, 1, 1).tobytes()
+                    gnw_off = packer.append(gnw) + 64
+                    gate_decl = f'''    tensor<fp16, [48, 128, 1, 1]> gmw = const()[name=string("gmw"), val=tensor<fp16, [48, 128, 1, 1]>(BLOBFILE(path=string("{path}"), offset=uint64({gmean_off})))];
+    tensor<fp16, [{Dc}, 1, 1, 1]> gew = const()[name=string("gew"), val=tensor<fp16, [{Dc}, 1, 1, 1]>(BLOBFILE(path=string("{path}"), offset=uint64({gexp_off})))];
+    tensor<fp16, [1, {Dc}, 1, 1]> gnw = const()[name=string("gnw"), val=tensor<fp16, [1, {Dc}, 1, 1]>(BLOBFILE(path=string("{path}"), offset=uint64({gnw_off})))];'''
+                    gate_body = _gdn_grouped_gate_mil(Dc, S, scale=64.0)
+                else:
+                    gate_body = _attn_silu_gate_mil(Dc, S)
+                slices = f'''    tensor<fp16, [1, {Dc}, 1, {S}]> core = slice_by_index(begin=tensor<int32, [4]>([0,0,0,0]), end=tensor<int32, [4]>([1,{Dc},1,{S}]), x=x)[name=string("core")];
+    tensor<fp16, [1, {Dc}, 1, {S}]> zz = slice_by_index(begin=tensor<int32, [4]>([0,{Dc},0,0]), end=tensor<int32, [4]>([1,{zin},1,{S}]), x=x)[name=string("zz")];
+    tensor<fp16, [1, {H}, 1, {S}]> residual = slice_by_index(begin=tensor<int32, [4]>([0,{zin},0,0]), end=tensor<int32, [4]>([1,{self.input},1,{S}]), x=x)[name=string("residual")];
+{gate_body}'''
+            else:
+                slices = f'''    tensor<fp16, [1, {Dc}, 1, {S}]> gated = slice_by_index(begin=tensor<int32, [4]>([0,0,0,0]), end=tensor<int32, [4]>([1,{Dc},1,{S}]), x=x)[name=string("gated")];
+    tensor<fp16, [1, {H}, 1, {S}]> residual = slice_by_index(begin=tensor<int32, [4]>([0,{Dc},0,0]), end=tensor<int32, [4]>([1,{self.input},1,{S}]), x=x)[name=string("residual")];'''
+            mux_decl, down_decl, down_body = _pack_layer_mlp_mil(
+                packer, checkpoint, layer, bits, H, I, S, down_proj_parts, path
+            )
+            rms = _conv_rms_block(
+                "h", "n", H, S, "nw", "mw", "nr", scale=norm_scale, groups="g1"
+            )
+            next_decl = next_body = ""
+            if chain_next:
+                nxt_layer = layer + 1
+                if nxt_layer < n_layers:
+                    nxt_names = _layer_in_proj_names(checkpoint, nxt_layer)
+                    parts = [_quantize_matrix(checkpoint, name, "nx", bits)
+                             for name in nxt_names]
+                    nx_data = b"".join(part["nx.bin"] for part in parts)
+                    nx_scale = None if bits == 16 else b"".join(
+                        part["nxs.bin"] for part in parts
+                    )
+                    nx_rows = sum(checkpoint.info(name).shape[0] for name in nxt_names)
+                    nx_data, nx_scale = _pad_quantized_rows(
+                        nx_data, nx_scale, nx_rows, self.next_pad, H, bits
+                    )
+                    xw = checkpoint.tensor(
+                        f"model.language_model.layers.{nxt_layer}.input_layernorm.weight",
+                        np.float16,
+                    ).tobytes()
+                    self.next_rows.append(nx_rows)
+                else:
+                    row_bytes = H // 2 if bits == 4 else (H if bits == 8 else H * 2)
+                    nx_data = bytes(self.next_pad * row_bytes)
+                    nx_scale = None if bits == 16 else np.ones(
+                        self.next_pad, np.float16
+                    ).tobytes()
+                    xw = np.ones(H, np.float16).tobytes()
+                    self.next_rows.append(0)
+                nx_off = packer.append(nx_data) + 64
+                xw_off = packer.append(xw) + 64
+                if bits == 16:
+                    next_decl = (
+                        f'    tensor<fp16, [{self.next_pad}, {H}, 1, 1]> nxw = const()'
+                        f'[name=string("nxw"), val=tensor<fp16, [{self.next_pad}, {H}, 1, 1]>'
+                        f'(BLOBFILE(path=string("{path}"), offset=uint64({nx_off})))];'
+                    )
+                else:
+                    nx_soff = packer.append(nx_scale) + 64
+                    next_decl = f'''    tensor<int{bits}, [{self.next_pad}, {H}, 1, 1]> nxq = const()[name=string("nxq"), val=tensor<int{bits}, [{self.next_pad}, {H}, 1, 1]>(BLOBFILE(path=string("{path}"), offset=uint64({nx_off})))];
+    tensor<fp16, [{self.next_pad}, 1, 1, 1]> nxsc = const()[name=string("nxsc"), val=tensor<fp16, [{self.next_pad}, 1, 1, 1]>(BLOBFILE(path=string("{path}"), offset=uint64({nx_soff})))];
+    tensor<fp16, [{self.next_pad}, {H}, 1, 1]> nxw = constexpr_blockwise_shift_scale(data=nxq, scale=nxsc)[name=string("nxdq")];'''
+                next_decl += (
+                    f'\n    tensor<fp16, [1, {H}, 1, 1]> xw = const()'
+                    f'[name=string("xw"), val=tensor<fp16, [1, {H}, 1, 1]>'
+                    f'(BLOBFILE(path=string("{path}"), offset=uint64({xw_off})))];'
+                )
+                next_rms = _conv_rms_block(
+                    "y", "xn", H, S, "xw", "mw", "xn", scale=2.0, groups="g1"
+                )
+                next_body = f'''{next_rms}
+    tensor<fp16, [1, {self.next_pad}, 1, {S}]> nxt = conv(dilations=dl, groups=g1, pad=pd, pad_type=pt, strides=st, weight=nxw, x=xn)[name=string("nx")];
+    tensor<fp16, [1, {self.O}, 1, {S}]> z = concat(values=(y, nxt), axis=int32(1), interleave=bool(false))[name=string("z")];'''
+            else:
+                self.next_rows.append(0)
+            result_name = "z" if chain_next else "y"
+            fn = f'''  func procedure{i:03d}<ios18>(tensor<fp16, [1, {self.input}, 1, {S}]> x) {{
+{_mil_conv_prelude(self.input, S)}
+{o_decl}
+{mux_decl}
+{down_decl}
+{next_decl}
+{gate_decl}
+    tensor<fp16, [1, {H}, 1, 1]> nw = const()[name=string("nw"), val=tensor<fp16, [1, {H}, 1, 1]>(BLOBFILE(path=string("{path}"), offset=uint64({n_off})))];
+    tensor<fp16, [1, {H}, 1, 1]> mw = const()[name=string("mw"), val=tensor<fp16, [1, {H}, 1, 1]>(BLOBFILE(path=string("{path}"), offset=uint64({mean_off})))];
+{slices}
+    tensor<fp16, [1, {H}, 1, {S}]> attn = conv(dilations=dl, groups=g1, pad=pd, pad_type=pt, strides=st, weight=ow, x=gated)[name=string("o")];
+    tensor<fp16, [1, {H}, 1, {S}]> h = add(x=residual, y=attn)[name=string("h")];
+{rms}
+    tensor<fp16, [1, {2*I}, 1, {S}]> mx = conv(dilations=dl, groups=g1, pad=pd, pad_type=pt, strides=st, weight=muxw, x=n)[name=string("mx")];
+    tensor<fp16, [1, {I}, 1, {S}]> gt0 = slice_by_index(begin=tensor<int32, [4]>([0,0,0,0]), end=tensor<int32, [4]>([1,{I},1,{S}]), x=mx)[name=string("gt0")];
+    tensor<fp16, [1, {I}, 1, {S}]> upp = slice_by_index(begin=tensor<int32, [4]>([0,{I},0,0]), end=tensor<int32, [4]>([1,{2*I},1,{S}]), x=mx)[name=string("upp")];
+    tensor<fp16, [1, {I}, 1, {S}]> ng = mul(x=gt0, y=fp16(-0x1p+0))[name=string("ng")];
+    tensor<fp16, [1, {I}, 1, {S}]> ex = exp(x=ng)[name=string("ex")];
+    tensor<fp16, [1, {I}, 1, {S}]> den = add(x=ex, y=fp16(0x1p+0))[name=string("den")];
+    tensor<fp16, [1, {I}, 1, {S}]> sl = real_div(x=gt0, y=den)[name=string("sl")];
+    tensor<fp16, [1, {I}, 1, {S}]> act = mul(x=sl, y=upp)[name=string("act")];
+{down_body}
+    tensor<fp16, [1, {H}, 1, {S}]> y = add(x=h, y=mlp)[name=string("y")];
+{next_body}
+  }} -> ({result_name});'''
+            funcs.append(fn.replace('name=string("', f'name=string("p{i}_'))
+        mil = (
+            f"program(1.3)\n{driver.module._BUILD_INFO}\n{{\n"
+            + "\n".join(funcs) + f"\n}}\n// pure_{tag}_fused_tail_bank\n"
+        )
+        cap = io.StringIO()
+        with contextlib.redirect_stdout(cap), contextlib.redirect_stderr(cap):
+            self.program = driver.engine.compile_multiproc(
+                mil, {"weight.bin": packer.getvalue()}, self.input, self.O, S,
+                raw_weight_files=frozenset({"weight.bin"}),
+            )
+        if self.program is None:
+            raise RuntimeError(
+                f"{tag} fused tail bank failed:\n"
+                + "\n".join(cap.getvalue().splitlines()[-16:])
+            )
+        driver.engine._ensure_io(self.program)
+        with self.driver.view(
+            self.program._in_surf, (self.input, self.width), np.float16
+        ) as d:
+            d[:] = 0
+        self.nbytes = len(packer)
+
+    def run(self, index, gated, residual, z=None):
+        gated, lanes = _lane_matrix(gated, self.Dc, self.active_lanes)
+        residual, rlanes = _lane_matrix(residual, self.H, self.active_lanes)
+        if rlanes != lanes:
+            raise ValueError("fused tail lane counts differ")
+        with self.driver.view(
+            self.program._in_surf, (self.input, self.width), np.float16
+        ) as d:
+            if self.fuse_gate:
+                if z is None:
+                    raise ValueError("fused tail fuse_gate requires z")
+                z, zlanes = _lane_matrix(z, self.Dc, self.active_lanes)
+                if zlanes != lanes:
+                    raise ValueError("fused tail gate lane counts differ")
+                d[:self.Dc, :lanes] = gated
+                d[self.Dc:2 * self.Dc, :lanes] = z
+                d[2 * self.Dc:, :lanes] = residual
+            else:
+                d[:self.Dc, :lanes] = gated
+                d[self.Dc:, :lanes] = residual
+        if not self.driver.engine.submit(self.program, procedure_index=index):
+            raise RuntimeError("fused tail bank submit failed")
+        with self.driver.view(
+            self.program._out_surf, (self.O, self.width), np.float16
+        ) as o:
+            hidden = np.array(o[:self.H, :lanes], np.float16)
+            if not self.chain_next:
+                return _restore_lane_rank(hidden, lanes)
+            rows = self.next_rows[index]
+            if rows <= 0:
+                return _restore_lane_rank(hidden, lanes)
+            nxt = np.array(o[self.H:self.H + rows, :lanes], np.float16)
+            return (_restore_lane_rank(hidden, lanes),
+                    _restore_lane_rank(nxt, lanes))
+
+
+class _HostRmsLinear:
+    """Host RMSNorm plus a procedure in an AneLinearProjectionBank."""
+
+    def __init__(self, bank: AneLinearProjectionBank, index: int, weight: np.ndarray):
+        self.bank, self.index = bank, index
+        self.weight = np.asarray(weight, np.float16)
+
+    def __call__(self, hidden: np.ndarray) -> np.ndarray:
+        hidden, lanes = _lane_matrix(hidden, self.weight.size, self.bank.active_lanes)
+        h = hidden.astype(np.float32)
+        w = self.weight.astype(np.float32).reshape(-1, 1)
+        n = (h / np.sqrt(np.mean(h * h, axis=0, keepdims=True) + 1e-6) * w).astype(np.float16)
+        out = self.bank.run(self.index, n)
+        out, _ = _lane_matrix(out, self.bank.O, self.bank.active_lanes)
+        return _restore_lane_rank(out, lanes)
+
+
+class _SharedDecoderTail:
+    """One layer's attention/GDN tail: optional host gate, then fused ANE tail.
+
+    Packed grouped-48 RMS + SiLU + ``out_proj`` verifies on macOS 27 Exclave.
+    When the fused bank is built with ``fuse_gate``, host gating is skipped.
+    """
+
+    def __init__(self, *, kind: str, index: int,
+                 post_norm: np.ndarray,
+                 gate_norm: np.ndarray | None = None,
+                 out_bank: AneLinearProjectionBank | None = None,
+                 mlp_bank: AneMlpBank | None = None,
+                 mlp_index: int | None = None,
+                 fused_bank: AneFusedTailBank | None = None):
+        if kind not in ("gdn", "attn"):
+            raise ValueError(kind)
+        if (fused_bank is None) == (out_bank is None or mlp_bank is None):
+            raise ValueError("tail needs fused_bank or out_bank+mlp_bank")
+        self.kind, self.index = kind, index
+        self.mlp_index = index if mlp_index is None else mlp_index
+        self.out_bank, self.mlp_bank = out_bank, mlp_bank
+        self.fused_bank = fused_bank
+        self.post_norm = np.asarray(post_norm, np.float16)
+        self.gate_norm = None if gate_norm is None else np.asarray(gate_norm, np.float16)
+        if fused_bank is not None:
+            self.H, self.Dc, self.I = fused_bank.H, fused_bank.Dc, fused_bank.I
+            self.program = fused_bank.program
+            self.programs = (fused_bank.program,)
+            self._lanes_cap = fused_bank.active_lanes
+        else:
+            self.H, self.Dc, self.I = out_bank.O, out_bank.H, mlp_bank.I
+            self.program = out_bank.program
+            self.programs = (out_bank.program, mlp_bank.program)
+            self._lanes_cap = out_bank.active_lanes
+        self.nbytes = 0
+
+    def __call__(self, core: np.ndarray, z_or_gate: np.ndarray,
+                 residual: np.ndarray) -> np.ndarray:
+        lanes_cap = self._lanes_cap
+        residual, lanes = _lane_matrix(residual, self.H, lanes_cap)
+        if (
+            self.fused_bank is not None
+            and getattr(self.fused_bank, "fuse_gate", False)
+        ):
+            if self.kind == "gdn":
+                core, _ = _lane_matrix(core, self.Dc, lanes_cap)
+                z, _ = _lane_matrix(z_or_gate, self.Dc, lanes_cap)
+            else:
+                core = np.asarray(core, np.float16)
+                if core.ndim == 3:
+                    core = core.reshape(-1, core.shape[-1])
+                elif core.ndim == 2 and core.shape == (24, 256):
+                    core = core.reshape(-1)
+                core, _ = _lane_matrix(core, self.Dc, lanes_cap)
+                gate = np.asarray(z_or_gate, np.float16)
+                if gate.ndim == 3:
+                    gate = gate.reshape(-1, gate.shape[-1])
+                elif gate.ndim == 2 and gate.shape == (24, 256):
+                    gate = gate.reshape(-1)
+                z, _ = _lane_matrix(gate, self.Dc, lanes_cap)
+            return self.fused_bank.run(
+                self.index, core.astype(np.float16), residual, z=z.astype(np.float16)
+            )
+        if self.kind == "gdn":
+            core, _ = _lane_matrix(core, self.Dc, lanes_cap)
+            z, _ = _lane_matrix(z_or_gate, self.Dc, lanes_cap)
+            core_f = core.astype(np.float32).reshape(48, 128, lanes) / 64.0
+            gn = self.gate_norm.astype(np.float32).reshape(48, 128, 1)
+            cn = core_f / np.sqrt(np.mean(core_f * core_f, axis=1, keepdims=True) + 1e-6) * gn
+            zw = z.astype(np.float32).reshape(48, 128, lanes)
+            gated = (cn * (zw / (1.0 + np.exp(-zw)))).reshape(self.Dc, lanes)
+        else:
+            core = np.asarray(core, np.float16)
+            if core.ndim == 3:
+                core = core.reshape(-1, core.shape[-1])
+            elif core.ndim == 2 and core.shape == (24, 256):
+                core = core.reshape(-1)
+            core, _ = _lane_matrix(core, self.Dc, lanes_cap)
+            gate = np.asarray(z_or_gate, np.float16)
+            if gate.ndim == 3:
+                gate = gate.reshape(-1, gate.shape[-1])
+            elif gate.ndim == 2 and gate.shape == (24, 256):
+                gate = gate.reshape(-1)
+            gate, _ = _lane_matrix(gate, self.Dc, lanes_cap)
+            gated = core.astype(np.float32) / (1.0 + np.exp(-gate.astype(np.float32)))
+        if self.fused_bank is not None:
+            out = self.fused_bank.run(
+                self.index, gated.astype(np.float16), residual
+            )
+            return out
+        attn = self.out_bank.run(self.index, gated.astype(np.float16))
+        attn, _ = _lane_matrix(attn, self.H, lanes_cap)
+        h = residual.astype(np.float32) + attn.astype(np.float32)
+        pn = self.post_norm.astype(np.float32).reshape(-1, 1)
+        hn = (h / np.sqrt(np.mean(h * h, axis=0, keepdims=True) + 1e-6) * pn).astype(np.float16)
+        mlp = self.mlp_bank.run(self.mlp_index, hn)
+        mlp, _ = _lane_matrix(mlp, self.H, lanes_cap)
+        out = (h + mlp.astype(np.float32)).astype(np.float16)
+        return _restore_lane_rank(out, lanes)
+
+
+class AneGdnConvBank:
+    """All GDN causal convs as procedures in one packed-weight program."""
+
+    def __init__(self, driver: AneDriver, checkpoint: Checkpoint,
+                 layers: list[int], width: int = 32):
+        if width % 32:
+            raise ValueError("conv bank width must be a multiple of 32")
+        self.driver = driver
+        self.C = 10240
+        self.width = width
+        packer = driver.module._BlobPacker()
+        funcs = []
+        C, S = self.C, width
+        path = "@model_path/weights/weight.bin"
+        for i, layer in enumerate(layers):
+            w = checkpoint.tensor(
+                f"model.language_model.layers.{layer}.linear_attn.conv1d.weight",
+                np.float16,
+            )
+            if w.ndim != 3 or w.shape[1:] != (1, 4) or w.shape[0] != C:
+                raise ValueError(f"unexpected GDN conv weight {w.shape}")
+            off = packer.append(w.reshape(C, 1, 1, 4).tobytes()) + 64
+            fn = f'''  func procedure{i:03d}<ios18>(tensor<fp16,[1,{C},1,{S}]> x) {{
+    tensor<fp16,[{C},1,1,4]> cw=const()[name=string("cw"),val=tensor<fp16,[{C},1,1,4]>(BLOBFILE(path=string("{path}"),offset=uint64({off})))];
+    tensor<int32,[2]> st=const()[name=string("st"),val=tensor<int32,[2]>([1,1])];
+    tensor<int32,[2]> dl=const()[name=string("dl"),val=tensor<int32,[2]>([1,1])];
+    tensor<int32,[4]> pd=const()[name=string("pd"),val=tensor<int32,[4]>([0,0,3,0])];
+    tensor<fp16,[1,{C},1,{S}]> c=conv(dilations=dl,groups=int32({C}),pad=pd,pad_type=string("custom"),strides=st,weight=cw,x=x)[name=string("c")];
+    tensor<fp16,[1,{C},1,{S}]> nc=mul(x=c,y=fp16(-0x1p+0))[name=string("nc")];
+    tensor<fp16,[1,{C},1,{S}]> ex=exp(x=nc)[name=string("ex")];
+    tensor<fp16,[1,{C},1,{S}]> den=add(x=ex,y=fp16(0x1p+0))[name=string("den")];
+    tensor<fp16,[1,{C},1,{S}]> y=real_div(x=c,y=den)[name=string("y")];
+  }} -> (y);'''
+            funcs.append(fn.replace('name=string("', f'name=string("c{i}_'))
+        mil = (
+            f"program(1.3)\n{driver.module._BUILD_INFO}\n{{\n"
+            + "\n".join(funcs) + "\n}}\n// pure_gdn_conv_bank\n"
+        )
+        cap = io.StringIO()
+        with contextlib.redirect_stdout(cap), contextlib.redirect_stderr(cap):
+            self.program = driver.engine.compile_multiproc(
+                mil, {"weight.bin": packer.getvalue()}, C, C, S,
+                raw_weight_files=frozenset({"weight.bin"}),
+            )
+        if self.program is None:
+            raise RuntimeError(
+                "GDN conv bank failed:\n" + "\n".join(cap.getvalue().splitlines()[-8:])
+            )
+        driver.engine._ensure_io(self.program)
+        self.nbytes = len(packer)
+
+    def run(self, index, qkv, cache):
+        current, lanes = _lane_matrix(qkv, self.C, self.width - 3)
+        with self.driver.view(
+            self.program._in_surf, (self.C, self.width), np.float16
+        ) as d:
+            d[:] = 0
+            d[:, :3] = cache
+            d[:, 3:3 + lanes] = current
+        if not self.driver.engine.submit(self.program, procedure_index=index):
+            raise RuntimeError("conv bank submit failed")
+        with self.driver.view(
+            self.program._out_surf, (self.C, self.width), np.float16
+        ) as o:
+            y = np.array(o[:, 3:3 + lanes], np.float16)
+        history = np.concatenate((cache, current), axis=1)
+        cache[:] = history[:, -3:]
+        return _restore_lane_rank(y, lanes)
 
 
 class _BankGdnConv:
-    def __init__(self,bank,index):self.bank=bank;self.index=index;self.cache=np.zeros((10240,3),np.float16)
-    def __call__(self,x):return self.bank.run(self.index,x,self.cache)
+    def __init__(self, bank, index):
+        self.bank = bank
+        self.index = index
+        self.cache = np.zeros((10240, 3), np.float16)
+
+    def reset(self) -> None:
+        self.cache[:] = 0
+
+    def __call__(self, x):
+        return self.bank.run(self.index, x, self.cache)
 
 
 @dataclass
 class _PureGdnLayer:
     head: AneNormProjection | None
     projection_output: int
-    conv: AneGdnConv
+    conv: AneGdnConv | _BankGdnConv
     state: GdnState
-    tail: AneGdnTail
+    tail: AneGdnTail | _SharedDecoderTail
     a_log: np.ndarray
     dt_bias: np.ndarray
+    rep_a_log: np.ndarray | None = None
+    rep_dt_bias: np.ndarray | None = None
 
 
 @dataclass
@@ -2708,7 +4002,7 @@ class _PureAttentionLayer:
     projection_output: int
     prepare: _DynamicPrepareLayer
     core: AneAttentionCore
-    tail: AneAttentionTail
+    tail: AneAttentionTail | _SharedDecoderTail
 
 
 @dataclass
@@ -2794,6 +4088,9 @@ class PureAneRuntime:
         # this class is framework-free and uses the same local ANE driver.
         from probes.ane_gdn_scan64 import AneGdnUnrolled
         self.prefill_recurrence = AneGdnUnrolled(self.driver, self.active_lanes)
+        self.unrolled_prefill_recurrence = self.prefill_recurrence
+        self.chunked_prefill_recurrence = None
+        self.prefill_recurrence_mode = "unroll"
         self.driver.discard_compiler_files(self.prefill_recurrence.program)
         shared_prepare = AneAttentionPrepareDynamic(self.driver, context)
         self.driver.discard_compiler_files(shared_prepare.program)
@@ -2810,9 +4107,9 @@ class PureAneRuntime:
             else:
                 ns=[f"{p}.linear_attn.{x}.weight" for x in ("in_proj_qkv","in_proj_z","in_proj_b","in_proj_a")]
             return (f"{p}.input_layernorm.weight",ns,64.0 if layer==0 else 2.0)
-        # Target input projections for layers 1..63 are chained into the
-        # preceding tail. This removes 63 dispatches and the two target
-        # projection-bank programs. MTP still needs its own draft projection.
+        # Layers 1..63 take their input projection from the previous tail when
+        # fused tails chain the next RMS+in_proj (Q38_ANE_CHAIN_NEXT). That
+        # removes 63 head dispatches and the two projection-bank programs.
         mtp_bank=None
         if mtp_draft:
             mtp_names=[
@@ -2846,65 +4143,175 @@ class PureAneRuntime:
             width=self.program_width
         )
         self.driver.discard_compiler_files(layer0_head.program)
+        out_sets=[]
+        gdn_head_sets=[]; attn_head_sets=[]
+        gdn_head_layers=[]; attn_head_layers=[]
+        for layer,kind in enumerate(types):
+            p=f"model.language_model.layers.{layer}"
+            if kind=="full_attention":
+                out_sets.append([f"{p}.self_attn.o_proj.weight"])
+                if layer>0:
+                    attn_head_sets.append([
+                        f"{p}.self_attn.{x}.weight" for x in ("q_proj","k_proj","v_proj")
+                    ])
+                    attn_head_layers.append(layer)
+            else:
+                out_sets.append([f"{p}.linear_attn.out_proj.weight"])
+                if layer>0:
+                    gdn_head_sets.append([
+                        f"{p}.linear_attn.{x}.weight"
+                        for x in ("in_proj_qkv","in_proj_z","in_proj_b","in_proj_a")
+                    ])
+                    gdn_head_layers.append(layer)
+        fuse_tail=os.environ.get("Q38_ANE_FUSED_TAIL","1")!="0"
+        chain_next=fuse_tail and os.environ.get("Q38_ANE_CHAIN_NEXT","1")!="0"
+        out_bank=None
+        mlp_banks:list[AneMlpBank]=[]
+        mlp_of:dict[int,tuple[AneMlpBank,int]]={}
+        fused_banks:list[AneFusedTailBank]=[]
+        fused_of:dict[int,tuple[AneFusedTailBank,int]]={}
+        if fuse_tail:
+            tail_chunk=int(os.environ.get("Q38_ANE_FUSED_TAIL_CHUNK","16"))
+            if tail_chunk < 2 or 64 % tail_chunk:
+                raise ValueError("Q38_ANE_FUSED_TAIL_CHUNK must divide 64 and be >= 2")
+            for start in range(0,len(types),tail_chunk):
+                ids=list(range(start,min(len(types),start+tail_chunk)))
+                tag=f"tail_{start//tail_chunk}"
+                print(f"  pure bake fused tail bank {tag} layers {ids[0]:02d}-{ids[-1]:02d}",
+                      flush=True)
+                bank=AneFusedTailBank(
+                    self.driver,checkpoint,ids,bits,tag,width=self.program_width,
+                    down_proj_parts=self.down_proj_parts,
+                    chain_next=chain_next,
+                    n_layers=len(types),
+                    fuse_gate=os.environ.get("Q38_ANE_FUSE_GATE","1")!="0",
+                )
+                bank.active_lanes=self.active_lanes
+                self.driver.discard_compiler_files(bank.program)
+                fused_banks.append(bank)
+                for j,layer_id in enumerate(ids):
+                    fused_of[layer_id]=(bank,j)
+        else:
+            print("  pure bake shared out_proj bank", flush=True)
+            out_bank=AneLinearProjectionBank(
+                self.driver,checkpoint,out_sets,bits,"tail_out",width=self.program_width
+            )
+            out_bank.active_lanes=self.active_lanes
+            self.driver.discard_compiler_files(out_bank.program)
+            mlp_chunk=16
+            for start in range(0,len(types),mlp_chunk):
+                ids=list(range(start,min(len(types),start+mlp_chunk)))
+                tag=f"mlp_{start//mlp_chunk}"
+                print(f"  pure bake fused MLP bank {tag} layers {ids[0]:02d}-{ids[-1]:02d}",
+                      flush=True)
+                bank=AneMlpBank(
+                    self.driver,checkpoint,ids,bits,tag,width=self.program_width,
+                    down_proj_parts=self.down_proj_parts
+                )
+                bank.active_lanes=self.active_lanes
+                self.driver.discard_compiler_files(bank.program)
+                mlp_banks.append(bank)
+                for j,layer_id in enumerate(ids):
+                    mlp_of[layer_id]=(bank,j)
+        print("  pure bake GDN convs per layer", flush=True)
+        gdn_head_bank=attn_head_bank=None
+        if gdn_head_sets and not chain_next:
+            gdn_head_bank=AneLinearProjectionBank(
+                self.driver,checkpoint,gdn_head_sets,bits,"gdn_in",
+                width=self.program_width
+            )
+            gdn_head_bank.active_lanes=self.active_lanes
+            self.driver.discard_compiler_files(gdn_head_bank.program)
+        if attn_head_sets and not chain_next:
+            attn_head_bank=AneLinearProjectionBank(
+                self.driver,checkpoint,attn_head_sets,bits,"attn_qkv",
+                width=self.program_width
+            )
+            attn_head_bank.active_lanes=self.active_lanes
+            self.driver.discard_compiler_files(attn_head_bank.program)
         self.layers: list[_PureGdnLayer | _PureAttentionLayer] = []
         self.program_count = (4+len(attention_programs)+
-                              (1 if mtp_bank is not None else 0))
+                              (1 if mtp_bank is not None else 0)+
+                              (len(fused_banks) if fuse_tail else 1+len(mlp_banks))+
+                              int(gdn_head_bank is not None)+
+                              int(attn_head_bank is not None))
         self.blob_bytes = (layer0_head.nbytes+
-                           (mtp_bank.nbytes if mtp_bank is not None else 0))
+                           (mtp_bank.nbytes if mtp_bank is not None else 0)+
+                           (sum(b.nbytes for b in fused_banks) if fuse_tail else
+                            (out_bank.nbytes if out_bank is not None else 0)+
+                            sum(b.nbytes for b in mlp_banks))+
+                           (gdn_head_bank.nbytes if gdn_head_bank is not None else 0)+
+                           (attn_head_bank.nbytes if attn_head_bank is not None else 0))
         layer_started=time.perf_counter()
+        gdn_head_index=attn_head_index=0
         for layer,kind in enumerate(types):
             p=f"model.language_model.layers.{layer}"
             current_names=pspec(layer,kind=="full_attention")[1]
             projection_output=sum(checkpoint.info(name).shape[0]
                                   for name in current_names)
-            head=layer0_head if layer==0 else None
-            if layer+1<len(types):
-                next_attention=types[layer+1]=="full_attention"
-                next_norm,next_names,_=pspec(layer+1,next_attention)
+            post=checkpoint.tensor(f"{p}.post_attention_layernorm.weight",np.float16)
+            if fuse_tail:
+                fused_bank,fused_index=fused_of[layer]
+                tail_kwargs=dict(fused_bank=fused_bank,index=fused_index,
+                                 post_norm=post)
             else:
-                next_norm=next_names=None
+                mlp_bank,mlp_index=mlp_of[layer]
+                tail_kwargs=dict(index=layer,mlp_index=mlp_index,
+                                 out_bank=out_bank,mlp_bank=mlp_bank,
+                                 post_norm=post)
             if kind=="full_attention":
+                if layer==0:
+                    head=layer0_head
+                elif chain_next:
+                    head=None
+                else:
+                    head=_HostRmsLinear(
+                        attn_head_bank,attn_head_index,
+                        checkpoint.tensor(f"{p}.input_layernorm.weight",np.float16)
+                    )
+                    attn_head_index+=1
                 prepare=_DynamicPrepareLayer(
                     shared_prepare,
                     checkpoint.tensor(f"{p}.self_attn.q_norm.weight",np.float16),
                     checkpoint.tensor(f"{p}.self_attn.k_norm.weight",np.float16),
                 )
                 core=shared_core.fork_cache()
-                tail=AneAttentionTail(
-                    self.driver,checkpoint,layer,bits=bits,next_norm_name=next_norm,
-                    next_projection_names=next_names,
-                    active_lanes=self.active_lanes,
-                    down_proj_parts=down_proj_parts,
-                    width=self.program_width
+                tail=_SharedDecoderTail(
+                    kind="attn",**tail_kwargs
                 )
                 self.layers.append(_PureAttentionLayer(
                     head,projection_output,prepare,core,tail
                 ))
-                self.driver.discard_compiler_files(tail.program)
-                self.program_count += 1
-                self.blob_bytes += tail.nbytes
             else:
+                if layer==0:
+                    head=layer0_head
+                elif chain_next:
+                    head=None
+                else:
+                    head=_HostRmsLinear(
+                        gdn_head_bank,gdn_head_index,
+                        checkpoint.tensor(f"{p}.input_layernorm.weight",np.float16)
+                    )
+                    gdn_head_index+=1
                 conv=AneGdnConv(
                     self.driver,checkpoint,f"{p}.linear_attn.conv1d.weight",
                     width=self.program_width
                 )
+                self.driver.discard_compiler_files(conv.program)
+                self.program_count += 1
                 state=self.recurrence.new_state()
-                tail=AneGdnTail(
-                    self.driver,checkpoint,layer,bits=bits,next_norm_name=next_norm,
-                    next_projection_names=next_names,
-                    active_lanes=self.active_lanes,
-                    down_proj_parts=down_proj_parts,
-                    width=self.program_width
+                gn=checkpoint.tensor(f"{p}.linear_attn.norm.weight",np.float16)
+                tail=_SharedDecoderTail(
+                    kind="gdn",gate_norm=np.tile(gn,48).astype(np.float16),
+                    **tail_kwargs
                 )
                 al=checkpoint.tensor(f"{p}.linear_attn.A_log",np.float16)
                 dt=checkpoint.tensor(f"{p}.linear_attn.dt_bias",np.float16)
+                rep_al = np.repeat(al, 128)
+                rep_dt = np.repeat(dt, 128)
                 self.layers.append(_PureGdnLayer(
-                    head,projection_output,conv,state,tail,al,dt
+                    head,projection_output,conv,state,tail,al,dt,rep_al,rep_dt
                 ))
-                for prog in (conv.program,tail.program):
-                    self.driver.discard_compiler_files(prog)
-                self.program_count += 2
-                self.blob_bytes += tail.nbytes
             print(f"  pure bake layer {layer+1:02d}/64 {kind:<16} "
                   f"{self.blob_bytes/1e9:.2f}GB "
                   f"{time.perf_counter()-layer_started:.1f}s",flush=True)
@@ -2928,13 +4335,19 @@ class PureAneRuntime:
                 mtp_prepare,shared_core.fork_cache(),self.final_head,bits,
                 self.mtp_lanes,down_proj_parts
             )
+            extra=0
             for prog in (self.mtp.fusion.program,self.mtp.tail.program):
+                if prog is None:
+                    continue
                 self.driver.discard_compiler_files(prog)
-            self.program_count+=2;self.blob_bytes+=self.mtp.nbytes
+                extra+=1
+            self.program_count+=extra
+            self.blob_bytes+=self.mtp.nbytes
         cache_capacity=getattr(shared_core,"capacity",context)
         cache_count=len(aidx)+(1 if self.mtp is not None else 0)
         self.kv_cache_bytes=(cache_count*2*shared_core.Hkv*cache_capacity*
                              shared_core.D*np.dtype(np.float16).itemsize)
+        self.set_prefill_recurrence(os.environ.get("Q38_ANE_GDN_PREFILL", "chunk"))
         assert_standalone("full model bake")
         total_seconds = time.perf_counter() - startup_started
         engine_metrics = dict(self.driver.engine.compile_metrics)
@@ -2963,6 +4376,26 @@ class PureAneRuntime:
               f"compiled={engine_metrics['calls']-engine_metrics['cache_load_hits']} "
               f"cache_loaded={engine_metrics['cache_load_hits']}",
               flush=True)
+
+    def set_prefill_recurrence(self, mode: str) -> None:
+        """Select the shared full-batch graph while idle, retaining A/B state IO.
+
+        This does not change decode or ragged batches. Call under the serving
+        lock and clear any prefix cache before benchmarking a different mode.
+        """
+        if mode not in ("unroll", "chunk"):
+            raise ValueError("Q38_ANE_GDN_PREFILL must be unroll or chunk")
+        if mode == "chunk" and self.chunked_prefill_recurrence is None:
+            if self.program_count + 1 >= 127:
+                raise ValueError("chunk graph would exceed the resident program budget")
+            from tools.ane_gdn_chunk import AneGdnChunked
+            program = AneGdnChunked(self.driver, self.active_lanes)
+            self.driver.discard_compiler_files(program.program)
+            self.chunked_prefill_recurrence = program
+            self.program_count += 1
+        self.prefill_recurrence = (self.chunked_prefill_recurrence if mode == "chunk"
+                                   else self.unrolled_prefill_recurrence)
+        self.prefill_recurrence_mode = mode
 
     def snapshot(self) -> PureAneSnapshot:
         """Capture all mutable target state before speculative verification."""
@@ -3070,7 +4503,7 @@ class PureAneRuntime:
                 "cumulative":self._format_profile(self._profile_cumulative)}
 
     def step_many(self,token_ids:list[int])->tuple[np.ndarray,np.ndarray]:
-        """Advance 1-3 causal positions, batching all learned weight matmuls."""
+        """Advance up to active_lanes positions, batching learned matmuls."""
         if not 1<=len(token_ids)<=self.active_lanes:
             raise ValueError(f"step_many supports 1..{self.active_lanes} tokens")
         assert_standalone("token batch start")
@@ -3085,18 +4518,16 @@ class PureAneRuntime:
         started=time.perf_counter_ns() if profiling else 0
         hidden=np.stack([self.checkpoint.embedding(t) for t in token_ids],axis=1)
         if profiling:record("embedding",started,lanes)
-        normalized=None
+        incoming=None
         for index,layer in enumerate(self.layers):
-            if index==0:
+            if incoming is None:
                 if layer.head is None:
-                    raise RuntimeError("layer zero is missing its input projection")
+                    raise RuntimeError(f"layer {index} is missing its input projection")
                 started=time.perf_counter_ns() if profiling else 0
                 projection=layer.head(hidden)
                 if profiling:record("projection_head",started)
             else:
-                if normalized is None:
-                    raise RuntimeError(f"layer {index} is missing chained projection")
-                projection=normalized
+                projection=incoming
             projection,_=_lane_matrix(
                 projection,layer.projection_output,self.active_lanes
             )
@@ -3119,7 +4550,7 @@ class PureAneRuntime:
                         activated[4096:10240,lane].reshape(48,128)
                         for lane in range(lanes)
                     ])
-                    initial=self.recurrence.materialize(layer.state)
+                    initial=self.recurrence.snapshot(layer.state)
                     self.prefill_recurrence.load(
                         raw_q,raw_k,values,
                         projection[16432:16480,:lanes].T,
@@ -3129,14 +4560,14 @@ class PureAneRuntime:
                     block,state=self.prefill_recurrence.run_loaded()
                     self.recurrence.restore(
                         layer.state,
-                        state.astype(np.float16).transpose(0,2,1).reshape(
+                        np.ascontiguousarray(state.transpose(0,2,1)).reshape(
                             self.recurrence.HK,self.recurrence.Dv
                         )
                     )
                     if profiling:record("gdn_recurrence",started)
-                    cores=block.reshape(lanes,6144).T.astype(
-                        np.float16,copy=False
-                    )
+                    cores=np.ascontiguousarray(
+                        block.reshape(lanes,6144).T
+                    ).astype(np.float16,copy=False)
                 else:
                     cores=np.empty((6144,lanes),np.float16)
                     for lane in range(lanes):
@@ -3146,7 +4577,9 @@ class PureAneRuntime:
                         started=time.perf_counter_ns() if profiling else 0
                         core=self.recurrence(
                             layer.state,q,k,v,projection[16432:16480,lane],
-                            projection[16384:16432,lane],layer.a_log,layer.dt_bias
+                            projection[16384:16432,lane],
+                            layer.rep_a_log if layer.rep_a_log is not None else layer.a_log,
+                            layer.rep_dt_bias if layer.rep_dt_bias is not None else layer.dt_bias
                         )
                         if profiling:record("gdn_recurrence",started)
                         cores[:,lane]=core.reshape(-1)
@@ -3158,32 +4591,59 @@ class PureAneRuntime:
             else:
                 cores=np.empty((6144,lanes),np.float16)
                 gates=np.empty((6144,lanes),np.float16)
-                for lane in range(lanes):
-                    qp=projection[:12288,lane].reshape(24,512)
-                    q,gate=qp[:,:256],qp[:,256:]
-                    k=projection[12288:13312,lane].reshape(4,256)
-                    v=projection[13312:14336,lane].reshape(4,256)
-                    position=layer.core.offset
+                use_batch=(
+                    lanes > 1
+                    and getattr(layer.core, "batched_program", None) is not None
+                    and hasattr(layer.core, "call_many")
+                )
+                if use_batch:
+                    qs=np.empty((lanes,24,256),np.float16)
+                    ks=np.empty((lanes,4,256),np.float16)
+                    vs=np.empty((lanes,4,256),np.float16)
+                    pos0=layer.core.offset
+                    for lane in range(lanes):
+                        qp=projection[:12288,lane].reshape(24,512)
+                        q,gate=qp[:,:256],qp[:,256:]
+                        k=projection[12288:13312,lane].reshape(4,256)
+                        v=projection[13312:14336,lane].reshape(4,256)
+                        started=time.perf_counter_ns() if profiling else 0
+                        q,k=layer.prepare(q,k,pos0+lane)
+                        if profiling:record("attention_prepare",started)
+                        qs[lane],ks[lane],vs[lane]=q,k,v
+                        gates[:,lane]=gate.reshape(-1)
                     started=time.perf_counter_ns() if profiling else 0
-                    q,k=layer.prepare(q,k,position)
-                    if profiling:record("attention_prepare",started)
-                    started=time.perf_counter_ns() if profiling else 0
-                    cores[:,lane]=layer.core(q,k,v).reshape(-1)
+                    y=layer.core.call_many(qs,ks,vs)
                     if profiling:record("attention_core",started)
-                    gates[:,lane]=gate.reshape(-1)
+                    cores=y.reshape(lanes,6144).T
+                else:
+                    for lane in range(lanes):
+                        qp=projection[:12288,lane].reshape(24,512)
+                        q,gate=qp[:,:256],qp[:,256:]
+                        k=projection[12288:13312,lane].reshape(4,256)
+                        v=projection[13312:14336,lane].reshape(4,256)
+                        position=layer.core.offset
+                        started=time.perf_counter_ns() if profiling else 0
+                        q,k=layer.prepare(q,k,position)
+                        if profiling:record("attention_prepare",started)
+                        started=time.perf_counter_ns() if profiling else 0
+                        cores[:,lane]=layer.core(q,k,v).reshape(-1)
+                        if profiling:record("attention_core",started)
+                        gates[:,lane]=gate.reshape(-1)
                 started=time.perf_counter_ns() if profiling else 0
                 result=layer.tail(cores,gates,hidden)
                 if profiling:record("attention_tail",started)
-            if isinstance(result,tuple):hidden,normalized=result
-            else:hidden=result;normalized=None
-            hidden,_=_lane_matrix(hidden,5120,self.active_lanes)
-            if normalized is not None:
+            if isinstance(result,tuple):
+                hidden,incoming=result
                 if index+1>=len(self.layers):
                     raise RuntimeError("final layer unexpectedly returned a projection")
-                normalized,_=_lane_matrix(
-                    normalized,self.layers[index+1].projection_output,
+                incoming,_=_lane_matrix(
+                    incoming,self.layers[index+1].projection_output,
                     self.active_lanes
                 )
+            else:
+                hidden=result
+                incoming=None
+            hidden,_=_lane_matrix(hidden,5120,self.active_lanes)
             trace_step=int(os.environ.get("PURE_ANE_TRACE_STEP","0") or 0)
             if (os.environ.get("PURE_ANE_TRACE") == "1" or
                     trace_step == self.steps+1):
@@ -3827,7 +5287,7 @@ def attention_layer_smoke(checkpoint: Checkpoint, engine_path: str,
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", default=os.environ.get(
-        "Q38_MODEL", "/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B"))
+        "Q38_MODEL", str(Path.home() / ".lmstudio" / "models" / "Qwen" / "Qwen3.8-27B")))
     p.add_argument("--engine-path", default=os.environ.get(
         "Q38_ANE_ENGINE", _REPO_ROOT))
     sub = p.add_subparsers(dest="command", required=True)
@@ -3868,7 +5328,7 @@ def main() -> None:
     infer.add_argument("--bits", type=int, choices=(4,8,16), default=16)
     infer.add_argument("--raw-prompt", action="store_true")
     infer.add_argument("--verify-reference", action="store_true")
-    infer.add_argument("--mtp-draft",type=int,choices=(0,1,2),default=0,
+    infer.add_argument("--mtp-draft",type=int,choices=(0,1,2,3),default=0,
                        help="pure-ANE MTP speculative draft depth")
     infer.add_argument("--context",type=int,default=256,
                        help="KV-cache capacity; values over 256 use exact streamed ANE attention")

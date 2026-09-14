@@ -1,437 +1,217 @@
-# Rindi: Qwen3.8-27B on Apple Silicon ANE + Metal + SME2
+# qwen-ane
 
-Rindi is an experimental, native C/C++ inference engine and OpenAI-compatible
-server for Qwen3.8-27B. The current fast path combines official CoreAI execution
-on the Apple Neural Engine with custom Metal kernels and optional SME2 kernels;
-it does not require MLX, PyTorch, or Core ML at inference time.
+Local Qwen3.8 inference on Apple Silicon. One CLI for an Apple `fm`-style
+terminal chat and an OpenAI-compatible server that coding agents can point at.
 
-This is research software built and measured on an M5 Max running macOS 27
-beta. CoreAI and SME2 availability, compiler behavior, speed, and power can
-differ on other Apple Silicon and OS builds.
+Two models, two silicon paths:
 
-### Model package
+| model | flag | where it runs | context | rough footprint |
+|---|---|---|---|---|
+| **Qwen3.8-Flash-Next** | `-model flash-next` | ANE for GDN / QSA, MLX GPU for MoE | up to 128k | ~23 GB |
+| **Qwen3.8-27B** | `-model 27b` | Apple Neural Engine only (GPU idle) | 4k tile | ~13 GB ANE-resident |
 
-The native engine expects a directory containing `gpu_backbone.safetensors`,
-the tokenizer/config files, and `ane_layers/`. Create it from the original
-Qwen checkpoint with the MLX-based exporter (MLX is needed for export, not for
-the resulting native inference process):
+Flash-Next is the default. 27B is the low-power path: measured around **4 tok/s
+decode at ~6 W** on an M5 Max, with the GPU free for a display or another job.
+That is not the same engine as native C++ `rindi`, whose **12 tok/s** decode
+is Metal, not ANE.
+
+Apple Silicon only. Measured on **M5 Max / macOS 27**. Other M-series parts
+will compile, but program limits and speed will differ.
+
+## Install
 
 ```bash
-python3 tools/export_rindi_package.py \
-  --model "$HOME/.lmstudio/models/Qwen/Qwen3.8-27B" \
-  --output "$HOME/.lmstudio/models/Qwen/Qwen3.8-27B.rindi" \
-  --bits 4
+git clone https://github.com/True2456/Rindi.git
+cd Rindi
+pip install -e .
 ```
 
-Qwen3.8 uses an untied output head. Keep the original checkpoint beside the
-`.rindi` directory so the engine can memory-map
-`model-00018-of-00018.safetensors`, or set `RINDI_LM_HEAD_FILE` to a readable
-safetensors file containing `lm_head.weight`.
-
-## Native server quick start
-
-The installed `rindi` launcher builds an out-of-date server automatically and
-starts the measured configuration: headless, CoreAI ANE prefill at width 128,
-batched Metal attention, Metal decode tails, INT4 target head, MTP disabled,
-and loopback port 2456.
+Flash-Next also needs MLX:
 
 ```bash
-rindi --model "$HOME/.lmstudio/models/Qwen/Qwen3.8-27B.rindi"
+pip install -e ".[mlx]"
 ```
 
-The INT4 option replaces the 2.37 GiB BF16 target vocabulary head with the
-approximately 698 MiB groupwise-INT4 head. This quantizes the target head, not
-every remaining decode operation. Launcher overrides are explicit so setting a
-presence-based engine variable to `0` cannot accidentally leave it enabled:
-
-| override | effect |
-|---|---|
-| `RINDI_ANE_WIDTH=32 rindi` | use width-32 ANE prefill bundles |
-| `RINDI_USE_BF16_LM_HEAD=1 rindi` | use the BF16 target vocabulary head |
-| `RINDI_ENABLE_MTP=1 rindi` | enable speculative MTP |
-| `RINDI_TUI=1 rindi` | show the terminal UI instead of headless mode |
-| `RINDI_HOST=0.0.0.0 RINDI_PORT=1239 rindi` | change the default listener |
-| `RINDI_DISABLE_PREFILL_BATCH_ATTENTION=1 rindi` | disable batched prefill attention for an A/B |
-
-The deterministic Qwen fast-prefill path is also enabled by default inside the
-engine. Use `RINDI_DISABLE_QWEN_PREFILL_FAST=1 rindi` for its scalar rollback.
-
-Verify the API before connecting a client:
+Or run the launcher with no install:
 
 ```bash
-curl http://127.0.0.1:2456/v1/models
+./bin/qwen-ane --help
+```
 
-curl http://127.0.0.1:2456/v1/chat/completions \
+Python 3.10+, numpy, `huggingface_hub`, `safetensors`, and `tokenizers`.
+27B talks to `AppleNeuralEngine.framework` through the driver vendored at
+`runtime/q38_ane_engine.py`.
+
+## Quick start
+
+```bash
+# Interactive chat (starts a local server if one is not already up)
+qwen-ane chat
+
+# Flash-Next, 128k context, thinking off
+qwen-ane chat -model flash-next -ctx 128k
+
+# Pure-ANE 27B
+qwen-ane chat -model 27b -ctx 4096
+
+# OpenAI-compatible API for agents
+qwen-ane serve
+qwen-ane serve -model 27b -port 2457 -ctx 4096
+```
+
+First launch looks for weights on disk, then pulls the Hugging Face package
+into `~/.qwenANE/models/` if nothing local is found.
+
+```text
+  Qwen ANE CLI
+  Apple Silicon Neural Engine Inference
+
+  Model:    Qwen3.8-Flash-Next
+  Context:  128k
+  Endpoint: http://127.0.0.1:2457/v1
+  Cache:    Enabled (LRU prefix reuse)
+  Thinking: off
+
+  Commands: /exit (quit), /clear (new chat), /think [level], /help
+
+you> Name 3 fruits.
+qwen> 1. Apple
+2. Banana
+3. Orange
+```
+
+Slash commands inside chat: `/exit`, `/quit`, `/clear`, `/think off|low|medium|xhigh`, `/help`.
+Resume a session with `qwen-ane chat --resume <session-id>`.
+
+## Models and weights
+
+```bash
+qwen-ane models              # what is installed, and where
+qwen-ane pull flash-next     # Hugging Face -> ~/.qwenANE/models/flash-next
+qwen-ane pull 27b
+```
+
+Default Hub repos:
+
+- Flash-Next: [True2456/Qwen3.8-Flash-Next-ANE](https://huggingface.co/True2456/Qwen3.8-Flash-Next-ANE)
+- 27B: [True2456/Qwen3.8-27B-ANE](https://huggingface.co/True2456/Qwen3.8-27B-ANE)
+
+If you already have the base BF16 (or MLX) checkpoint:
+
+```bash
+qwen-ane chat -model flash-next --model-path ~/models/Qwen3.8-Flash-Next
+qwen-ane chat -model 27b --model-path ~/.lmstudio/models/Qwen/Qwen3.8-27B
+```
+
+`qwen-ane build <model> --source /path/to/bf16` links that checkpoint into
+`~/.qwenANE/models/`. 27B quantizes INT4 into `~/Library/Caches/q38-pure-ane`
+on the first serve; later launches reuse the bake.
+
+Discovery order: `~/.qwenANE/models/<name>`, then `~/models/…` and
+`~/.lmstudio/models/Qwen/…`, then Hugging Face.
+
+## Talking to the server
+
+Default listener is `http://127.0.0.1:2457/v1`. The API key is not checked.
+Requests are serialized: GDN / KV state is mutable, so one in-flight
+completion at a time. A second `qwen-ane serve` on the same port refuses to
+start a duplicate and tells you to `qwen-ane chat --port 2457` instead.
+
+```bash
+curl http://127.0.0.1:2457/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "Qwen3.8-27B",
-    "messages": [{"role": "user", "content": "Write one sentence about ANE."}],
-    "max_tokens": 64,
-    "stream": true,
-    "enable_thinking": false
+    "model": "Qwen3.8-Flash-Next",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": true
   }'
 ```
 
-Pi and other OpenAI-compatible clients should use
-`http://127.0.0.1:2456/v1` as their base URL; the server does not validate the
-API key. After adding a `rindi` OpenAI-compatible provider to Pi, for example:
+Pi:
 
 ```bash
-pi --provider rindi --model Qwen3.8-27B --thinking off
+# Flash-Next on :2457
+pi -e extensions/flashnext-pi.ts --provider flashnext --model Qwen3.8-Flash-Next
+
+# 27B pure ANE (server on :1240 if you launched tools/ane pure-serve;
+# qwen-ane serve -model 27b uses the port you passed, default 2457)
+pi -e extensions/pure27-pi.ts --provider pure27 --model Qwen3.8-27B --thinking off
 ```
 
-The endpoint implements `GET /v1/models` and streaming/non-streaming
-`POST /v1/chat/completions`, including Qwen reasoning content and OpenAI-style
-function tool calls. Inference requests are serialized because each request
-mutates shared GDN and KV state.
+Prefix reuse (`-lru`, on by default) is what makes agent loops tolerable:
+the client resends the whole history, the engine restores matching GDN / KV
+state and only evaluates the new suffix.
 
-### 128K context
+## Storage and config
 
-The native server defaults to a 131,072-token KV capacity. Host KV, Metal KV,
-and attention scratch grow lazily instead of committing the full capacity at
-startup. Override it with `RINDI_CONTEXT_LENGTH` from 256 through 262,144:
-
-```bash
-RINDI_CONTEXT_LENGTH=262144 runtime/rindi-server --model /path/to/model.rindi
-```
-
-`GET /v1/models` reports the active `context_window`, and generation is clamped
-so prompt plus output cannot overrun it. The exact prefix-state cache is limited
-to prompts of at most 8,192 tokens to avoid duplicating many GiB of KV state;
-that cache policy does not limit ordinary inference context. Long-context
-decode remains O(context), so 128K is capacity support rather than a claim of
-short-context latency at 128K.
-
-### Where each phase runs
-
-| phase | primary execution path | current role |
-|---|---|---|
-| prompt prefill | 64 fused CoreAI tails on ANE plus custom Metal attention/GDN kernels | parallel width-128 path; Qwen fast prefill is default |
-| token decode | custom lane-1 Metal projection, attention, GDN, and LM-head kernels | sequential path; ANE decode is not enabled |
-| SME2 | direct CPU Q4/INT8 projection kernels | optional experiments; off by default for dense decode |
-
-SME2 can add bandwidth on isolated projections, but the measured dense
-Metal→SME2 synchronization boundary made full-model decode slower. The dense
-default therefore remains Metal. The independent-expert structure of a future
-MoE backend is a better candidate for concurrent GPU/SME2 scheduling.
-
-### Measured native performance
-
-Representative cooled runs on the development M5 Max/macOS 27 beta, using a
-1,024-token prompt and generating 128 tokens:
-
-| configuration | prefill | decode | note |
-|---|---:|---:|---|
-| width-32 fast prefill, BF16 head | 82.86 tok/s | 10.48 tok/s | control width |
-| width-128 fast prefill, BF16 head | 94.95 tok/s | 9.67 tok/s | 8.718 prompt tok/J in that A/B |
-| width-128 fast prefill, INT4 target head | 95.22 tok/s | 12.25 tok/s | 0.572% aggregate PPL increase in the four-slice check |
-
-These are single-machine measurements, not portable guarantees. Decode width
-is one in every row; `RINDI_ANE_WIDTH=128` accelerates prompt ingestion and does
-not make autoregressive decode 128-wide. See
-[`docs/QWEN-PREFILL-FAST.md`](docs/QWEN-PREFILL-FAST.md) for validation and
-power details and [`docs/SME2.md`](docs/SME2.md) for the heterogeneous kernel
-results and promotion gates.
-
-## Framework-free pure ANE backend
-
-`tools/pure_ane.py` is a second backend, independent of the hybrid server. It
-does not import MLX, oMLX, PyTorch, Core ML, Transformers, or a GPU runtime. It
-reads BF16 safetensors directly, uses `tokenizers` for token IDs, and submits
-MIL programs and IOSurfaces straight to `AppleNeuralEngine.framework` through
-the private driver vendored at `runtime/q38_ane_engine.py`, which itself needs
-only the standard library and numpy.
-
-```bash
-tools/ane pure-loader-smoke
-tools/ane pure-gdn-layer-smoke --bits 16
-tools/ane pure-attention-layer-smoke --bits 16
-tools/ane pure-attention-long-smoke --context 262144 --valid 8193
-tools/ane pure-infer --bits 16 --tokens 4 --verify-reference
-tools/ane pure-infer --bits 4 --tokens 32 --mtp-draft 2
-tools/ane pure-infer --bits 4 --context 4096 --prompt-file prompt.txt --tokens 32
-```
-
-For chat clients and repeatable benchmarks, keep the pure model resident:
-
-```bash
-tools/ane pure-serve --bits 4 --context 4096 --port 1240
-
-# In another terminal; this reuses the already-baked model for every run.
-tools/ane pure-bench --url http://127.0.0.1:1240 --tokens 32 --runs 3 --warmup 1
-```
-
-`pure-serve` quantizes each checkpoint tensor only once. Its default
-Zstandard-compressed cache lives at `~/Library/Caches/q38-pure-ane`; the
-measured int4 cache is 9.18 GB on disk and reduced a full restart from 60.97 s
-to 14.50 s (504/504 quantized-tensor hits, 127/127 compiled-artifact hits).
-Use `--no-bake-cache` to disable it. `GET /v1/metrics` exposes quantize,
-read/decompress, descriptor, compile, and ANE-load phase totals.
-
-The persistent endpoint is OpenAI-compatible at
-`http://127.0.0.1:1240/v1`. It implements `GET /v1/models`,
-`POST /v1/chat/completions` (streaming and non-streaming),
-`POST /v1/completions`, `POST /v1/benchmarks`, and `GET /metrics`. The model is
-loaded once at process start. Requests are serialized because GDN and KV
-caches are mutable. The server automatically retains the most recent prompt
-boundary: when the next request begins with the same token sequence, it restores
-the 48 GDN states, convolution histories, attention/MTP offsets, last hidden
-state, and cached logits, then evaluates only the new suffix. A mismatch resets
-state without unloading or recompiling ANE programs. Set `"prefix_cache":
-false` on a request to force a clean prefill; `/v1/benchmarks` does this by
-default, while `pure-bench --prefix-cache` measures warm-prefix latency.
-
-Greedy decode uses pure MTP when `--mtp-draft` is enabled. Nonzero
-`temperature` uses CPU-side sampling over ANE-produced logits and therefore
-disables speculative MTP for that request; no learned model arithmetic leaves
-the ANE. OpenAI function tools, `tool_choice`, assistant `tool_calls`, tool
-results, and structured streamed/non-streamed tool-call responses are supported
-using Qwen's native tool format internally. Tool-enabled SSE buffers the current
-assistant turn until its XML can be validated and emitted as one structured
-`tool_calls` delta. Multimodal content is not implemented yet.
-
-### Qwen3.8 thinking levels
-
-The server follows this checkpoint's own chat template, whose behavior is not
-the generic OpenAI `low/medium/high` scale. Thinking is enabled by default and
-defaults to `xhigh`. The accepted values are exactly `low`, `medium`, and
-`xhigh`:
-
-```json
-{
-  "enable_thinking": true,
-  "reasoning_effort": "medium"
-}
-```
-
-`low` injects the checkpoint's brief/focused reasoning instruction. `medium`
-intentionally injects no effort instruction. `xhigh` injects its careful
-validation/alternatives instruction. Set `"enable_thinking": false` to use
-the checkpoint's empty `<think>` framing and return only an answer. JSON
-responses put private reasoning in `message.reasoning_content` and the answer
-in `message.content`; SSE uses matching `reasoning_content` and `content`
-deltas. Send `reasoning_content` back on assistant history messages to preserve
-the exact conversation prefix and maximize cache reuse.
-
-The complete 64-layer scheduler now bakes and dispatches without a GPU or MLX:
-
-| precision | ANE programs | learned-weight blobs | status |
-|---|---:|---:|---|
-| chained int4 (base decode) | 69 (out of 127) | 12.19 GB | **4.08 tok/s** measured over 512 tokens; 41.0 GB RAM freed; ~5.9 W |
-| **chained int4 + MTP depth 3 (Optimum)** | **69** | **12.19 GB** | **5.86 tok/s (~5.9)**; **2.86 tokens/step**; 64 tokens in 22 steps |
-| chained int4 + MTP depth 2 | 69 | 12.19 GB | **5.63 tok/s**; 2.42 tokens/step |
-| per-output int8 | 122 | 25.72 GB | exact for 16 MLX tokens; then diverges but correctly answers `OK`; 2.421 tok/s |
-| fp16 | 125 | 51.42 GB | **full semantic inference passes**; known prompt generated the same first four tokens as MLX |
-
-The earlier int4 incoherence was caused by shared fp16 arithmetic bugs, not
-necessarily by quantization: after fixing those bugs, int4 generated the exact
-same four-token reference prefix in 4.791 seconds with 12.86 GB of blobs. In a
-32-token comparison it diverged at token 5 but continued with coherent,
-semantically equivalent reasoning. Int8 matched the MLX reference for 16 tokens
-and then took a different but correct path, producing the requested `OK`. This
-is strong evidence that both formats work, but not yet a broad benchmark.
-`pure-infer` continues to default to fp16. CPU work is limited to tokenization,
-embedding-row selection, IOSurface byte movement, cache bookkeeping, and greedy
-or probabilistic token selection; all learned tensor arithmetic, attention, GDN convolution and
-recurrence, normalization, MLPs, and the final head run on the ANE. GPU operations can optionally bypass MLX entirely using our custom low-latency C/ObjC Metal runtime (`runtime/libmetal_engine.dylib`) with zero-copy `IOSurface` wrapping and hardware `MTLSharedEvent` signaling.
-
-### Hybrid Apple Silicon Inference Engine (`tools/hybrid_serve.py`)
-
-Unified dual-mode engine featuring an Automatic Radix Prefix Cache (**$0.03\,\text{ms}$ TTFT** on cache hit) and fast GPU burst prefill:
-
-```bash
-# Turbo Mode (GPU Metal C Tree Drafter + ANE Verifier):
-KMP_DUPLICATE_LIB_OK=TRUE python3 tools/hybrid_serve.py --mode turbo --tokens 128
-
-# Silent Mode (Pure ANE @ ~5.9W, 41.0 GB RAM freed):
-KMP_DUPLICATE_LIB_OK=TRUE python3 tools/hybrid_serve.py --mode silent --tokens 128
-
-# Multi-Turn APC Benchmark:
-KMP_DUPLICATE_LIB_OK=TRUE python3 tools/hybrid_serve.py --bench
-```
-
-### Context up to 256K
-
-The pure backend accepts `--context` from 256 through the checkpoint's declared
-maximum of **262,144 tokens**. The original direct-softmax program remains in
-use through position 256. Above that boundary, KV is stored block-major and
-the ANE scans 256-token blocks in grouped submissions, returning stable-softmax
-statistics that a weight-free ANE program merges exactly. The host schedules
-and copies buffers but performs no attention arithmetic. Dense RoPE matrices
-are generated lazily for only the active positions instead of preallocating a
-262K-position table.
-
-```bash
-# Reproducible boundary and multi-block numerical test at 256K capacity:
-tools/ane pure-attention-long-smoke --context 262144 --valid 8193
-
-# Long prompts are easier to supply by file:
-tools/ane pure-infer --bits 4 --context 262144 \
-  --raw-prompt --prompt-file prompt.txt --tokens 32
-```
-
-The 16 target attention layers require **64 KiB per configured token** in
-aggregate: 256 MiB at 4K, 2 GiB at 32K, and 16 GiB at 256K. MTP adds another
-4 KiB/token (1 GiB at 256K). These caches are fp16 regardless of weight
-quantization. Decode attention remains O(context): 256K is supported for
-correctness and retrieval capacity, but it is not expected to have short-chat
-latency without further cache paging/windowing work.
-
-The integrated 261-token prompt test crossed the old boundary successfully:
+Everything user-local lives in **`~/.qwenANE/`** (override with `QWEN_ANE_HOME`):
 
 ```text
-PURE_ANE_BAKE=PASS programs=127 blobs=12.86GB context=512 kv_capacity=0.03GB
-PURE_ANE_EXECUTION=PASS prompt_tokens=261 generated=1 seconds=35.934
+~/.qwenANE/
+├── config.json     persistent defaults
+├── models/         pulled or linked checkpoints
+│   ├── flash-next/
+│   └── 27b/
+└── sessions/       resumable chats
 ```
 
-The isolated 256K-capacity test passed at position 8,193 with relative error
-`2.19e-3`. All 16 target caches report exactly 16 GiB of logical capacity, but
-fresh calloc-backed blocks remain sparse: the allocation-only test peaked at
-58.8 MB RSS before any KV blocks were populated.
-
-The standalone backend now consumes the checkpoint's one MTP layer without
-MLX. `--mtp-draft 2` batches `[confirmed, draft1, draft2]` through the target's
-large projections and MLPs, while causal attention and GDN recurrence advance
-in order. Rejections restore all 48 compact GDN states, convolution histories,
-and attention offsets, then replay only the proven prefix. The 32-token MTP and
-non-MTP runs emitted identical token IDs; MTP improved the current batched
-baseline by 15.0% and the original one-lane-prompt result by 29.1%.
-
-Measured full-fidelity check on M5 Max:
-
-```text
-PURE_ANE_BAKE=PASS programs=125 blobs=51.42GB seconds=82.3
-PURE_ANE_REFERENCE=PASS tokens=[248068,198,760,1156]
-PURE_ANE_EXECUTION=PASS prompt_tokens=13 generated=4 seconds=11.594
-token_ids=[248068, 198, 760, 1156]
-<think>
-The user
+```bash
+qwen-ane config show
+qwen-ane config set default_model 27b
+qwen-ane config set default_port 2457
 ```
 
-The output exactly matches the four-token MLX reference for the same templated
-prompt. Allow roughly 55 GB of genuinely available disk space during an fp16
-cold bake: the private compiler materializes weights and macOS may use swap.
-Deleted files still held open by another application do not count as free
-space (`lsof +L1` is useful when `df` and Finder disagree).
-
-The measured `_ANEInMemoryModel` load failure at 128 distinct
-models was avoided with
-projection procedure banks (two quantized or five fp16), one shared
-attention-preparation program, one
-shared attention core, and one shared GDN recurrence. This is why the pure
-layout differs from the 69-program hybrid chain described below.
-Pure MTP adds two programs: an fp16 embedding/hidden fusion projection and the
-MTP decoder tail. Its QKV projection is another procedure in the existing
-attention bank, and it shares the target's four dynamically-normalized
-vocabulary-head programs.
-
-This is deliberately described as a limit of the private loader path, not a
-strict hardware total. Recent reverse engineering separately identifies a
-hardware evaluation-queue depth of 127 requests. Our failure occurs while
-loading model 128 with no evaluations in flight (`0x50004`), so the two
-observations must not be conflated; unloading/multiplexing or a lower-level
-dispatch path may remove the resident-model restriction.
-
-## What runs on the ANE in the 69-program pure/hybrid chain
-
-| block | coverage | programs |
+| flag | default | meaning |
 |---|---|---|
-| layer tails: `out_proj → +residual → RMSNorm → gate/up → silu → mul → down → +residual` | 64/64 | 64 |
-| next-layer `input_layernorm` + input projection, folded into the layer before it | 63/64 | 0 (rides along) |
-| layer 0's input projection (nothing precedes it) | 1 | 1 |
-| `lm_head` [248320, 5120], split along the vocabulary | 1 | 4 |
-| **total** | | **69 / 127** |
+| `-m`, `--model` | `flash-next` | `flash-next` or `27b` |
+| `-c`, `--ctx` | `128k` | `128k`, `64k`, `32k`, `8192`, `4096` (27B clamps to 4096) |
+| `-p`, `--port` | `2457` | server or chat client port |
+| `-lru` / `--no-lru` | on | prefix cache |
+| `--thinking` | `off` | `off`, `low`, `medium`, `xhigh` |
+| `--host` | `127.0.0.1` | bind / connect address |
+| `--model-path` | auto | explicit checkpoint directory |
+| `--hf-repo` | auto | override Hub repo on pull |
+| `-r`, `--resume` | — | chat session id |
+| `--spec` | `4` | Flash-Next speculative lookahead (`serve` only) |
 
-12.19 GB of int4 blobs. Every linear projection in the model is on the ANE.
+Single-dash long flags work (`-model`, `-ctx`, `-port`, `-lru`) so the CLI
+feels like `/usr/bin/fm`.
 
-Still on the GPU in the default build: embeddings, the attention core
-(softmax·QK<sup>T</sup>·V), and GDN `conv1d`. With `--ane-gdn-step`, the
-gated-delta recurrence keeps state resident in ANE-layout IOSurfaces, computes
-polynomial softplus/decay and beta inside the same ANE graph, and runs at
-0.344 ms/layer-token in the standalone benchmark (state rel 1.06e-3), versus
-4.39 ms for the old host round trip and about 0.66 ms on GPU.
+## What actually runs where
 
-In the current hybrid server, this option is still slower end-to-end (5.6 tok/s
-versus an 8.5 tok/s GPU baseline) because GPU-produced q/k/v/a/b force a
-3.06 ms synchronization/marshalling boundary per GDN call. Real inference is
-coherent; performance requires chaining the preceding ANE projection and
-temporal convolution directly into the resident recurrence surface.
+**Flash-Next** is a hybrid decode: linear recurrence and QSA on the Neural
+Engine, routed MoE experts on MLX. Context is 128k. This is the daily-driver
+chat / agent model.
 
-## Start here
+**27B pure ANE** submits MIL programs straight to
+`AppleNeuralEngine.framework`. No MLX, no PyTorch, no Metal GEMMs on the
+decode path. INT4 weights, greedy or sampled decode. MTP (`--mtp-draft`)
+exists in `tools/pure_ane_server.py` but `qwen-ane` leaves it off: warming
+the extra layer over the prompt lost wall-clock time on the agent loop we
+care about.
 
-* **[runtime/rindi_engine.cpp](runtime/rindi_engine.cpp)** / **[runtime/rindi_server.cpp](runtime/rindi_server.cpp)** —
-  native scheduler, lazy 128K context, and OpenAI-compatible HTTP server.
-* **[runtime/metal_engine.h](runtime/metal_engine.h)** / **[runtime/metal_engine.m](runtime/metal_engine.m)** —
-  Zero-copy Metal C runtime for GPU + ANE heterogeneous acceleration. Binds `IOSurfaceRef`
-  directly to `MTLBuffer` and uses hardware `MTLSharedEvent` signals without MLX/PyTorch.
-* **[docs/QWEN-PREFILL-FAST.md](docs/QWEN-PREFILL-FAST.md)** — width-128 native
-  prefill, INT4 target-head validation, perplexity checks, and rail-power runs.
-* **[docs/SME2.md](docs/SME2.md)** — direct SME2 Q4 kernels, Metal comparison,
-  heterogeneous row splits, and why dense SME2 routing remains opt-in.
-* **[docs/SETUP.md](docs/SETUP.md)** — moving this to another machine, paths, the
-  `libomp` crash, verifying the install.
-* **[docs/ANE-REFERENCE.md](docs/ANE-REFERENCE.md)** — what the ANE accepts and
-  rejects. Read before writing any MIL: the ops that silently fail, the width
-  and alignment rules, the program limit. This is the part that took the longest
-  to learn.
-* **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — how the model is mapped onto
-  ANE programs, the zero-copy Metal engine, and why it is shaped this way.
-* **[docs/PERFORMANCE.md](docs/PERFORMANCE.md)** — measured throughput and
-  energy, including where the ANE wins and where it does not.
-* **[docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md)** — what is left on the
-  table, ranked, with every claim tagged measured, derived, or unmeasured. The
-  decode time budget and 42 TOPS INT8 vs 21.3 TFLOP/s FP16 breakdown live here.
-* **[docs/FULL-ANE-FEASIBILITY.md](docs/FULL-ANE-FEASIBILITY.md)** — measured
-  feasibility of removing the remaining GPU blocks: full attention and GDN
-  arithmetic work, fp16-safe softplus is solved, and recurrent state now stays
-  in ANE-layout IOSurfaces across decode steps.
-* **[docs/FULL-HANDOFF.md](docs/FULL-HANDOFF.md)** — the complete lab notebook,
-  44 sections, including the dead ends and the claims that turned out wrong.
+A third engine, native C++ `rindi`, lives in this repo for research. Its
+headline **95 tok/s prefill / 12 tok/s decode** is width-128 ANE prefill
+plus **lane-1 Metal decode**, not ANE decode. See
+[docs/QWEN-PREFILL-FAST.md](docs/QWEN-PREFILL-FAST.md). Use `qwen-ane` unless
+you are working on that path.
 
-## Pure-ANE backend summary
+## Requirements and caveats
 
-This section describes the separate `tools/ane pure-*` backend and its private
-driver path. It should not be used as the speed summary for the newer native
-CoreAI + Metal server documented at the top of this README.
+- Apple Silicon. One heavy ANE process at a time; a second model on the Neural
+  Engine will fail compiles that otherwise succeed.
+- 27B first load bakes INT4 (~9 GB cache) and compiles ~70 ANE programs.
+  Later starts reuse `~/Library/Caches/q38-pure-ane` and the private compiler
+  artifact cache.
+- Do not load Flash-Next (~78 GB) and 27B in the same process. Separate ports,
+  separate processes.
+- Private ANE APIs. This is research software; expect breakage across macOS
+  builds.
 
-The ANE is **1.7× more efficient per joule** than the M5 Max GPU (1.24 vs
-0.74 TFLOP/W) and draws ~6 W against 64–84 W. The comparable GPU kernel reaches
-~45–48 TFLOP/s. Whole-model pure int4 now measures **3.499 tok/s** after
-chaining each next-layer projection into the preceding tail; the older hybrid
-path measures 3.5–3.8 tok/s against
-8.8 tok/s on the GPU.
+Full CLI notes: [docs/QWEN-ANE.md](docs/QWEN-ANE.md).
+Setup / moving machines: [docs/SETUP.md](docs/SETUP.md).
+Measured ANE vs GPU energy: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+ANE op rules: [docs/ANE-REFERENCE.md](docs/ANE-REFERENCE.md).
 
-The right ANE figure for M5 Max is **42 TOPS INT8** — 38 TOPS is the M4 part,
-and M5's headline "4× AI compute" belongs to the GPU's per-core Neural
-Accelerators, not to the ANE. 42 TOPS is 21.3 TFLOP/s fp16-equivalent (16 cores
-× 512 MACs/cycle × 1.30 GHz × 2), and on the model's real projection shapes at
-int4 the ANE sustains **18.7–20.3 TFLOP/s, or 89–97% of the physical FP16 peak**. An earlier claim in this repository that the ANE
-ceilings at ~10 TFLOP/s was wrong: that was one graph's throughput, dominated
-by a `down_proj` shape that tiles badly. Splitting that projection's input
-channels four ways measures **3.81× on it** at S=512 with no accuracy cost.
-That four-way form is now packed into one ANE weight file and enabled by
-default. Complete real tails at width 64 improve **18.4% (GDN)** and **16.8%
-(attention)**, while the current width-32 server remains flat at 3.499 tok/s.
-
-So the arithmetic is close to spec and much of the loss is in scheduling.
-Prefill now groups complete 16-token blocks through one shared, weight-free GDN
-program containing all 16 ordered recurrent steps. Q/K normalization, softplus,
-decay, sigmoid gates, state updates, and outputs all remain on the ANE; prefix
-state enters and leaves the graph directly. This reduces a real layer's GDN
-block from 12.756 to **3.499 ms (3.65×)**. The compiler rejects both dense
-affine-state scans and Qwen's multi-query chunk matmuls, while a 64-token
-unrolled graph is slower, so 16 is the measured deployment point. On the
-production server a 148-token prompt fell from the earlier ~137 ms/token class
-to **41.31 ms/token**, with warmed decode unchanged at 3.53–3.65 tok/s and
-prefix-cache reuse still working. Partial prompt blocks and decode retain the
-one-step recurrence; see
-[docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md#o3a-fuse-the-gdn-recurrence-across-a-prompt-block-deployed).
-The unreached 2× to the INT8 figure needs int8 activations feeding
-an int8 MAC lane, and no MIL spelling for that was found —
-`constexpr_blockwise_shift_scale` dequantizes to fp16 before the conv, so
-quantization currently buys bandwidth, not MACs. See
-[docs/PERFORMANCE.md](docs/PERFORMANCE.md).
-
-So this is currently a power-efficiency and GPU-availability result, with real
-unused ANE headroom still visible between whole-model throughput, sustained
-kernel throughput, and theoretical peak.
+Apache-2.0.

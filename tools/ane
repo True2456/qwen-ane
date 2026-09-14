@@ -20,6 +20,7 @@
 #   tools/ane pure-infer --raw-prompt --prompt-file prompt.txt --tokens 4 --bits 4 --context 4096
 #   tools/ane pure-serve --bits 4 --context 4096
 #   tools/ane pure-bench --tokens 32 --runs 3
+#   tools/ane headless --port 2456 --load Qwen3.8-27B
 #
 set -u
 REPO=${0:A:h:h}
@@ -50,5 +51,6 @@ case "$cmd" in
   pure-infer) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane.py" --model "$MODEL" infer "$@" ;;
   pure-serve) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane_server.py" serve --model "$MODEL" "$@" ;;
   pure-bench) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane_server.py" bench "$@" ;;
-  *)     echo "usage: tools/ane {serve|bench|spec|pure-inspect|pure-loader-smoke|pure-projection-smoke|pure-gdn-conv-smoke|pure-gdn-recurrence-smoke|pure-gdn-layer-smoke|pure-attention-core-smoke|pure-attention-long-smoke|pure-attention-layer-smoke|pure-infer|pure-serve|pure-bench|ling-inspect|ling-reference-generate} [args...]"; exit 2 ;;
+  headless) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/rindi_openai.py" "$@" ;;
+  *)     echo "usage: tools/ane {serve|bench|spec|pure-inspect|pure-loader-smoke|pure-projection-smoke|pure-gdn-conv-smoke|pure-gdn-recurrence-smoke|pure-gdn-layer-smoke|pure-attention-core-smoke|pure-attention-long-smoke|pure-attention-layer-smoke|pure-infer|pure-serve|pure-bench|headless|ling-inspect|ling-reference-generate} [args...]"; exit 2 ;;
 esac

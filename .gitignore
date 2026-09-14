@@ -7,3 +7,12 @@ runtime/*.o
 # Compiled ANE assets and run logs: 16+ GB of .aimodel plus probe output,
 # all regenerable from the checkpoint by the export probes.
 artifacts/
+.qwenANE
+.qwenANE/
+*.egg-info/
+results/
+eval/results/
+auto/
+bin/*.dylib
+fm/build/
+
