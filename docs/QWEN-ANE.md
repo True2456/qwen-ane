@@ -59,8 +59,10 @@ Endpoints: `GET /v1/models`, `POST /v1/chat/completions` (streaming SSE,
 tools, `reasoning_content`). A second serve on the same port exits 0 after
 printing the already-running model list.
 
-27B context is clamped to 4096 (hardware tile). Flash-Next `--spec` is
-speculative lookahead (default 4).
+Both checkpoints declare `max_position_embeddings: 262144`. That is the
+config cap the runtime will not exceed, not a timed load. Flash-Next was
+timed at 4k / 8k / 16k / 32k on 2026-09-15 ([README](../README.md)).
+Flash-Next `--spec` is speculative lookahead (default 4).
 
 ## Models, pull, build
 

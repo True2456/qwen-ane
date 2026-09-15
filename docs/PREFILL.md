@@ -17,6 +17,16 @@ Three changes, each measured on 511 tokens of prose:
 None of it costs quality. Scoring 1024 tokens after a 512-token prefill:
 6.6188 one token at a time, 6.5828 at K=4, 6.5574 at k=16, 6.6037 at k=32.
 
+## Full-model context scale (2026-09-15)
+
+The 511-token rows above are a short prose walk. A later llama.cpp-style
+sweep on the shipping hybrid (`FLASHNEXT_PREFILL_MIL_K=32`, spec 4,
+mlxresident MoE, cold prefix, reused=0, engine 33792) held **~80 tok/s
+prefill** from 4k through 32k, **~15 tok/s** decode, **81–82 GB** peak,
+mean **~1.1 W ANE / 9–10.5 W GPU / ~7.5 W CPU**. TTFT scaled linearly
+(49 s / 101 s / 202 s / 399 s). See the README table; do not mix these
+with the 511-token component benches.
+
 ## How wide a graph can go
 
 `probes/mil_wide_prefill.py` prices the unroll on one GDN layer.

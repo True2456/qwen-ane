@@ -7,16 +7,17 @@ Two models, two silicon paths:
 
 | model | flag | where it runs | context | rough footprint |
 |---|---|---|---|---|
-| **Qwen3.8-Flash-Next** | `-model flash-next` | ANE for GDN / QSA, MLX GPU for MoE | up to 128k | ~23 GB |
-| **Qwen3.8-27B** | `-model 27b` | Apple Neural Engine only (GPU idle) | 4k tile | ~13 GB ANE-resident |
+| **Qwen3.8-Flash-Next** | `-model flash-next` | GDN / QSA on the Neural Engine; routed MoE on MLX GPU | config 256k; **32k timed** | **78 GB idle, 81–82 GB peak** |
+| **Qwen3.8-27B** | `-model 27b` | Apple Neural Engine (`tools/pure_ane.py`) | config 256k; 4k is a common bench, not a hardware clamp | ~13 GB int4 blobs / ~21 GB process at 4k–8k |
 
-Flash-Next is the default. 27B is the low-power path: measured around **4 tok/s
-decode at ~6 W** on an M5 Max, with the GPU free for a display or another job.
-That is not the same engine as native C++ `rindi`, whose **12 tok/s** decode
-is Metal, not ANE.
+Flash-Next is the default. It is hybrid, not full-ANE: attention graphs on the
+Neural Engine, the 68 GB expert bank on the GPU. 27B is the low-power ANE-only
+path: about **4 tok/s decode at ~6 W** on an M5 Max. That is not native C++
+`rindi`, whose **12 tok/s** decode is Metal.
 
-Apple Silicon only. Measured on **M5 Max / macOS 27**. Other M-series parts
-will compile, but program limits and speed will differ.
+Apple Silicon only. Every speed / power / footprint number below is from a
+named run on the development **M5 Max / macOS 27**. Other M-series parts are
+untested here.
 
 ## Install
 
@@ -166,7 +167,7 @@ qwen-ane config set default_port 2457
 | flag | default | meaning |
 |---|---|---|
 | `-m`, `--model` | `flash-next` | `flash-next` or `27b` |
-| `-c`, `--ctx` | `128k` | `128k`, `64k`, `32k`, `8192`, `4096` (27B clamps to 4096) |
+| `-c`, `--ctx` | `128k` | requested capacity (`128k`, `64k`, `32k`, `4096`, …). Flag default, not a 128k load test |
 | `-p`, `--port` | `2457` | server or chat client port |
 | `-lru` / `--no-lru` | on | prefix cache |
 | `--thinking` | `off` | `off`, `low`, `medium`, `xhigh` |
@@ -182,8 +183,9 @@ feels like `/usr/bin/fm`.
 ## What actually runs where
 
 **Flash-Next** is a hybrid decode: linear recurrence and QSA on the Neural
-Engine, routed MoE experts on MLX. Context is 128k. This is the daily-driver
-chat / agent model.
+Engine, routed MoE experts on MLX. The CLI default `-ctx 128k` is requested
+capacity. The load test below is 4k / 8k / 16k / 32k (engine 33792). This is
+the daily-driver chat / agent model.
 
 **27B pure ANE** submits MIL programs straight to
 `AppleNeuralEngine.framework`. No MLX, no PyTorch, no Metal GEMMs on the
@@ -209,6 +211,28 @@ you are working on that path.
   separate processes.
 - Private ANE APIs. This is research software; expect breakage across macOS
   builds.
+
+## Measured: Flash-Next context scale (M5 Max, 2026-09-15)
+
+Cold prefix (`reset` between lengths, salted prompts, **reused=0**). Serve
+context 33792. `FLASHNEXT_SPEC=4`, `FLASHNEXT_PREFILL_MIL_K=32`,
+`FLASHNEXT_MOE=mlxresident`, `FLASHNEXT_HEAD=mlx`, MIL GDN+QSA. Watts are
+**mean** `powermetrics --samplers cpu_power,gpu_power,ane_power -i 500` over
+the generate — ANE sits near 1 W and spikes to **8 W** when those graphs run;
+MoE is the GPU. PeakMem is `footprint -p` `phys_footprint_peak`. Prompt tokens
+were 3979 / 7958 / 15953 / 31906; completion 128.
+
+| Test | TTFT(ms) | TPOT(ms) | ppTPS | tgTPS | E2E(s) | Throughput | PeakMem | ANE / GPU / CPU W |
+|---|---:|---:|---:|---:|---:|---:|---|---|
+| pp 4096 / tg 128 | 49355.9 | 66.2 | 80.6 | 15.1 | 57.8 | 71.1 | 81.0 GB | 1.09 / 9.00 / 7.77 |
+| pp 8192 / tg 128 | 100506.4 | 67.5 | 79.2 | 14.8 | 109.1 | 74.1 | 81.0 GB | 1.07 / 9.06 / 7.79 |
+| pp 16384 / tg 128 | 201653.2 | 63.6 | 79.1 | 15.7 | 209.7 | 76.7 | 81.0 GB | 1.12 / 9.49 / 7.13 |
+| pp 32768 / tg 128 | 399231.5 | 63.5 | 79.9 | 15.8 | 407.3 | 78.7 | 82.0 GB | 1.07 / 10.51 / 7.78 |
+
+Prefill stays ~80 tok/s as the prompt grows; TTFT is essentially linear.
+Decode is ~15 tok/s (includes MTP, spec 4). A 511-token prose walk on the
+same k=32 graphs was 58–82 tok/s depending on the graph set
+([docs/PREFILL.md](docs/PREFILL.md)); do not mix that row with this table.
 
 Full CLI notes: [docs/QWEN-ANE.md](docs/QWEN-ANE.md).
 Setup / moving machines: [docs/SETUP.md](docs/SETUP.md).
