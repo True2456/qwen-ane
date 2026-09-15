@@ -10,10 +10,11 @@ Two models, two silicon paths:
 | **Qwen3.8-Flash-Next** | `-model flash-next` | GDN / QSA on the Neural Engine; routed MoE on MLX GPU | config 256k; **32k timed** | **78 GB idle, 81–82 GB peak** |
 | **Qwen3.8-27B** | `-model 27b` | Apple Neural Engine (`tools/pure_ane.py`) | config 256k; 4k is a common bench, not a hardware clamp | ~13 GB int4 blobs / ~21 GB process at 4k–8k |
 
-Flash-Next is the default. It is hybrid, not full-ANE: attention graphs on the
-Neural Engine, the 68 GB expert bank on the GPU. 27B is the low-power ANE-only
-path: about **4 tok/s decode at ~6 W** on an M5 Max. That is not native C++
-`rindi`, whose **12 tok/s** decode is Metal.
+Flash-Next is the default, and calling that “on the ANE” is misleading: the
+68 GB expert bank, most of the FLOPs, and ~10 W of the ~18 W generate rail
+are GPU. Attention (GDN/QSA) is on the Neural Engine; mean ANE draw in the
+4k–32k sweep was ~1.1 W. **27B** is the ANE-only model (~4 tok/s at ~6 W).
+That is not native C++ `rindi`, whose **12 tok/s** decode is Metal.
 
 Apple Silicon only. Every speed / power / footprint number below is from a
 named run on the development **M5 Max / macOS 27**. Other M-series parts are
@@ -66,7 +67,7 @@ fallback if nothing local is found.
 
 ```text
   Qwen ANE CLI
-  Apple Silicon Neural Engine Inference
+  Hybrid: ANE attention, GPU MoE (not full-ANE)
 
   Model:    Qwen3.8-Flash-Next
   Context:  128k

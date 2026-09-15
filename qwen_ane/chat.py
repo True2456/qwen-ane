@@ -19,7 +19,7 @@ from .server import is_server_running, run_server
 
 BANNER = """
   Qwen ANE CLI
-  Apple Silicon Neural Engine Inference
+  {silicon}
 
   Model:    {model_name}
   Context:  {ctx_human}
@@ -254,7 +254,13 @@ def start_chat(
 
     ctx_human = format_tokens(ctx)
     cache_str = "Enabled (LRU prefix reuse)" if lru else "Disabled"
+    silicon = (
+        "Neural Engine (pure ANE)"
+        if normalize_model_name(session.model) == "27b"
+        else "Hybrid: ANE attention, GPU MoE (not full-ANE)"
+    )
     print(BANNER.format(
+        silicon=silicon,
         model_name=model_id,
         ctx_human=ctx_human,
         host=host,
