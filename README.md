@@ -241,4 +241,7 @@ Measured ANE vs GPU energy: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ANE op rules: [docs/ANE-REFERENCE.md](docs/ANE-REFERENCE.md).
 
-Apache-2.0.
+## License
+
+This project is licensed under the [Apache-2.0 License](LICENSE).
+Copyright 2026 True2456.
