@@ -31,8 +31,22 @@ import numpy as np
 
 try:
     from compression import zstd as _zstd
-except ImportError:  # Python <3.14: retain the uncompressed cache format.
-    _zstd = None
+except ImportError:
+    try:
+        import zstandard as _zstd_mod
+
+        class _ZstdShim:
+            @staticmethod
+            def decompress(data: bytes) -> bytes:
+                return _zstd_mod.ZstdDecompressor().decompress(data)
+
+            @staticmethod
+            def compress(data: bytes, level: int = 1) -> bytes:
+                return _zstd_mod.ZstdCompressor(level=level).compress(data)
+
+        _zstd = _ZstdShim()
+    except ImportError:  # Neither Python 3.14 stdlib nor zstandard package available.
+        _zstd = None
 
 
 FORBIDDEN_COMPUTE_MODULES = ("mlx", "torch", "coremltools")
@@ -212,6 +226,7 @@ class Checkpoint:
                 with manifest_path.open("r", encoding="utf-8") as f:
                     mdata = json.load(f)
                     self._quant_manifest = mdata.get("quant_manifest", mdata)
+                self.quant_cache_dir = self.path / "quant_cache"
             except Exception:
                 pass
         self._quant_by_tensor = {
