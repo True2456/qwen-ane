@@ -11,7 +11,7 @@ GPU-free spellings at Flash-Next shapes:
 
 Each arm is a child process so an ANE abort does not kill the suite.
 
-    /Users/true/.rindi/venvs/coreai/bin/python -u probes/flashnext_pure_ane_moe.py
+    python3 -u probes/flashnext_pure_ane_moe.py
 """
 from __future__ import annotations
 

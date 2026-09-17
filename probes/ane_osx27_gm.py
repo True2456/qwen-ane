@@ -217,7 +217,7 @@ def probe_espresso_gather_conv() -> None:
 import json, os, sys
 from pathlib import Path
 os.environ["Q38_ANE_REUSE_COMPILED"] = "0"
-sys.path.insert(0, str(Path("/Users/true/Desktop/LLM - Reap/ane-port")))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import coremltools as ct
 from coremltools.models import datatypes
 from coremltools.models.neural_network import NeuralNetworkBuilder
@@ -251,7 +251,7 @@ print("nn inner_product cannot bind live W; trying batched_mat_mul")
 import json, os, sys
 from pathlib import Path
 os.environ["Q38_ANE_REUSE_COMPILED"] = "0"
-sys.path.insert(0, str(Path("/Users/true/Desktop/LLM - Reap/ane-port")))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import coremltools as ct
 from coremltools.models import datatypes
 from coremltools.models.neural_network import NeuralNetworkBuilder

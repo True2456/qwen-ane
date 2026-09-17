@@ -6,7 +6,7 @@ unmodified 4-bit MLX model so the two numbers differ only by what the port
 changed: int8 activations and weights on the ANE, a hand-written MIL graph per
 layer, and fp16 mixers.
 
-    PYTHONPATH=/Users/true/.mlx128/mlx-lm:/Users/true/.mlx128/mlx/python \
+    PYTHONPATH=~/.mlx128/mlx-lm:~/.mlx128/mlx/python \
     ~/.rindi/venvs/coreai/bin/python probes/flashnext_ppl_mlx.py FILE [N]
 """
 from __future__ import annotations
@@ -31,7 +31,7 @@ if not hasattr(mx, "unique"):
 
     mx.unique = _unique
 
-MODEL = "/Users/true/models/Qwen3.8-Flash-Next-MLX-4bit"
+MODEL = str(Path.home() / "models/Qwen3.8-Flash-Next-MLX-4bit")
 # Feed the file in chunks through one prompt cache, so context accumulates the
 # way it does on the ANE arm. Scoring independent windows would measure a
 # different thing and would flatter neither arm honestly.

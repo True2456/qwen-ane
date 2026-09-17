@@ -10,7 +10,7 @@
 int main(int argc, char** argv) {
     const std::string path = argc > 1
         ? argv[1]
-        : "/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/gpu_backbone.safetensors";
+        : "~/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/gpu_backbone.safetensors";
 
     SafeTensorsLoader loader;
     if (!loader.open_file(path)) return EXIT_FAILURE;

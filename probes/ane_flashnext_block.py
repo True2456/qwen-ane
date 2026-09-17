@@ -72,7 +72,7 @@ from runtime.q38_ane_engine import (
     _nsarray_strings, _nsnumber_int, _nsstring, _objc, _sel,
 )
 
-MODEL = Path(os.environ.get("FLASH_NEXT", "/Users/true/models/Qwen3.8-Flash-Next"))
+MODEL = Path(os.environ.get("FLASH_NEXT", str(Path.home() / "models/Qwen3.8-Flash-Next")))
 SHARD = MODEL / "model-00001-of-00131.safetensors"
 PREFIX = "model.language_model.layers.0.linear_attn."
 

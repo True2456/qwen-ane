@@ -95,7 +95,7 @@ t24=0.0277  t25=0.0290  t26=0.0274  t27=0.0263  t28=0.0275  t29=0.0295  t30=0.03
 
 ### B. Agreement with MLX CPU Reference Ops (`probes/gdn_chunk_mlx_check.py`)
 
-Cross-checked the mathematical chunk equations against `_gated_delta_step_ops` and `compute_g` from `/Users/true/.mlx128/mlx-lm/mlx_lm/models/gated_delta.py` in double precision:
+Cross-checked the mathematical chunk equations against `_gated_delta_step_ops` and `compute_g` from `~/.mlx128/mlx-lm/mlx_lm/models/gated_delta.py` in double precision:
 - $K=1$: $\text{rel\_err}(Y) = 1.27 \times 10^{-7}$, $\text{rel\_err}(S) = 1.56 \times 10^{-8}$
 - $K=4$: $\text{rel\_err}(Y) = 2.32 \times 10^{-7}$, $\text{rel\_err}(S) = 9.10 \times 10^{-8}$
 - $K=8$: $\text{rel\_err}(Y) = 2.24 \times 10^{-7}$, $\text{rel\_err}(S) = 8.31 \times 10^{-8}$

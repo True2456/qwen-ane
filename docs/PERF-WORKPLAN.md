@@ -131,7 +131,7 @@ the server or TUI reports must come from a measured timer.
 
 ### Why MLX is still ~10x faster (source-verified, not guessed)
 MLX's real int4 GEMM lives locally at
-  /Users/true/AppleLLM/.build/checkouts/mlx-swift/Source/Cmlx/mlx-generated/
+  ~/AppleLLM/.build/checkouts/mlx-swift/Source/Cmlx/mlx-generated/
   metal/steel/gemm/{gemm.h, mma.h, loader.h} + kernels/steel_gemm_splitk.h.
 - gemm.h GEMMKernel: blocks the output into BMxBN tiles (NOT one row like
   ours); each threadgroup owns an output tile and streams A/B K-blocks

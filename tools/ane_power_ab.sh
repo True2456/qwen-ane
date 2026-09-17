@@ -7,7 +7,7 @@
 set -u
 REPO=${0:A:h:h}
 PY=${PYTHON:-python3}
-M=${Q38_MODEL:-/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B}
+M=${Q38_MODEL:-$HOME/.lmstudio/models/Qwen/Qwen3.8-27B}
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 

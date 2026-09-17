@@ -21,7 +21,7 @@ uint64_t fnv1a64(const std::string& text) {
 int main(int argc, char** argv) {
     const char* model = argc > 1
         ? argv[1]
-        : "/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi";
+        : "~/.lmstudio/models/Qwen/Qwen3.8-27B.rindi";
     const int max_tokens = argc > 2 ? std::atoi(argv[2]) : 16;
     if (max_tokens < 2) {
         std::fprintf(stderr, "max_tokens must be at least 2\n");

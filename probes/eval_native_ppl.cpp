@@ -13,7 +13,7 @@
 int main(int argc, char** argv) {
     const std::string model = argc > 1
         ? argv[1]
-        : "/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi";
+        : "~/.lmstudio/models/Qwen/Qwen3.8-27B.rindi";
     if (argc < 3) {
         std::fprintf(stderr, "usage: %s MODEL TEXT_FILE [MAX_TOKENS]\n", argv[0]);
         return 2;

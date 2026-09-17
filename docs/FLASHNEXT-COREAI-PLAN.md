@@ -11,7 +11,7 @@ venv `~/.rindi/venvs/coreai`.
 
 ## Guardrails
 
-- Base BF16 `/Users/true/models/Qwen3.8-Flash-Next` is **read-only mmap**.
+- Base BF16 `~/models/Qwen3.8-Flash-Next` is **read-only mmap**.
   Never write there. Artifacts go to `ane-port/artifacts/coreai/`.
 - PLE n-gram (~51B, `ple_layer_ids: [2]`) stays **off** the `.aimodel`.
 - 4-bit MLX / AWQ 2/3 are GPU/MLX artifacts, not the Core AI source. Convert
@@ -166,7 +166,7 @@ per-layer weights** rather than 48× resident graphs.
 
 ### P4 — PLE n-gram (layer index 1 / `ple_layer_ids: [2]`)
 
-- [x] **No** `ngram_index.json` in `/Users/true/models/Qwen3.8-Flash-Next`.
+- [x] **No** `ngram_index.json` in `~/models/Qwen3.8-Flash-Next`.
       128 `ngram_embedding.shard_*` tensors **do** live in the main safetensors
       (`shard_0` is `(2500012, 160)` ≈ 51B bf16 values / ~102 GB) but mlx-lm
       only wires `NGramTable` when the index JSON exists. Without it the
@@ -342,7 +342,7 @@ latency before any MoE work.
 
 `FLASHNEXT_PLE=1` produced ` passage states:` where the recorded MLX greedy is
 `[220, 17, 15, 15]` (`The 201…`). That reference was generated with the n-gram
-table **off**: `/Users/true/models/Qwen3.8-Flash-Next/ngram_index.json` does not
+table **off**: `~/models/Qwen3.8-Flash-Next/ngram_index.json` does not
 exist, so `set_ngram_lookup` is never called and `NGramEmbedding` returns zeros.
 Zero-PLE runs matched it because both sides had PLE disabled. A PLE-on run must
 be compared against MLX with a lookup installed, not against this prefix. The

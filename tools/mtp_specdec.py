@@ -27,7 +27,7 @@ from mlx_lm import load
 from mlx_lm.models import cache as kvcache
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--model", default="/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B")
+ap.add_argument("--model", default=str(Path.home() / ".lmstudio/models/Qwen/Qwen3.8-27B"))
 ap.add_argument("--mtp", default=None, help="separate -mtp dir; default uses the in-model head")
 ap.add_argument("--draft", type=int, default=2, help="draft depth k")
 ap.add_argument("--tokens", type=int, default=64)

@@ -19,7 +19,7 @@ static unsigned long long fnv(const std::vector<uint16_t>& v){
     return h;
 }
 int main(int argc, char** argv){
-    const char* model = argc>1?argv[1]:"/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi";
+    const char* model = argc>1?argv[1]:"~/.lmstudio/models/Qwen/Qwen3.8-27B.rindi";
     const std::string mode = argc>2?argv[2]:"one"; // one | all | metal
     SafeTensorsLoader loader;
     if(!loader.open_file(std::string(model)+"/gpu_backbone.safetensors")) return 2;

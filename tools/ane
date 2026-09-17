@@ -22,7 +22,7 @@
 set -u
 REPO=${0:A:h:h}
 PY=${PYTHON:-python3}
-MODEL=${Q38_MODEL:-/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B}
+MODEL=${Q38_MODEL:-$HOME/.lmstudio/models/Qwen/Qwen3.8-27B}
 require_py() {
   command -v "$PY" >/dev/null 2>&1 || { echo "Python not found: $PY"; exit 1; }
 }

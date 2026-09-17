@@ -81,7 +81,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 import runtime.q38_ane_engine as E
 from runtime.q38_ane_engine import AneEngine, _iosurface_view
 
-MODEL = Path(os.environ.get("FLASH_NEXT", "/Users/true/models/Qwen3.8-Flash-Next"))
+MODEL = Path(os.environ.get("FLASH_NEXT", str(Path.home() / "models/Qwen3.8-Flash-Next")))
 SHARD = MODEL / "model-00001-of-00131.safetensors"
 WNAME = "model.language_model.layers.0.linear_attn.in_proj_z.weight"
 

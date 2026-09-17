@@ -17,7 +17,7 @@ static float half_to_float(uint16_t bits) {
 
 int main() {
     SafeTensorsLoader loader;
-    if (!loader.open_file("/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/gpu_backbone.safetensors")) return 2;
+    if (!loader.open_file("~/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/gpu_backbone.safetensors")) return 2;
     ANEContext* ctx = ane_context_create();
     if (!ctx) return 2;
     RindiGdnConv conv;

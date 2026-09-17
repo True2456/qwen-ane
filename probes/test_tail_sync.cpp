@@ -19,7 +19,7 @@ static unsigned long long hash_range(const uint16_t* p, size_t n, int cols, int 
 
 int main(int argc, char** argv) {
     const char* model = argc > 1 ? argv[1]
-        : "/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi";
+        : "~/.lmstudio/models/Qwen/Qwen3.8-27B.rindi";
     SafeTensorsLoader loader;
     if (!loader.open_file(std::string(model) + "/gpu_backbone.safetensors")) return 2;
     RindiNativeChain chain(5120, 32);

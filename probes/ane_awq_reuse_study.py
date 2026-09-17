@@ -10,8 +10,8 @@ import struct
 
 import numpy as np
 
-BF16_DIR = "/Users/true/Desktop/models/Qwen3.8-27B"
-AWQ_DIR = "/Users/true/.lmstudio/models/truemod/Qwen3.8-27B-AWQ-gs64-mm"
+BF16_DIR = str(Path.home() / "models/Qwen3.8-27B")
+AWQ_DIR = str(Path.home() / ".lmstudio/models/truemod/Qwen3.8-27B-AWQ-gs64-mm")
 LAYER = 20
 
 

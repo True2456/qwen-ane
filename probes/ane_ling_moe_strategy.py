@@ -25,7 +25,7 @@ import runtime.q38_ane_engine as E
 from runtime.q38_ane_engine import AneEngine, AneDynamicLinear, _iosurface_view
 
 MODEL = os.environ.get("Q38_LING_MODEL",
-                       "/Users/true/.lmstudio/models/inclusionAI/Ling-3.0-tiny")
+                       str(Path.home() / ".lmstudio/models/inclusionAI/Ling-3.0-tiny"))
 H, M, NE, TOP_K = 1536, 512, 128, 8      # hidden, moe_intermediate, experts, top-k
 N_GROUP, TOPK_GROUP, SCALE = 8, 4, 2.5
 MOE_LAYERS = 23

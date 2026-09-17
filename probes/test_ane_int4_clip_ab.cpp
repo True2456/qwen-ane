@@ -31,7 +31,7 @@ float bits_to_float(uint16_t bits) {
 
 int main(int argc, char** argv) {
     const char* path = argc > 1 ? argv[1]
-        : "/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/gpu_backbone.safetensors";
+        : "~/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/gpu_backbone.safetensors";
     SafeTensorsLoader loader;
     if (!loader.open_file(path)) {
         std::fprintf(stderr, "open failed\n");

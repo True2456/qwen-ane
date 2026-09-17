@@ -5,8 +5,8 @@
 int main() {
     RindiNativeChain chain(5120, 32);
     SafeTensorsLoader loader;
-    if (!loader.open_file("/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/gpu_backbone.safetensors")) return 2;
-    const char* path = "/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/ane_layers";
+    if (!loader.open_file("~/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/gpu_backbone.safetensors")) return 2;
+    const char* path = "~/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/ane_layers";
     bool ok = true;
     for (int layer = 0; layer < 64; ++layer) {
         if (!chain.compile_layer(layer, path, loader)) {

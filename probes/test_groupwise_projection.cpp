@@ -3,7 +3,7 @@
 
 int main() {
     SafeTensorsLoader loader;
-    if (!loader.open_file("/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/gpu_backbone.safetensors")) return 2;
+    if (!loader.open_file("~/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/gpu_backbone.safetensors")) return 2;
     RindiAneProjection projection;
     if (!projection.compile_int4_host(loader, "layers.0.linear_attn.in_proj_qkv.weight")) return 3;
     std::vector<uint16_t> input;

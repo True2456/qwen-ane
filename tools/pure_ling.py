@@ -337,7 +337,7 @@ def inspect(model_dir: str) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", default=os.environ.get(
-        "Q38_LING_MODEL", "/Users/true/.lmstudio/models/inclusionAI/Ling-3.0-tiny"))
+        "Q38_LING_MODEL", str(Path.home() / ".lmstudio/models/inclusionAI/Ling-3.0-tiny")))
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("inspect")
     gen = sub.add_parser("reference-generate")

@@ -29,7 +29,7 @@ std::string run_engine(const char* model_path, const char* prompt,
 
 int main(int argc, char** argv) {
     const char* model_path = argc > 1 ? argv[1]
-        : "/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi";
+        : "~/.lmstudio/models/Qwen/Qwen3.8-27B.rindi";
     const char* prompt = argc > 2 ? argv[2]
         : "Count from 1 to 15, then explain why speculative decoding preserves output.";
     const int max_tokens = std::getenv("MTP_PROBE_TOKENS")

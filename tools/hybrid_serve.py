@@ -72,7 +72,7 @@ class HybridEngine:
 
     def __init__(
         self,
-        model_path: str = "/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B",
+        model_path: str = str(Path.home() / ".lmstudio/models/Qwen/Qwen3.8-27B"),
         dense_bits: int = 4,
         bake_cache: bool = True,
         mode: str = "turbo",
@@ -632,7 +632,7 @@ _REASONING_INSTRUCTIONS = {
 
 def main():
     p = argparse.ArgumentParser(description="Apple Silicon Hybrid Inference Engine (APC + Turbo/Silent)")
-    p.add_argument("--model", default="/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B")
+    p.add_argument("--model", default=str(Path.home() / ".lmstudio/models/Qwen/Qwen3.8-27B"))
     p.add_argument("--mode", default="silent", choices=["turbo", "silent"],
                    help="Default execution mode: 'silent' (Pure ANE @ ~5.9W) or 'turbo' (MTP+ANE)")
     p.add_argument("--tokens", type=int, default=64)

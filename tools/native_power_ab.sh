@@ -12,7 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR=${0:A:h}
 REPO_DIR=${SCRIPT_DIR:h}
-MODEL=${MODEL:-/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi}
+MODEL=${MODEL:-$HOME/.lmstudio/models/Qwen/Qwen3.8-27B.rindi}
 PROMPT_TOKENS=${PROMPT_TOKENS:-1024}
 GEN_TOKENS=${GEN_TOKENS:-128}
 WIDTHS=${WIDTHS:-"32 128"}

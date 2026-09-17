@@ -32,9 +32,9 @@ static float half_to_float(uint16_t bits) {
 
 int main() {
     constexpr size_t O = 5120, I = 6144, W = 32;
-    const char* base = "/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/ane_layers/chain0.o/";
-    auto q = read_file("/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/ane_layers/chain0.o/__.bin");
-    auto sc = read_file("/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/ane_layers/chain0.o/__s.bin");
+    const char* base = "~/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/ane_layers/chain0.o/";
+    auto q = read_file("~/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/ane_layers/chain0.o/__.bin");
+    auto sc = read_file("~/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/ane_layers/chain0.o/__s.bin");
     (void)base;
     if (q.size() != O * I / 2 || sc.size() != O * 2) return 2;
     const char* mil = R"MIL(program(1.3)

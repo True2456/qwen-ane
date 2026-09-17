@@ -1,7 +1,7 @@
 """Instrument the actual stage_generate loop; never extrapolate a microbenchmark.
 
 Example: FLASHNEXT_MOE=mlxresident FLASHNEXT_HEAD=mlx FLASHNEXT_PREFILL_K=16
-PYTHONPATH=/Users/true/.mlx128/mlx/python python probes/flashnext_moe_inloop.py
+PYTHONPATH=~/.mlx128/mlx/python python probes/flashnext_moe_inloop.py
 --output /tmp/ane-moe-baseline.json --tokens 700 --warmup 100
 """
 import argparse

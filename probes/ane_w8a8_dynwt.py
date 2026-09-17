@@ -63,7 +63,7 @@ import runtime.q38_ane_engine as E
 from runtime.q38_ane_engine import AneEngine, _iosurface_view
 
 MODEL = Path(os.environ.get(
-    "FLASH_NEXT", "/Users/true/models/Qwen3.8-Flash-Next"))
+    "FLASH_NEXT", str(Path.home() / "models/Qwen3.8-Flash-Next")))
 SHARD = MODEL / "model-00001-of-00131.safetensors"
 PREFIX = "model.language_model.layers.0.linear_attn."
 

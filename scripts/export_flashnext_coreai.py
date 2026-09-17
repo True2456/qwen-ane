@@ -3,7 +3,7 @@
 
 Authoring is Conv2d / BC1S so the Neural Engine compiler sees convolutions,
 not Linear-decomposed GEMMs. Weights come from the BF16 base via read-only
-mmap; nothing is written under /Users/true/models/Qwen3.8-Flash-Next.
+mmap; nothing is written under models/Qwen3.8-Flash-Next.
 
 Stages (run in order):
   smoke   tiny random Conv2d SwiGLU, S=32

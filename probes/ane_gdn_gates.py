@@ -10,7 +10,7 @@ from runtime.q38_ane_engine import AneEngine, _iosurface_view
 H, S = 48, 32
 eng = AneEngine()
 rng = np.random.default_rng(77)
-model_path = os.environ.get("Q38_MODEL", "/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B")
+model_path = os.environ.get("Q38_MODEL", str(Path.home() / ".lmstudio/models/Qwen/Qwen3.8-27B"))
 try:
     import mlx.core as mx
     from mlx_lm import load

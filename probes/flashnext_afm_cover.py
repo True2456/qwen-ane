@@ -4,8 +4,8 @@
 Records Flash-Next top-10 routes during MLX greedy generate and reports the
 pin size / refresh cadence that would keep decode on a baked ANE expert set.
 
-    PYTHONPATH=/Users/true/.mlx128/mlx-lm:/Users/true/.mlx128/mlx/python \\
-      /Users/true/.rindi/venvs/coreai/bin/python -u probes/flashnext_afm_cover.py \\
+    PYTHONPATH=~/.mlx128/mlx-lm:~/.mlx128/mlx/python \\
+      python3 -u probes/flashnext_afm_cover.py \\
       cover --max-new 600
 
     ... pin-bench --k 16,32
@@ -27,7 +27,7 @@ sys.path.insert(0, str(ROOT))
 from runtime.afm_cover import covering_report, format_report  # noqa: E402
 
 MODEL = os.environ.get(
-    "FLASHNEXT_MLX4", "/Users/true/models/Qwen3.8-Flash-Next-MLX-4bit"
+    "FLASHNEXT_MLX4", str(Path.home() / "models/Qwen3.8-Flash-Next-MLX-4bit")
 )
 OUT = ROOT / "artifacts" / "coreai"
 DEFAULT_PROMPT = (

@@ -2,7 +2,7 @@
 #include <cstdio>
 
 int main() {
-    RindiEngine engine("/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi");
+    RindiEngine engine("~/.lmstudio/models/Qwen/Qwen3.8-27B.rindi");
     if (!engine.is_ready()) return 2;
     const std::string prompt = "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n";
     const std::string text = engine.generate(prompt, 32, 0.7f);

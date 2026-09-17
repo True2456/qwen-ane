@@ -18,8 +18,8 @@ import time
 
 import numpy as np
 
-QWEN36 = "/Users/true/.lmstudio/models/mlx-community/Qwen3.6-35B-A3B-bf16"
-QWEN38 = "/Users/true/Desktop/models/Qwen3.8-27B"
+QWEN36 = str(Path.home() / ".lmstudio/models/mlx-community/Qwen3.6-35B-A3B-bf16")
+QWEN38 = str(Path.home() / "models/Qwen3.8-27B")
 LAYERS = [5, 20, 35]
 EXPERTS = [0, 63]
 

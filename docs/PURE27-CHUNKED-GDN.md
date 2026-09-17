@@ -97,7 +97,7 @@ env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P -m pytest \
 
 ```sh
 env -u PYTHONPATH Q38_ANE_REUSE_COMPILED=1 \
-  Q38_MODEL=/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B \
+  Q38_MODEL=~/.lmstudio/models/Qwen/Qwen3.8-27B \
   /opt/homebrew/bin/python3 -u -P probes/pure27_chunk_bench.py
 ```
 

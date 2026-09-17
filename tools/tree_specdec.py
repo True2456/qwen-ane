@@ -25,7 +25,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--model", default="/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B")
+ap.add_argument("--model", default=str(Path.home() / ".lmstudio/models/Qwen/Qwen3.8-27B"))
 ap.add_argument("--mtp", default=None, help="separate -mtp dir; default uses in-model head")
 ap.add_argument("--tokens", type=int, default=64)
 ap.add_argument("--top-b1", type=int, default=3, help="tree branching factor depth 1")

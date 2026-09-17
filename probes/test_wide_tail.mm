@@ -12,7 +12,7 @@ extern "C" {
 #include <cstring>
 
 int main() {
-    NSString* model_path = @"/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi";
+    NSString* model_path = @"~/.lmstudio/models/Qwen/Qwen3.8-27B.rindi";
     ANEContext* ctx = ane_context_create();
     if (!ctx) { printf("no ANE ctx\n"); return 1; }
 

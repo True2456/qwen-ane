@@ -11,9 +11,9 @@ activation scales can be calibrated against real numbers instead of guesses.
 Reference sources (NOT invented here)
 -------------------------------------
 Primary, and the one the code follows op-for-op:
-    /Users/true/.mlx128/mlx-lm/mlx_lm/models/qwen4_exp.py
-    /Users/true/.mlx128/mlx-lm/mlx_lm/models/gated_delta.py
-    /Users/true/.mlx128/mlx-lm/mlx_lm/models/switch_layers.py
+    ~/.mlx128/mlx-lm/mlx_lm/models/qwen4_exp.py
+    ~/.mlx128/mlx-lm/mlx_lm/models/gated_delta.py
+    ~/.mlx128/mlx-lm/mlx_lm/models/switch_layers.py
   This is an MLX port of HF transformers `modeling_qwen4_exp.py` /
   `modular_qwen4_exp.py` (huggingface/transformers PR #48337), per its own
   module docstring. `qwen4_exp` is exactly this model's `model_type`.
@@ -66,7 +66,7 @@ import numpy as np
 
 _F_NOCACHE = getattr(fcntl, "F_NOCACHE", 48)
 
-DEFAULT_MODEL = "/Users/true/models/Qwen3.8-Flash-Next"
+DEFAULT_MODEL = os.environ.get("FLASHNEXT_MODEL", str(Path.home() / "models/Qwen3.8-Flash-Next"))
 
 RECURRENCE_DOC = """\
 gated delta net (Qwen3-Next / qwen4_exp linear_attention), per value head h:
@@ -1023,7 +1023,7 @@ def check_prefill_vs_step(weights: LayerWeights, hidden: np.ndarray,
 # ---------------------------------------------------------------------------
 # optional cross-check against mlx-lm's independent implementation
 # ---------------------------------------------------------------------------
-MLX_LM_PATH = "/Users/true/.mlx128/mlx-lm"
+MLX_LM_PATH = str(Path.home() / ".mlx128/mlx-lm")
 
 
 def crosscheck_mlx(weights: LayerWeights, hidden_hc: np.ndarray,

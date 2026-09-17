@@ -81,8 +81,8 @@ observed allocation limit.
 FLASHNEXT_MOE=mlxresident FLASHNEXT_HEAD=mlx FLASHNEXT_PREFILL_K=16 \
 FLASHNEXT_QSA_FOLDED=0 FLASHNEXT_ANE_WORKER=1 FLASHNEXT_STRICT_LOAD=1 \
 FLASHNEXT_MOE_DTYPE=float32 \
-PYTHONPATH=/Users/true/.mlx128/mlx/python \
-/Users/true/.rindi/venvs/coreai/bin/python -u probes/flashnext_moe_inloop.py \
+PYTHONPATH=~/.mlx128/mlx/python \
+~/.rindi/venvs/coreai/bin/python -u probes/flashnext_moe_inloop.py \
   --tokens 700 --warmup 100 --validate --output /tmp/ane-moe-fp32.json
 ```
 
@@ -93,7 +93,7 @@ decoder inputs from layers 0, 3, 24 and 47 at the start and end of the measured
 window. Then run:
 
 ```sh
-/Users/true/.rindi/venvs/coreai/bin/python probes/run_flashnext_moe_swift.py \
+~/.rindi/venvs/coreai/bin/python probes/run_flashnext_moe_swift.py \
   /tmp/ane-moe-fixtures
 ```
 

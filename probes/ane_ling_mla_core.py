@@ -33,7 +33,7 @@ from runtime.q38_ane_engine import AneEngine, _iosurface_view
 from pure_ling import load
 
 MODEL = os.environ.get("Q38_LING_MODEL",
-                       "/Users/true/.lmstudio/models/inclusionAI/Ling-3.0-tiny")
+                       str(Path.home() / ".lmstudio/models/inclusionAI/Ling-3.0-tiny"))
 LAYER, L = 3, 256
 
 checkpoint, spec = load(MODEL)

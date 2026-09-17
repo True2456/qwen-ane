@@ -655,7 +655,7 @@ def relative(got: np.ndarray, expected: np.ndarray) -> float:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get(
-        "Q38_MODEL", "/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B"))
+        "Q38_MODEL", str(Path.home() / ".lmstudio/models/Qwen/Qwen3.8-27B")))
     parser.add_argument("--engine-path", default=os.environ.get(
         "Q38_ANE_ENGINE", ROOT))
     parser.add_argument("--tokens", type=int, choices=(2,4,8,16,32,64), default=64)

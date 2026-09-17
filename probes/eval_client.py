@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-MLX4 = "/Users/true/models/Qwen3.8-Flash-Next-MLX-4bit"
+MLX4 = str(Path.home() / "models/Qwen3.8-Flash-Next-MLX-4bit")
 
 
 class AneClient:

@@ -34,9 +34,9 @@ from runtime.ane_fused_w8a8 import MultiOut, Prog  # noqa: E402
 from runtime.q38_ane_engine import AneEngine  # noqa: E402
 from tools.flashnext_reference import FlashNextLoader  # noqa: E402
 
-BASE = Path("/Users/true/models/Qwen3.8-Flash-Next")
-MLX4 = Path("/Users/true/models/Qwen3.8-Flash-Next-MLX-4bit")
-AWQ = Path("/Users/true/models/Qwen3.8-Flash-Next-MLX-AWQ-3b2b")
+BASE = Path.home() / "models/Qwen3.8-Flash-Next"
+MLX4 = Path.home() / "models/Qwen3.8-Flash-Next-MLX-4bit"
+AWQ = Path.home() / "models/Qwen3.8-Flash-Next-MLX-AWQ-3b2b"
 assert BASE.is_dir() and BASE.resolve() != ROOT.resolve()
 
 H, I, K = 2560, 640, 10

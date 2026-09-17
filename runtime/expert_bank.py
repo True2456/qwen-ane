@@ -1,6 +1,6 @@
 """MLX 4-bit routed-expert library for host MoE.
 
-Reads ``/Users/true/models/Qwen3.8-Flash-Next-MLX-4bit/model.safetensors``
+Reads ``models/Qwen3.8-Flash-Next-MLX-4bit/model.safetensors``
 (affine gs=64, bits=4 on ``switch_mlp.{gate,up,down}_proj``). GDN/QSA stay
 the fp16 ANE ``.aimodel``s. Shared expert is 8-bit in that checkpoint (tiny).
 Does not touch ``ngram_embedding``. Does not write the BF16 tree.
@@ -70,7 +70,7 @@ BITS_SHARED = 8
 GU_SHAPE = (2 * I, H)
 DN_SHAPE = (H, I)
 
-MLX4_DEFAULT = Path("/Users/true/models/Qwen3.8-Flash-Next-MLX-4bit/model.safetensors")
+MLX4_DEFAULT = Path.home() / "models" / "Qwen3.8-Flash-Next-MLX-4bit" / "model.safetensors"
 ART_DEFAULT = Path(__file__).resolve().parents[1] / "artifacts" / "experts"
 
 _U32 = np.uint32

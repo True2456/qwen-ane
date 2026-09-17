@@ -104,8 +104,11 @@ bool RindiEngine::init_model() {
     // 2. Load Tokenizer
     std::string tok_path = model_path_ + "/tokenizer.json";
     if (!tokenizer_.load(tok_path)) {
-        tok_path = "/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B/tokenizer.json";
-        tokenizer_.load(tok_path);
+        const char* home = std::getenv("HOME");
+        if (home) {
+            tok_path = std::string(home) + "/.lmstudio/models/Qwen/Qwen3.8-27B/tokenizer.json";
+            tokenizer_.load(tok_path);
+        }
     }
 
     // 3. Load Safetensors Backbone
@@ -113,8 +116,11 @@ bool RindiEngine::init_model() {
     if (!safetensors_.open_file(st_path)) {
         st_path = model_path_ + "/model.safetensors";
         if (!safetensors_.open_file(st_path)) {
-            st_path = "/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/gpu_backbone.safetensors";
-            safetensors_.open_file(st_path);
+            const char* home = std::getenv("HOME");
+            if (home) {
+                st_path = std::string(home) + "/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/gpu_backbone.safetensors";
+                safetensors_.open_file(st_path);
+            }
         }
     }
 

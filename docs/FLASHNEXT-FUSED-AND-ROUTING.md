@@ -1,7 +1,7 @@
 # Flash-Next on ANE: fused projections + routing (Sep 2026)
 
 Machine: M5 Max, ANE h17, macOS 27.0 (26A428). Model:
-`/Users/true/models/Qwen3.8-Flash-Next`.
+`~/models/Qwen3.8-Flash-Next`.
 
 ## What is proven
 

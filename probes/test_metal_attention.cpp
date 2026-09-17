@@ -94,7 +94,7 @@ PathResult run_path(RindiAttention& attn, const std::vector<uint16_t>& hidden,
 
 int main(int argc, char** argv) {
     const char* model_dir = argc > 1 ? argv[1]
-        : "/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi";
+        : "~/.lmstudio/models/Qwen/Qwen3.8-27B.rindi";
     SafeTensorsLoader loader;
     if (!loader.open_file(std::string(model_dir) + "/gpu_backbone.safetensors")) {
         std::fprintf(stderr, "FAIL open backbone\n");

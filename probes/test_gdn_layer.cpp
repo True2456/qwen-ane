@@ -9,7 +9,7 @@ int main(int argc, char** argv) {
     const size_t lanes = argc > 2 ? static_cast<size_t>(std::strtoul(argv[2], nullptr, 10)) : 1;
     ANEContext* ctx = ane_context_create();
     SafeTensorsLoader loader;
-    const char* path = "/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/gpu_backbone.safetensors";
+    const char* path = "~/.lmstudio/models/Qwen/Qwen3.8-27B.rindi/gpu_backbone.safetensors";
     if (!ctx || !loader.open_file(path)) return 2;
 
     RindiGdnLayer layer;

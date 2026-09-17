@@ -7,7 +7,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-BASE = Path("/Users/true/models/Qwen3.8-Flash-Next")
+BASE = Path(os.environ.get("FLASHNEXT_MODEL", Path.home() / "models/Qwen3.8-Flash-Next"))
 
 
 def _need_checkpoint():

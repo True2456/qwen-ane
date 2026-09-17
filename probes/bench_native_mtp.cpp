@@ -84,7 +84,7 @@ std::string make_prompt(BPETokenizer& tokenizer, size_t target_tokens) {
 int main(int argc, char** argv) {
     const std::string model = argc > 1
         ? argv[1]
-        : "/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi";
+        : "~/.lmstudio/models/Qwen/Qwen3.8-27B.rindi";
     const int target_prompt_tokens = argc > 2 ? std::atoi(argv[2]) : 1024;
     const int max_tokens = argc > 3 ? std::atoi(argv[3]) : 128;
     if (target_prompt_tokens < 64 || max_tokens < 2) {

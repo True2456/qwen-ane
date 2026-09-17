@@ -102,8 +102,8 @@ def export_rindi_package(model_path: str, output_path: str, dense_bits: int = 4,
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Export a unified .rindi single model package")
-    p.add_argument("--model", default="/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B", help="Source base model directory")
-    p.add_argument("--output", default="/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi", help="Output .rindi package path")
+    p.add_argument("--model", default=str(Path.home() / ".lmstudio/models/Qwen/Qwen3.8-27B"), help="Source base model directory")
+    p.add_argument("--output", default=str(Path.home() / ".lmstudio/models/Qwen/Qwen3.8-27B.rindi"), help="Output .rindi package path")
     p.add_argument("--bits", type=int, default=4, help="Quantization precision bits")
     args = p.parse_args()
 

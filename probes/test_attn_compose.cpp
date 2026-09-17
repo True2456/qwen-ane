@@ -10,7 +10,7 @@
 static uint32_t rs=11;
 static uint16_t rnd16(){ rs=rs*1103515245u+12345u; return (uint16_t)((rs>>16)|0x3800); }
 int main(int argc, char** argv){
-    const char* model = argc>1?argv[1]:"/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi";
+    const char* model = argc>1?argv[1]:"~/.lmstudio/models/Qwen/Qwen3.8-27B.rindi";
     SafeTensorsLoader loader;
     if(!loader.open_file(std::string(model)+"/gpu_backbone.safetensors")) return 2;
     ANEContext* ane = ane_context_create();

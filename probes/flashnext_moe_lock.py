@@ -4,7 +4,7 @@
 Prefill uses full top-10. Decode masks the router to a frozen per-layer set.
 If greedy tokens hold, that set is what we bake on ANE.
 
-    PYTHONPATH="$HOME/Desktop/LLM - Reap:$HOME/.mlx128/mlx-lm" \
+    PYTHONPATH=".:$HOME/.mlx128/mlx-lm" \
       python3 -u probes/flashnext_moe_lock.py
 """
 from __future__ import annotations

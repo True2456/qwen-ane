@@ -47,7 +47,7 @@ for what this model is asked to do and avoids any question about what a
 downloaded benchmark set contains.
 
 ```bash
-PYTHONPATH=/Users/true/.mlx128/mlx-lm:/Users/true/.mlx128/mlx/python \
+PYTHONPATH=~/.mlx128/mlx-lm:~/.mlx128/mlx/python \
   ~/.rindi/venvs/coreai/bin/python probes/flashnext_ppl_mlx.py eval/prose.txt 2048
 ```
 

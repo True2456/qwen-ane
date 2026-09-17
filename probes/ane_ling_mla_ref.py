@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
 from pure_ling import load
 
 MODEL = os.environ.get("Q38_LING_MODEL",
-                       "/Users/true/.lmstudio/models/inclusionAI/Ling-3.0-tiny")
+                       str(Path.home() / ".lmstudio/models/inclusionAI/Ling-3.0-tiny"))
 LAYER, T = 3, 12
 
 checkpoint, spec = load(MODEL)

@@ -165,16 +165,16 @@ rediscovering the same rejections.
 ## 8. Environment
 
 ```bash
-cd ~/Desktop/LLM\ -\ Reap/ane-port
+cd /path/to/qwen-ane
 # Core AI / ANE work
-/Users/true/.rindi/venvs/coreai/bin/python
+~/.rindi/venvs/coreai/bin/python
 # anything touching MLX
-PYTHONPATH=/Users/true/.mlx128/mlx/python /Users/true/.rindi/venvs/coreai/bin/python
+PYTHONPATH=~/.mlx128/mlx/python ~/.rindi/venvs/coreai/bin/python
 
 # the decode loop
 FLASHNEXT_MOE=mlxresident FLASHNEXT_HEAD=mlx FLASHNEXT_PREFILL_K=16 \
-PYTHONPATH=/Users/true/.mlx128/mlx/python \
-/Users/true/.rindi/venvs/coreai/bin/python -u scripts/export_flashnext_coreai.py \
+PYTHONPATH=~/.mlx128/mlx/python \
+~/.rindi/venvs/coreai/bin/python -u scripts/export_flashnext_coreai.py \
   generate --max-new 12 --prompt-ids 760
 ```
 

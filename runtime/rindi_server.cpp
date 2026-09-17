@@ -1037,9 +1037,9 @@ int main(int argc, char* argv[]) {
     config.model_name = "Qwen3.8-27B";
     config.device_name = "Apple M5 Max";
     config.mode = "silent";
-    config.resident_layers = 64;
-
-    std::string model_path = "/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B.rindi";
+    const char* env_model = std::getenv("Q38_MODEL");
+    const char* env_home = std::getenv("HOME");
+    std::string model_path = env_model ? env_model : (env_home ? std::string(env_home) + "/.lmstudio/models/Qwen/Qwen3.8-27B.rindi" : "model.rindi");
     bool chat_only = false;
 
     for (int i = 1; i < argc; i++) {

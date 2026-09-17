@@ -47,7 +47,7 @@ def restore(caches, snap):
 
 def main():
     p = argparse.ArgumentParser(description="Heterogeneous Metal GPU + ANE Speculative Decoding")
-    p.add_argument("--model", default="/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B")
+    p.add_argument("--model", default=str(Path.home() / ".lmstudio/models/Qwen/Qwen3.8-27B"))
     p.add_argument("--mtp", default=None)
     p.add_argument("--tokens", type=int, default=64)
     p.add_argument("--draft", type=int, default=3)

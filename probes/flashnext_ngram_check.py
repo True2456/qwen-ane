@@ -8,7 +8,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from runtime.flashnext_ngram import NgramRows, CpuPLE
 from mlx_lm.models.qwen4_exp import TextConfig, PLELayer, NGramTable
 
-root=Path("/Users/true/models/Qwen3.8-Flash-Next")
+root=Path.home() / "models/Qwen3.8-Flash-Next"
 rows=NgramRows(root)
 index=Path(__file__).resolve().parents[1]/"artifacts/coreai/ngram_index.json"
 rows.write_index(index)

@@ -21,7 +21,7 @@ def run_agentic_benchmark():
 
     # 1. Initialize Hybrid Engine in Turbo Mode with APC
     engine = HybridEngine(
-        model_path="/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B",
+        model_path=str(Path.home() / ".lmstudio/models/Qwen/Qwen3.8-27B"),
         mode="turbo",
         draft_depth=3,
     )
@@ -40,7 +40,7 @@ def run_agentic_benchmark():
         "3. Output valid tool calls in XML format: <tool_call><name>...</name><args>...</args></tool_call>.\n"
         "4. Verify all changes with automated unit tests before reporting completion.\n\n"
         "Current Workspace State:\n"
-        "Repository: /Users/true/Desktop/LLM - Reap/ane-port\n"
+        "Repository: /path/to/qwen-ane\n"
         "Architecture: Apple Silicon M5 Max (16-core ANE, 40-core GPU, Unified RAM)\n"
         "Active files: runtime/metal_engine.m, runtime/apc_cache.py, tools/hybrid_serve.py\n"
     )
