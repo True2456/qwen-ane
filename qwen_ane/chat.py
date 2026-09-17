@@ -401,12 +401,17 @@ def start_chat(
 
     # 1. Start background inference server if not running
     server_proc = None
+    server_log = None
     if not is_server_running(host, port):
         print(f"\033[38;2;153;153;153mStarting background {canon} engine on port {port}...\033[0m", flush=True)
         resolved_path = ensure_model(canon, custom_path=model_path, hf_repo=hf_repo)
 
         env = dict(os.environ)
+        env["QWEN_ANE_QUIET"] = "1"
         root = Path(__file__).resolve().parents[1]
+        log_path = get_qwen_ane_dir() / "server.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        server_log = open(log_path, "a", encoding="utf-8")
 
         if canon == "flash-next":
             env.update({
@@ -430,6 +435,7 @@ def start_chat(
                 str(ctx),
                 "--max-new",
                 str(max_tokens),
+                "--quiet",
             ]
         else:
             env.update({
@@ -461,9 +467,16 @@ def start_chat(
                 "4",
                 "--mtp-draft",
                 os.environ.get("Q38_ANE_MTP_DRAFT", "0"),
+                "--quiet",
             ]
 
-        server_proc = subprocess.Popen(cmd, env=env, cwd=str(root))
+        server_proc = subprocess.Popen(
+            cmd,
+            env=env,
+            cwd=str(root),
+            stdout=server_log,
+            stderr=server_log,
+        )
 
         # Wait for server to become ready
         for _ in range(120):
@@ -471,9 +484,11 @@ def start_chat(
                 break
             time.sleep(1.0)
         else:
-            print(f"\033[31mError: Server timed out while starting.\033[0m")
+            print(f"\033[31mError: Server timed out while starting. See {log_path} for details.\033[0m")
             if server_proc:
                 server_proc.terminate()
+            if server_log:
+                server_log.close()
             return 1
 
     session = ChatSession(
@@ -704,5 +719,10 @@ def start_chat(
                 server_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 server_proc.kill()
+        if server_log:
+            try:
+                server_log.close()
+            except Exception:
+                pass
 
     return 0

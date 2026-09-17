@@ -324,6 +324,8 @@ class TextEmitter:
 
     def token(self,token_id:int)->bool:
         self.ids.append(token_id);self.decoded=self.tokenizer.decode(self.ids)
+        if self.decoded.endswith("\ufffd"):
+            return True
         ends=[self.decoded.find(stop) for stop in self.stops]
         ends=[x for x in ends if x>=0]
         if ends:
@@ -490,10 +492,11 @@ class PureAneService:
             self.requests+=1;self.total_prompt_tokens+=len(prompt_ids)
             self.total_completion_tokens+=len(ids);self.total_inference_seconds+=seconds
             self.last_result=result.copy()
-        print(f"PURE_ANE_REQUEST prompt={len(prompt_ids)} generated={len(ids)} "
-              f"ttft={ttft:.3f}s seconds={seconds:.3f} tok_s={result['tokens_per_second']:.3f} "
-              f"queue={result['queue_seconds']:.3f}s cache={'hit' if cache_hit else 'miss'} "
-              f"reused={prefilled}",flush=True)
+        if not getattr(self.args, "quiet", False) and os.environ.get("QWEN_ANE_QUIET") != "1":
+            print(f"PURE_ANE_REQUEST prompt={len(prompt_ids)} generated={len(ids)} "
+                  f"ttft={ttft:.3f}s seconds={seconds:.3f} tok_s={result['tokens_per_second']:.3f} "
+                  f"queue={result['queue_seconds']:.3f}s cache={'hit' if cache_hit else 'miss'} "
+                  f"reused={prefilled}",flush=True)
         return result
 
 
@@ -544,7 +547,9 @@ def _thinking_options(req:dict[str,Any],*,default:bool=True)->tuple[bool,str]:
 def build_handler(service:PureAneService):
     class Handler(BaseHTTPRequestHandler):
         protocol_version="HTTP/1.1";server_version="PureANE/0.1"
-        def log_message(self,fmt:str,*args:Any)->None:print("  HTTP "+fmt%args,flush=True)
+        def log_message(self,fmt:str,*args:Any)->None:
+            if not getattr(service.args, "quiet", False) and os.environ.get("QWEN_ANE_QUIET") != "1":
+                print("  HTTP "+fmt%args,flush=True)
         def _json(self,obj:Any,status:int=200)->None:
             body=json.dumps(obj,separators=(",",":"),allow_nan=False).encode()
             self.send_response(status);self.send_header("Content-Type","application/json")
@@ -602,13 +607,14 @@ def build_handler(service:PureAneService):
             cid="chatcmpl-"+uuid.uuid4().hex
             stream=bool(req.get("stream",False))
             created=int(time.time())
-            print(
-                f"  req stream={stream} tools={len(functions)} msgs="
-                f"{len(req.get('messages') or [])} max_tokens={options['max_tokens']} "
-                f"client_max={req.get('max_tokens') or req.get('max_completion_tokens')} "
-                f"think={enable_thinking}/{reasoning_effort} prompt_chars={len(prompt)}",
-                flush=True,
-            )
+            if not getattr(service.args, "quiet", False) and os.environ.get("QWEN_ANE_QUIET") != "1":
+                print(
+                    f"  req stream={stream} tools={len(functions)} msgs="
+                    f"{len(req.get('messages') or [])} max_tokens={options['max_tokens']} "
+                    f"client_max={req.get('max_tokens') or req.get('max_completion_tokens')} "
+                    f"think={enable_thinking}/{reasoning_effort} prompt_chars={len(prompt)}",
+                    flush=True,
+                )
             if stream:
                 self._sse_start();self._sse({"id":cid,"object":"chat.completion.chunk","created":created,"model":service.args.name,"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":None}]})
                 def emit_content(delta:str)->None:
@@ -706,6 +712,8 @@ def main()->None:
     s.add_argument("--down-proj-parts",type=int,choices=(1,4),default=4,
                    help="input-channel partitions for packed ANE down_proj")
     s.add_argument("--max-request-bytes",type=int,default=8*1024*1024)
+    s.add_argument("--quiet",action="store_true",
+                   help="suppress per-request logging to stdout")
     b=sub.add_parser("bench");b.add_argument("--url",default="http://127.0.0.1:1240")
     b.add_argument("--prompt",default="Reply with exactly: OK");b.add_argument("--tokens",type=int,default=16)
     b.add_argument("--raw-prompt",action="store_true")

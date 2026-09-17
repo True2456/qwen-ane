@@ -250,11 +250,11 @@ def client_error(exc: BaseException) -> tuple[int, str]:
 class Engine:
     """The serve subprocess, behind a lock."""
 
-    def __init__(self, ctx: int, spec: int, prefill_k: int, max_new: int = 2048):
+    def __init__(self, ctx: int, spec: int, prefill_k: int, max_new: int = 2048, quiet: bool = False):
         self.lock = threading.Lock()
         self.max_new = max_new
         self.client = eval_client.AneClient(ctx=ctx, spec=spec,
-                                            prefill_k=prefill_k, quiet=False)
+                                            prefill_k=prefill_k, quiet=quiet)
 
     def chat(self, body: dict) -> dict:
         raw = body.get("max_tokens", body.get("max_completion_tokens"))
@@ -336,9 +336,11 @@ def stream_deltas(message: dict) -> list[dict]:
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     engine: Engine = None
+    quiet: bool = False
 
     def log_message(self, fmt, *a):
-        sys.stderr.write("  %s\n" % (fmt % a))
+        if not self.quiet and os.environ.get("QWEN_ANE_QUIET") != "1":
+            sys.stderr.write("  %s\n" % (fmt % a))
 
     def _send(self, code: int, payload: dict):
         body = json.dumps(payload).encode()
@@ -399,11 +401,12 @@ class Handler(BaseHTTPRequestHandler):
         ctk = body.get("chat_template_kwargs")
         ctk = ctk if isinstance(ctk, dict) else {}
         think = body.get("enable_thinking", ctk.get("enable_thinking"))
-        sys.stderr.write(
-            "  req %s stream=%s tools=%d msgs=%d max_tokens=%s think=%s bytes=%d\n"
-            % (rid[:16], stream, n_tools, len(msgs),
-               body.get("max_tokens") or body.get("max_completion_tokens"),
-               think, n))
+        if not self.quiet and os.environ.get("QWEN_ANE_QUIET") != "1":
+            sys.stderr.write(
+                "  req %s stream=%s tools=%d msgs=%d max_tokens=%s think=%s bytes=%d\n"
+                % (rid[:16], stream, n_tools, len(msgs),
+                   body.get("max_tokens") or body.get("max_completion_tokens"),
+                   think, n))
         box: dict = {}
 
         def run():
@@ -463,12 +466,13 @@ class Handler(BaseHTTPRequestHandler):
         dec_s = max(wall_ms - pf_ms, 0.0) / 1000.0
         pf_tps = (n_new / pf_s) if pf_s > 0 else 0.0
         dec_tps = (n_gen / dec_s) if dec_s > 0 else 0.0
-        sys.stderr.write(
-            "  done %s prompt=%d reused=%d new=%d gen=%d  "
-            "wall=%.1f tok/s  prefill=%d/%.0fms %.1f tok/s  "
-            "decode=%.1f tok/s\n"
-            % (rid[:16], n_prompt, n_reused, n_new, n_gen,
-               float(res.get("tok_s") or 0), n_new, pf_ms, pf_tps, dec_tps))
+        if not self.quiet and os.environ.get("QWEN_ANE_QUIET") != "1":
+            sys.stderr.write(
+                "  done %s prompt=%d reused=%d new=%d gen=%d  "
+                "wall=%.1f tok/s  prefill=%d/%.0fms %.1f tok/s  "
+                "decode=%.1f tok/s\n"
+                % (rid[:16], n_prompt, n_reused, n_new, n_gen,
+                   float(res.get("tok_s") or 0), n_new, pf_ms, pf_tps, dec_tps))
         if not stream:
             self._send(200, _completion(res, rid, body.get("tools")))
             return
@@ -510,12 +514,18 @@ def main() -> int:
                     help="prompt block width; 0 walks prompts at decode width")
     ap.add_argument("--max-new", type=int, default=2048,
                     help="cap on max_tokens; clients like Qwen Code send 64k")
+    ap.add_argument("--quiet", action="store_true",
+                    help="suppress request logging to stderr")
     a = ap.parse_args()
-    print(f"loading {MODEL}; this takes a couple of minutes", flush=True)
+    is_quiet = a.quiet or os.environ.get("QWEN_ANE_QUIET") == "1"
+    Handler.quiet = is_quiet
+    if not is_quiet:
+        print(f"loading {MODEL}; this takes a couple of minutes", flush=True)
     t0 = time.perf_counter()
-    Handler.engine = Engine(a.ctx, a.spec, a.prefill_k, max_new=a.max_new)
-    print(f"ready in {time.perf_counter() - t0:.0f}s on "
-          f"http://{a.host}:{a.port}/v1", flush=True)
+    Handler.engine = Engine(a.ctx, a.spec, a.prefill_k, max_new=a.max_new, quiet=is_quiet)
+    if not is_quiet:
+        print(f"ready in {time.perf_counter() - t0:.0f}s on "
+              f"http://{a.host}:{a.port}/v1", flush=True)
     ThreadingHTTPServer((a.host, a.port), Handler).serve_forever()
     return 0
 
