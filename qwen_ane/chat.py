@@ -194,7 +194,6 @@ def start_chat(
                 str(max_tokens),
             ]
         else:
-            ctx_27b = min(ctx, 4096)
             env.update({
                 "Q38_ANE_REUSE_COMPILED": "1",
                 "Q38_ANE_FUSED_TAIL": "1",
@@ -202,6 +201,7 @@ def start_chat(
                 "Q38_ANE_FUSE_GATE": "0",
                 "Q38_ANE_HOST_PREPARE": "1",
                 "Q38_ANE_BATCH_ATTN": "16",
+                "Q38_ANE_GDN_PREFILL": os.environ.get("Q38_ANE_GDN_PREFILL", "chunk"),
                 "Q38_MODEL": str(resolved_path),
             })
             env.pop("PYTHONPATH", None)
@@ -218,9 +218,11 @@ def start_chat(
                 "--port",
                 str(port),
                 "--context",
-                str(ctx_27b),
+                str(ctx),
                 "--bits",
                 "4",
+                "--mtp-draft",
+                os.environ.get("Q38_ANE_MTP_DRAFT", "0"),
             ]
 
         server_proc = subprocess.Popen(cmd, env=env, cwd=str(root))

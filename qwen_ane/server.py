@@ -34,14 +34,15 @@ def is_server_running(host: str = "127.0.0.1", port: int = 2457, timeout: float 
 
 def run_server(
     model: str = "flash-next",
-    ctx: int = 131072,
     port: int = 2457,
     host: str = "127.0.0.1",
+    ctx: int = 131072,
     lru: bool = True,
+    spec: int = 4,
+    mtp_draft: int | None = None,
+    max_new: int = 2048,
     model_path: str | Path | None = None,
     hf_repo: str | None = None,
-    max_new: int = 2048,
-    spec: int = 4,
 ) -> int:
     """Launch the OpenAI-compatible ANE server for the specified model."""
     canon = normalize_model_name(model)
@@ -96,12 +97,6 @@ def run_server(
         return subprocess.call(cmd, env=env, cwd=str(ROOT))
 
     elif canon == "27b":
-        # Pure ANE 27B
-        # If context is 128k, adjust down to 4096 for 27B pure ANE tile limits
-        ctx_27b = min(ctx, 4096) if ctx > 4096 else ctx
-        if ctx > 4096:
-            print(f"   Note: 27B pure ANE uses hardware tile context of {ctx_27b} tokens.")
-
         env.update({
             "Q38_ANE_REUSE_COMPILED": "1",
             "Q38_ANE_FUSED_TAIL": "1",
@@ -109,11 +104,20 @@ def run_server(
             "Q38_ANE_FUSE_GATE": "0",
             "Q38_ANE_HOST_PREPARE": "1",
             "Q38_ANE_BATCH_ATTN": "16",
+            "Q38_ANE_GDN_PREFILL": os.environ.get("Q38_ANE_GDN_PREFILL", "chunk"),
             "Q38_MODEL": str(resolved_path),
         })
         env.pop("PYTHONPATH", None)
 
         server_script = ROOT / "tools" / "pure_ane_server.py"
+        draft_val = "0"
+        if mtp_draft is not None:
+            draft_val = str(mtp_draft)
+        elif spec in (1, 2, 3):
+            draft_val = str(spec)
+        elif "Q38_ANE_MTP_DRAFT" in os.environ:
+            draft_val = os.environ["Q38_ANE_MTP_DRAFT"]
+
         cmd = [
             sys.executable,
             "-u",
@@ -127,11 +131,13 @@ def run_server(
             "--port",
             str(port),
             "--context",
-            str(ctx_27b),
+            str(ctx),
             "--bits",
             "4",
             "--max-tokens",
             str(max_new),
+            "--mtp-draft",
+            draft_val,
             "--profile-decode",
         ]
         return subprocess.call(cmd, env=env, cwd=str(ROOT))

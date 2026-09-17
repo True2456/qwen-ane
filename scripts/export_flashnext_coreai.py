@@ -257,6 +257,8 @@ def _moe_decode_mode() -> str:
     ``FLASHNEXT_MOE=q4gemv`` is native vectorized, parallel CPU INT4 SwiGLU.
     ``FLASHNEXT_MOE=mlxresident`` is resident quantized GPU MoE, an explicit
     hybrid diagnostic; requires MLX in this Python environment.
+    ``FLASHNEXT_MOE=anepacked`` is GPU-off packed AneDynamicLinear (K=10 decode,
+    4×K=32 prefill).
     ``FLASHNEXT_MOE_BF16=1`` / ``FLASHNEXT_MOE=bf16`` are aliases for fp16.
     """
     if os.environ.get("FLASHNEXT_MOE_BF16", "").strip().lower() in ("1", "true"):
@@ -268,6 +270,8 @@ def _moe_decode_mode() -> str:
         return "q4gemv"
     if raw == "mlxresident":
         return "mlxresident"
+    if raw in ("anepacked", "ane", "packed"):
+        return "anepacked"
     if raw in ("hybrid", "mlx4", "q4dequant"):
         return "hybrid"
     return "fp16"
@@ -683,6 +687,22 @@ class HostMoE:
             self.shared_gate = sg
             self.shared_up = su
             self.shared_down = sd
+        self._moe_mode = _moe_decode_mode()
+        if self._moe_mode == "anepacked":
+            from runtime.ane_packed_moe import AnePackedMoe
+            self._resident = AnePackedMoe(self)
+            self.gu_buf = self.dn_buf = np.empty(0, np.float32)
+            self.gu_f16 = self.dn_f16 = None
+            self.inds = np.zeros((1, K_PIN), np.int32)
+            self.scores = np.zeros((1, K_PIN, 1, seq), np.float16)
+            self.last_ms = {"route": 0.0, "gather": 0.0, "gemm": 0.0}
+            self.last_reuse = 0
+            self.last_copy = K_PIN
+            self._slot_ids = [-1] * K_PIN
+            self._eid_slot = {}
+            self.device = device if device is not None else _moe_device()
+            self._use_mps = False
+            return
         from runtime.expert_bank import _SwiGLUScratch
         self._q4_scratch = _SwiGLUScratch()
         self._moe_mode = _moe_decode_mode()
@@ -2926,6 +2946,8 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
         moe_label = "host fp16 hot store (artifacts/experts_f16 LRU)"
     elif moe_mode == "mlxresident":
         moe_label = "resident quantized MLX GPU MoE (ANE attention; explicit diagnostic)"
+    elif moe_mode == "anepacked":
+        moe_label = "packed ANE MoE (K=10 decode, 4×K=32 prefill; GPU-off)"
     elif moe_mode == "q4gemv":
         moe_label = "parallel native CPU INT4 SwiGLU (FLASHNEXT_MOE=q4gemv)"
     else:
@@ -4878,8 +4900,7 @@ def stage_generate(seq: int, max_new: int, prompt_ids: list[int],
                       f"{prefill_steps - done} left serial", flush=True)
                 pf_ids = prompt_ids[done:]
                 prefill_steps = len(pf_ids) - 1
-        t_decode = t_all
-        if spec_k > 1:
+        if spec_k > 1 or serve:
             # Walk the prompt through the same K-slot graphs, full width. A
             # submit costs about 1.13 ms that does not depend on how many
             # slots carry a token, so feeding one token at a time paid it once

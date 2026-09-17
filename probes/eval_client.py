@@ -23,9 +23,11 @@ class AneClient:
     def __init__(self, ctx: int = 8192, spec: int = 4, prefill_k: int = 32,
                  quiet: bool = True, serve_log=None, seed: int | None = None):
         env = dict(os.environ)
-        env.update({"FLASHNEXT_SPEC": str(spec), "FLASHNEXT_MOE": "mlxresident",
-                    "FLASHNEXT_HEAD": "mlx", "FLASHNEXT_MIL_GDN": "1",
-                    "FLASHNEXT_MIL_QSA": "1"})
+        env.setdefault("FLASHNEXT_MOE", "mlxresident")
+        env.setdefault("FLASHNEXT_HEAD", "mlx")
+        env.setdefault("FLASHNEXT_MIL_GDN", "1")
+        env.setdefault("FLASHNEXT_MIL_QSA", "1")
+        env["FLASHNEXT_SPEC"] = str(spec)
         # Zero is an explicit decode-width baseline, even when the parent
         # environment or the exporter's default enables wide prefill.
         env["FLASHNEXT_PREFILL_MIL_K"] = str(prefill_k)
@@ -47,15 +49,21 @@ class AneClient:
             cwd=str(ROOT), env=env, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=err, text=True)
         # Everything before the ready line is load chatter.
+        chatter = []
         for line in self.p.stdout:
-            line = line.strip()
-            if line.startswith("{") and "ready" in line:
-                self.info = json.loads(line)
+            line_s = line.strip()
+            if not quiet:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+            if line_s.startswith("{") and "ready" in line_s:
+                self.info = json.loads(line_s)
                 self.info["prefill_k"] = prefill_k
                 self.info["spec"] = spec
                 self.info["ple"] = env.get("FLASHNEXT_PLE", "1")
                 return
-        raise RuntimeError("the serve process never became ready")
+            chatter.append(line_s)
+        tail = "\n".join(chatter[-20:])
+        raise RuntimeError(f"the serve process never became ready; output:\n{tail}")
 
     def _rpc(self, req: dict) -> dict:
         self.p.stdin.write(json.dumps(req) + "\n")

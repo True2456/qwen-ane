@@ -41,11 +41,10 @@ def find_local_model(model: str, custom_path: str | Path | None = None) -> Path 
         if p.exists():
             return p
 
-    # 1. Look inside .qwenANE/models/<canonical>
     models_dir = get_models_dir()
-    candidate = models_dir / canon
-    if candidate.exists() and any(candidate.iterdir()):
-        return candidate
+    packaged = models_dir / canon
+    if packaged.exists() and any(packaged.iterdir()):
+        return packaged
 
     home = Path.home()
     if canon == "flash-next":

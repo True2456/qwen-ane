@@ -32,7 +32,7 @@ if str(_TOOLS) not in sys.path:
     sys.path.insert(0,str(_TOOLS))
 from pure_ane import (  # noqa: E402
     Checkpoint, PureAneRuntime, PureAneSnapshot, StandaloneTokenizer,
-    assert_standalone,
+    assert_standalone, Sampler,
 )
 
 
@@ -432,8 +432,11 @@ class PureAneService:
         prompt_ids=self.validate(prompt,max_tokens,temperature,top_p,top_k,
                                  repetition_penalty)
         max_tokens=min(max_tokens,self.args.context-len(prompt_ids))
-        selector=_sampling_selector(prompt_ids,temperature,top_p,top_k,
-                                    repetition_penalty,seed)
+        sampler = Sampler(
+            temperature=temperature, top_p=top_p, top_k=top_k,
+            repetition_penalty=repetition_penalty, seed=seed,
+            prompt_ids=prompt_ids
+        )
         emitter=TextEmitter(self.tokenizer,stops or [],emit)
         queued=time.perf_counter();first=[None]
         def token(token_id:int)->bool:
@@ -442,7 +445,7 @@ class PureAneService:
         with self.lock:
             entered=time.perf_counter();start=time.perf_counter()
             self.runtime.begin_profile()
-            mode=("mtp" if self.runtime.mtp is not None and selector is None
+            mode=("mtp" if self.runtime.mtp is not None and self.args.mtp_draft > 0
                   else "target")
             cache=self.prefix_cache;prefilled=0;cached_logits=None;cache_hit=False
             if (prefix_cache and cache is not None and cache.mode==mode and
@@ -462,7 +465,7 @@ class PureAneService:
                     )
             try:
                 ids,_runtime_seconds=self.runtime.generate(self.tokenizer,prompt,max_tokens,
-                    on_token=token,stop_token_ids=self.eos_ids,token_selector=selector,
+                    on_token=token,stop_token_ids=self.eos_ids,sampler=sampler,
                     prefilled_tokens=prefilled,prefill_logits=cached_logits,
                     on_prefill=cache_prefill if prefix_cache else None)
                 seconds=time.perf_counter()-start
@@ -477,8 +480,8 @@ class PureAneService:
                 "tokens_per_second":len(ids)/max(seconds,1e-9),
                 "decode_tokens_per_second":max(0,len(ids)-1)/max(seconds-ttft,1e-9),
                 "finish_reason":"stop" if len(ids)<max_tokens or emitter.stopped else "length",
-                "sampled":selector is not None,
-                "mtp_used":self.runtime.mtp is not None and selector is None,
+                "sampled":not sampler.is_greedy(),
+                "mtp_used":self.runtime.mtp is not None and self.args.mtp_draft > 0,
                 "prefix_cache_hit":cache_hit,"prefix_tokens_reused":prefilled,
                 "prompt_tokens_evaluated":len(prompt_ids)-prefilled}
         profile=self.runtime.profile_snapshot()

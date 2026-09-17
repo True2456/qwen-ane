@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import shutil
+import struct
 import sys
 import time
 from pathlib import Path
@@ -24,53 +25,47 @@ DEFAULT_CACHE = Path.home() / "Library/Caches/q38-pure-ane/4edf80a2689e5c6b2ff7"
 DEFAULT_MANIFEST = Path("/tmp/qwen27b_manifest.json")
 DEFAULT_DEST = Path.home() / ".qwenANE" / "models" / "27b"
 DEFAULT_REPO = "True2456/Qwen3.8-27B-ANE"
+README_PATH = ROOT / "scripts" / "README_27B.md"
 
-README_CONTENT = """---
-license: apache-2.0
-tags:
-- apple-silicon
-- ane
-- apple-neural-engine
-- qwen
-- qwen3.8
-- pure-ane
----
 
-# Qwen3.8-27B-ANE (Apple Neural Engine Standalone Package)
+def write_mtp_sidecar(source_model: Path, out_dir: Path) -> Path | None:
+    """Copy the checkpoint MTP layer next to the ANE host-tensor package.
 
-High-performance, pure on-chip inference package for **Qwen3.8-27B** running natively on the Apple Neural Engine (ANE).
-
-This package contains:
-- **`model.safetensors` (5.09 GB)**: Host embeddings, RMSNorms, and LM output head.
-- **`quant_cache/` (9.15 GB)**: Pre-quantized INT4 weight blobs & scales for all 64 layers (48 GDN + 16 Attention) along with `manifest.json`.
-- **Tokenizers & Configs**: Complete configuration and tokenizer files.
-
-Total package size is **~14.2 GB** (compared to 52 GB for base BF16 weights), ready to run immediately without compilation stalls or external weights.
-
-## 🚀 Quick Start with `qwen-ane`
-
-Install the unified CLI:
-```bash
-git clone https://github.com/True2456/qwen-ane.git
-cd qwen-ane
-pip install -e .
-```
-
-### Interactive Chat (Apple Foundation Models 'fm' Style)
-```bash
-qwen-ane chat -model 27b -ctx 4096
-```
-
-### OpenAI-Compatible Serving
-```bash
-qwen-ane serve -model 27b -port 2457 -ctx 4096
-```
-
-### Connect with Pi Coding Agent
-```bash
-pi -e extensions/pure27-pi.ts --provider pure27 --model Qwen3.8-27B
-```
-"""
+    Keep BF16 payloads. Down-casting to F16 before INT4 quantize wrecks
+    drafter acceptance (measured ~1.03 tokens/cycle vs ~2.4 from BF16).
+    """
+    dest = out_dir / "mtp.safetensors"
+    ckpt = Checkpoint(source_model)
+    names = [n for n in ckpt.weight_map if n.startswith("mtp.")]
+    if not names:
+        print("\n[2b/5] No mtp.* tensors in source; speculative decode disabled")
+        return None
+    print("\n[2b/5] Extracting MTP draft tensors (BF16)...")
+    header: dict[str, dict] = {}
+    blobs: list[bytes] = []
+    offset = 0
+    for name in names:
+        info = ckpt.info(name)
+        raw = np.ascontiguousarray(ckpt._file(name).mmap(name))
+        if info.dtype == "BF16":
+            payload = np.asarray(raw, dtype="<u2").tobytes()
+            dtype = "BF16"
+        else:
+            payload = np.asarray(raw, np.float16).tobytes()
+            dtype = "F16"
+        header[name] = {
+            "dtype": dtype,
+            "shape": list(info.shape),
+            "data_offsets": [offset, offset + len(payload)],
+        }
+        blobs.append(payload)
+        offset += len(payload)
+    encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    pad = (8 - (len(encoded) % 8)) % 8
+    encoded += b" " * pad
+    dest.write_bytes(struct.pack("<Q", len(encoded)) + encoded + b"".join(blobs))
+    print(f"  ✓ {dest.name} ({dest.stat().st_size / 1e9:.2f} GB, {len(header)} tensors)")
+    return dest
 
 
 def package_27b(
@@ -127,13 +122,19 @@ def package_27b(
             meta = json.load(f)
         tensors = {}
         for name in meta["host_tensors"]:
-            tensors[name] = ckpt.tensor(name, np.float16)
+            # Save the on-disk RMSNorm deltas. Checkpoint.tensor() would bake
+            # the Qwen +1 sanitize into the package and NaN at load.
+            tensors[name] = ckpt._file(name).array(name, np.float16)
         embed_name = ckpt.embedding_name
-        tensors[embed_name] = ckpt.tensor(embed_name, np.float16)
+        tensors[embed_name] = ckpt._file(embed_name).array(embed_name, np.float16)
         if "lm_head.weight" not in tensors:
-            tensors["lm_head.weight"] = ckpt.tensor("lm_head.weight", np.float16)
+            tensors["lm_head.weight"] = ckpt._file("lm_head.weight").array(
+                "lm_head.weight", np.float16
+            )
         sf.save_file(tensors, str(st_path))
         print(f"  ✓ Extracted and saved {len(tensors)} host tensors ({st_path.stat().st_size / 1e9:.2f} GB)")
+
+    write_mtp_sidecar(source_model, out_dir)
 
     # 3. Link/copy 500 quant cache files
     print("\n[3/5] Linking 500 prebaked INT4 weight blobs into quant_cache/...")
@@ -172,8 +173,7 @@ def package_27b(
         json.dump({"quant_manifest": quant_manifest}, f, indent=2)
     print("  ✓ manifest.json written")
 
-    # Write README.md
-    (out_dir / "README.md").write_text(README_CONTENT)
+    (out_dir / "README.md").write_text(README_PATH.read_text())
 
     # 5. Verification: Load standalone package with PureAneRuntime
     if skip_verify:
@@ -214,25 +214,22 @@ def upload_to_huggingface(pkg_dir: Path, repo_id: str) -> None:
     from huggingface_hub import HfApi
 
     api = HfApi()
-    print(f"\n🚀 Creating / Verifying Hugging Face repo: {repo_id}...")
-    api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True, private=False)
+    print(f"Creating / verifying Hugging Face repo: {repo_id}")
+    api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
 
-    # 1. Configs, tokenizers, README
-    print("\n📤 [1/3] Uploading configs, tokenizers, and README...")
-    config_patterns = ["*.json", "*.jinja", "*.txt", "README.md"]
+    print("\n[1/4] Uploading configs, tokenizer, and README...")
     api.upload_folder(
         repo_id=repo_id,
         folder_path=str(pkg_dir),
-        allow_patterns=config_patterns,
+        allow_patterns=["*.json", "*.jinja", "*.txt", "README.md"],
+        ignore_patterns=["quant_cache/**"],
         repo_type="model",
         commit_message="Add configs, tokenizer, and model card",
     )
-    print("  ✓ Configs and tokenizers uploaded successfully!")
 
-    # 2. Host model.safetensors
     st_path = pkg_dir / "model.safetensors"
     if st_path.is_file():
-        print(f"\n📤 [2/3] Uploading host model.safetensors ({st_path.stat().st_size / 1e9:.2f} GB)...")
+        print(f"\n[2/4] Uploading model.safetensors ({st_path.stat().st_size / 1e9:.2f} GB)...")
         api.upload_file(
             path_or_fileobj=str(st_path),
             path_in_repo="model.safetensors",
@@ -240,23 +237,33 @@ def upload_to_huggingface(pkg_dir: Path, repo_id: str) -> None:
             repo_type="model",
             commit_message="Add host embeddings, norms, and LM head safetensors",
         )
-        print("  ✓ Host model.safetensors uploaded successfully!")
 
-    # 3. quant_cache
+    mtp_path = pkg_dir / "mtp.safetensors"
+    if mtp_path.is_file():
+        print(f"\n[3/4] Uploading mtp.safetensors ({mtp_path.stat().st_size / 1e9:.2f} GB)...")
+        api.upload_file(
+            path_or_fileobj=str(mtp_path),
+            path_in_repo="mtp.safetensors",
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message="Add MTP draft sidecar",
+        )
+
     quant_dir = pkg_dir / "quant_cache"
     if quant_dir.is_dir():
-        print("\n📤 [3/3] Uploading quant_cache (9.15 GB, 500 prebaked INT4 blobs)...")
+        n_files = sum(1 for p in quant_dir.iterdir() if p.is_file())
+        nbytes = sum(p.stat().st_size for p in quant_dir.iterdir() if p.is_file())
+        print(f"\n[4/4] Uploading quant_cache ({n_files} files, {nbytes / 1e9:.2f} GB)...")
         api.upload_folder(
             repo_id=repo_id,
             folder_path=str(quant_dir),
             path_in_repo="quant_cache",
             repo_type="model",
-            commit_message="Add prebaked INT4 quant_cache and manifest.json",
+            commit_message="Add INT4 quant_cache blobs and manifest",
         )
-        print("  ✓ quant_cache uploaded successfully!")
 
-    print(f"\n🎉 Successfully uploaded {repo_id} to Hugging Face!")
-    print(f"   URL: https://huggingface.co/{repo_id}")
+    print(f"\nUploaded {repo_id}")
+    print(f"URL: https://huggingface.co/{repo_id}")
 
 
 def main() -> int:

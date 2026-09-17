@@ -56,8 +56,43 @@ def test_greedy_is_unchanged():
     assert m == 1 and nxt == preds[1]
 
 
+def test_pure_ane_speculative_sampler():
+    from tools.pure_ane import Sampler
+    
+    # 1. Greedy behavior
+    s_greedy = Sampler(temperature=0.0)
+    logits = np.array([1.0, 5.0, 2.0, 0.5], dtype=np.float32)
+    tok, _ = s_greedy.sample(logits)
+    assert tok == 1
+    acc, corr = s_greedy.speculative_verify(1, np.array([]), logits)
+    assert acc is True and corr is None
+    acc, corr = s_greedy.speculative_verify(0, np.array([]), logits)
+    assert acc is False and corr == 1
+    
+    # 2. Speculative rejection sampling distribution match
+    s_samp = Sampler(temperature=0.8, top_p=0.95, seed=123)
+    target_logits = np.array([1.0, 4.0, 2.5, 0.5], dtype=np.float32)
+    draft_logits = np.array([1.2, 3.8, 2.3, 0.6], dtype=np.float32)
+    
+    p_true = s_samp.get_probs(target_logits)
+    
+    # Sample many times using speculative rejection sampling
+    N = 20000
+    counts = np.zeros(len(target_logits))
+    for _ in range(N):
+        d_tok, q_probs = s_samp.sample(draft_logits)
+        acc, corr = s_samp.speculative_verify(d_tok, q_probs, target_logits)
+        chosen = d_tok if acc else corr
+        counts[chosen] += 1
+    
+    p_emp = counts / N
+    max_err = np.max(np.abs(p_emp - p_true))
+    assert max_err < 0.015, f"Speculative sampling error {max_err} exceeded tolerance"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
             fn()
             print("ok", name)
+

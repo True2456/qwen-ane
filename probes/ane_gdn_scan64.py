@@ -313,7 +313,7 @@ class AneGdnChunk(AneGdnAffineScan):
             dst[4*nh:5*nh, 0] = beta.transpose(1, 0).reshape(nh)
 
 
-def unrolled_mil(module, tokens: int) -> tuple[str, int, int]:
+def unrolled_mil(module, tokens: int, chunk_body=None) -> tuple[str, int, int]:
     """Fuse exact recurrent steps into one compiler-safe ANE evaluation."""
     if tokens < 2 or tokens & (tokens - 1):
         raise ValueError("unrolled token count must be a power of two >= 2")
@@ -351,8 +351,6 @@ def unrolled_mil(module, tokens: int) -> tuple[str, int, int]:
     tensor<fp16, [1, {H}, {tokens}, 1]> avec = reshape(shape=tensor<int32, [4]>([1,{H},{tokens},1]), x=aflat)[name=string("avec")];
     tensor<fp16, [1, {H}, {tokens}, 1]> beta = reshape(shape=tensor<int32, [4]>([1,{H},{tokens},1]), x=bflat)[name=string("beta")];''']
 
-    state = ""
-    outputs = []
     for i in range(tokens):
         lines.append(f'''    tensor<fp16, [1, {H}, 1, {D}]> qt{i} = slice_by_index(begin=tensor<int32, [4]>([0,0,{i},0]), end=tensor<int32, [4]>([1,{H},{i+1},{D}]), x=q)[name=string("qt{i}")];
     tensor<fp16, [1, {H}, 1, {D}]> kt{i} = slice_by_index(begin=tensor<int32, [4]>([0,0,{i},0]), end=tensor<int32, [4]>([1,{H},{i+1},{D}]), x=k)[name=string("kt{i}")];
@@ -405,6 +403,12 @@ def unrolled_mil(module, tokens: int) -> tuple[str, int, int]:
     tensor<fp16, [1, {H}, 1, 1]> enb{i} = exp(x=nb{i})[name=string("enb{i}")];
     tensor<fp16, [1, {H}, 1, 1]> bden{i} = add(x=enb{i}, y=fp16(0x1p+0))[name=string("bden{i}")];
     tensor<fp16, [1, {H}, 1, 1]> bt{i} = real_div(x=fp16(0x1p+0), y=bden{i})[name=string("bt{i}")];''')
+    if chunk_body is not None:
+        chunk_body(lines, tokens)
+        return "\n".join(lines), channels, output_channels
+    state = ""
+    outputs = []
+    for i in range(tokens):
         previous = "state_u" if i == 0 else state
         lines.append(f'''    tensor<fp16, [1, {hk}, 1, {D}]> sd{i} = mul(x={previous}, y=dr{i})[name=string("sd{i}")];
     tensor<fp16, [1, {hk}, 1, {D}]> sk{i} = mul(x=sd{i}, y=kf{i})[name=string("sk{i}")];
@@ -441,12 +445,15 @@ def unrolled_mil(module, tokens: int) -> tuple[str, int, int]:
 class AneGdnUnrolled(AneGdnAffineScan):
     """One-dispatch, exact sequential GDN prefill block."""
 
-    def __init__(self, driver: AneDriver, tokens: int):
+    def __init__(self, driver: AneDriver, tokens: int, *,
+                 mil_factory=None, weight_blobs=None,
+                 raw_weight_files: frozenset[str] | None = None):
         self.driver = driver
         self.tokens = tokens
         self.nh = tokens * H
-        mil, channels, output_channels = unrolled_mil(driver.module, tokens)
-        blobs = {
+        factory = mil_factory or unrolled_mil
+        mil, channels, output_channels = factory(driver.module, tokens)
+        blobs = weight_blobs or {
             "sum.bin": np.ones((H, D, 1, 1), np.float16).tobytes(),
             "mean.bin": np.full((H, D, 1, 1), 1.0/D, np.float16).tobytes(),
             "repeat.bin": np.ones((H*D, 1, 1, 1), np.float16).tobytes(),
@@ -455,7 +462,8 @@ class AneGdnUnrolled(AneGdnAffineScan):
         started = time.perf_counter()
         with contextlib.redirect_stdout(capture), contextlib.redirect_stderr(capture):
             self.program = driver.engine.compile_multiproc(
-                mil, blobs, channels, output_channels, D
+                mil, blobs, channels, output_channels, D,
+                raw_weight_files=raw_weight_files or frozenset(),
             )
         self.compile_seconds = time.perf_counter() - started
         if self.program is None:
@@ -525,8 +533,13 @@ class AneGdnUnrolled(AneGdnAffineScan):
             raise ValueError("invalid gate-parameter shapes")
         if initial_state is None:
             initial_state = np.zeros((H, D, D), np.float16)
-        if initial_state.shape != (H, D, D):
-            raise ValueError(f"invalid initial state {initial_state.shape}")
+        else:
+            initial_state = np.asarray(initial_state)
+            if initial_state.shape == (H * D, D):
+                # Compact IOSurface layout from AneGdnRecurrence.snapshot.
+                initial_state = initial_state.reshape(H, D, D).transpose(0, 2, 1)
+            if initial_state.shape != (H, D, D):
+                raise ValueError(f"invalid initial state {initial_state.shape}")
         nh = self.nh
         with self.driver.view(
             self.program._in_surf, (self.channels, D), np.float16
@@ -561,8 +574,8 @@ class AneGdnUnrolled(AneGdnAffineScan):
         ) as ysrc, self.driver.view(
             self.state_surface, (H, D, D), np.float16
         ) as ssrc:
-            y = np.array(ysrc, np.float32).reshape(self.tokens, H, D)
-            state = np.array(ssrc, np.float32)
+            y = np.array(ysrc, np.float16).reshape(self.tokens, H, D)
+            state = np.array(ssrc, np.float16)
         return y, state
 
 

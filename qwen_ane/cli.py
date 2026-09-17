@@ -143,6 +143,13 @@ def create_parser() -> argparse.ArgumentParser:
         default=4,
         help="Speculative decoding lookahead steps (default: 4)",
     )
+    p_serve.add_argument(
+        "--mtp-draft", "-mtp-draft", "--mtp", "-mtp",
+        type=int,
+        default=None,
+        choices=[0, 1, 2, 3],
+        help="MTP speculative draft depth for 27b (0-3, default: 2 when supported, else 0)",
+    )
 
     # 3. 'pull' / 'download' command
     p_pull = subparsers.add_parser(
@@ -230,6 +237,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             hf_repo=args.hf_repo,
             max_new=args.max_new,
             spec=args.spec,
+            mtp_draft=getattr(args, "mtp_draft", None),
         )
 
     elif args.command == "chat":

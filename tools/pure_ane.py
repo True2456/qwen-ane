@@ -176,12 +176,20 @@ class Checkpoint:
             with index_path.open() as f:
                 self.weight_map = json.load(f)["weight_map"]
         else:
-            one = self.path / "model.safetensors"
-            if not one.exists():
+            shards = sorted(p for p in self.path.glob("*.safetensors") if p.is_file())
+            if not shards:
                 raise FileNotFoundError("no safetensors checkpoint found")
-            sf = SafeTensorFile(one)
-            self.weight_map = {name: one.name for name in sf.header}
-        self._files: dict[str, SafeTensorFile] = {}
+            self.weight_map = {}
+            self._files = {}
+            for shard in shards:
+                sf = SafeTensorFile(shard)
+                self._files[shard.name] = sf
+                for name in sf.header:
+                    if name in self.weight_map:
+                        raise KeyError(f"duplicate tensor {name} in {shard.name}")
+                    self.weight_map[name] = shard.name
+        if not hasattr(self, "_files"):
+            self._files: dict[str, SafeTensorFile] = {}
         self.quant_cache_dir: Path | None = None
         self.quant_cache_stats = {
             "hits": 0, "misses": 0, "bytes_read": 0, "bytes_written": 0,
@@ -262,6 +270,17 @@ class Checkpoint:
         if self.shifted_norms and (name.endswith(self.SHIFTED_NORM_SUFFIXES)
                                    or mtp_norm):
             out = self._file(name).array(name, np.float32)
+            # The 27B ANE packager previously saved backbone RMSNorms after
+            # this +1. Skip only those host-file tensors. MTP and HF BF16
+            # checkpoints still need the shift; a global mean cutoff hid
+            # high-valued q_norm deltas and killed drafter acceptance.
+            filename = self.weight_map.get(name, "")
+            packaged_host = (
+                filename == "model.safetensors"
+                and (self.path / "quant_cache" / "manifest.json").is_file()
+            )
+            if packaged_host and float(np.mean(out)) > 0.75:
+                return np.asarray(out, dtype=dtype)
             out = np.asarray(out + np.float32(1.0), np.float32)
             # IEEE round-to-nearest-even float32 -> bfloat16 -> float32.
             words = out.view(np.uint32)
@@ -1221,8 +1240,14 @@ class AneGdnRecurrence:
             return np.array(src, np.float16)
 
     def restore(self, state: GdnState, saved: np.ndarray) -> None:
-        if saved.shape != (self.HK, self.Dv) or saved.dtype != np.float16:
+        saved = np.ascontiguousarray(saved)
+        if saved.shape == (self.H, self.Dk, self.Dv):
+            saved = np.ascontiguousarray(saved.transpose(0, 2, 1)).reshape(
+                self.HK, self.Dv
+            )
+        if saved.shape != (self.HK, self.Dv):
             raise ValueError(f"invalid GDN snapshot {saved.shape}/{saved.dtype}")
+        saved = saved.astype(np.float16, copy=False)
         with self.driver.view(
             state.surface, (self.HK, self.Dv), np.float16
         ) as dst:
@@ -2187,6 +2212,12 @@ class AneAttentionCore:
         T = int(qs.shape[0])
         if T < 1:
             raise ValueError("call_many requires at least one query")
+        if self.batched_program is not None and T > self.batched_T:
+            outs = np.empty((T, self.Hq, self.D), np.float16)
+            for start_at in range(0, T, self.batched_T):
+                sl = slice(start_at, min(start_at + self.batched_T, T))
+                outs[sl] = self.call_many(qs[sl], ks[sl], vs[sl])
+            return outs
         start = self.offset
         if start + T > self.L:
             raise RuntimeError(f"attention cache exceeds direct limit {self.L}")
@@ -2480,6 +2511,12 @@ class AneLongContextAttentionCore:
         self.programs.extend(group.program for group in self.groups.values())
         if self.batched_program is not None:
             self.programs.append(self.batched_program)
+        self.batched_stream_program=None
+        self.batched_stream_input=0
+        if self.batched_T>=2:
+            self._compile_batched_stream()
+        if self.batched_stream_program is not None:
+            self.programs.append(self.batched_stream_program)
         self.blocks=self.capacity//B
         # Block-major makes every 256-token K/V submission contiguous.  At
         # 256K this avoids materializing a strided copy for every KV head and
@@ -2499,7 +2536,8 @@ class AneLongContextAttentionCore:
         for name in ("driver","Hq","Hkv","D","L","B","capacity","blocks",
                      "direct_program","direct_input","input","program",
                      "combine","groups","programs",
-                     "batched_T","batched_program","batched_input"):
+                     "batched_T","batched_program","batched_input",
+                     "batched_stream_program","batched_stream_input"):
             setattr(other,name,getattr(self,name))
         # np.zeros_like eagerly faults these multi-GiB arrays on macOS. Fresh
         # calloc-backed arrays preserve sparse virtual allocation until a KV
@@ -2508,6 +2546,153 @@ class AneLongContextAttentionCore:
         other.values=np.zeros(self.values.shape,self.values.dtype)
         other.offset=0
         return other
+
+    def _compile_batched_stream(self) -> None:
+        """T queries against one 256-token KV block, returning online-softmax state.
+
+        Prefill's call_many currently falls back to one query per submit as soon
+        as the cache leaves the first block. Sharing the block across the 16-wide
+        prompt batch is the 4k attention term (about half of TTFT).
+        """
+        T,H,K,D,B=self.batched_T,self.Hq,self.Hkv,self.D,self.B
+        QH=T*H
+        C=QH+2*K*B+QH
+        k0,k1=QH,QH+K*B
+        v0,v1=k1,k1+K*B
+        m0=v1
+        mil=f'''program(1.3)
+{self.driver.module._BUILD_INFO}
+{{
+  func main<ios18>(tensor<fp16, [1, {C}, 1, {D}]> x) {{
+    tensor<fp16, [1, {QH}, 1, {D}]> q4 = slice_by_index(begin=tensor<int32, [4]>([0,0,0,0]), end=tensor<int32, [4]>([1,{QH},1,{D}]), x=x)[name=string("q4")];
+    tensor<fp16, [1, {K*B}, 1, {D}]> kf = slice_by_index(begin=tensor<int32, [4]>([0,{k0},0,0]), end=tensor<int32, [4]>([1,{k1},1,{D}]), x=x)[name=string("kf")];
+    tensor<fp16, [1, {K*B}, 1, {D}]> vf = slice_by_index(begin=tensor<int32, [4]>([0,{v0},0,0]), end=tensor<int32, [4]>([1,{v1},1,{D}]), x=x)[name=string("vf")];
+    tensor<fp16, [1, {QH}, 1, {B}]> mask = slice_by_index(begin=tensor<int32, [4]>([0,{m0},0,0]), end=tensor<int32, [4]>([1,{m0+QH},1,{B}]), x=x)[name=string("mask")];
+    tensor<fp16, [1, {K}, {T*(H//K)}, {D}]> q = reshape(shape=tensor<int32, [4]>([1,{K},{T*(H//K)},{D}]), x=q4)[name=string("q")];
+    tensor<fp16, [1, {K}, {B}, {D}]> k = reshape(shape=tensor<int32, [4]>([1,{K},{B},{D}]), x=kf)[name=string("k")];
+    tensor<fp16, [1, {K}, {B}, {D}]> v = reshape(shape=tensor<int32, [4]>([1,{K},{B},{D}]), x=vf)[name=string("v")];
+    tensor<fp16, [1, {K}, {T*(H//K)}, {B}]> raw = matmul(transpose_x=bool(false), transpose_y=bool(true), x=q, y=k)[name=string("raw")];
+    tensor<fp16, [1, {K}, {T*(H//K)}, {B}]> scaled = mul(x=raw, y=fp16(0x1.0p-4))[name=string("scaled")];
+    tensor<fp16, [1, {QH}, 1, {B}]> raw4 = reshape(shape=tensor<int32, [4]>([1,{QH},1,{B}]), x=scaled)[name=string("raw4")];
+    tensor<fp16, [1, {QH}, 1, {B}]> scores = add(x=raw4, y=mask)[name=string("scores")];
+    tensor<fp16, [1, {K}, {T*(H//K)}, {B}]> score = reshape(shape=tensor<int32, [4]>([1,{K},{T*(H//K)},{B}]), x=scores)[name=string("score")];
+    tensor<int32, [1]> ax = const()[name=string("ax"), val=tensor<int32, [1]>([3])];
+    tensor<fp16, [1, {K}, {T*(H//K)}, 1]> mx = reduce_max(axes=ax, keep_dims=bool(true), x=score)[name=string("mx")];
+    tensor<fp16, [1, {K}, {T*(H//K)}, {B}]> centered = sub(x=score, y=mx)[name=string("centered")];
+    tensor<fp16, [1, {K}, {T*(H//K)}, {B}]> ex = exp(x=centered)[name=string("ex")];
+    tensor<fp16, [1, {K}, {T*(H//K)}, 1]> den = reduce_sum(axes=ax, keep_dims=bool(true), x=ex)[name=string("den")];
+    tensor<fp16, [1, {K}, {T*(H//K)}, {D}]> num = matmul(transpose_x=bool(false), transpose_y=bool(false), x=ex, y=v)[name=string("num")];
+    tensor<fp16, [1, {K}, {T*(H//K)}, {D}]> yg = real_div(x=num, y=den)[name=string("yg")];
+    tensor<fp16, [1, {QH}, 1, {D}]> y0 = reshape(shape=tensor<int32, [4]>([1,{QH},1,{D}]), x=yg)[name=string("y0")];
+    tensor<fp16, [1, {QH}, 1, 1]> mx4 = reshape(shape=tensor<int32, [4]>([1,{QH},1,1]), x=mx)[name=string("mx4")];
+    tensor<fp16, [1, {QH}, 1, 1]> dn4 = reshape(shape=tensor<int32, [4]>([1,{QH},1,1]), x=den)[name=string("dn4")];
+    tensor<fp16, [1, {QH}, 1, {D}]> zero = mul(x=y0, y=fp16(0x0p+0))[name=string("zero")];
+    tensor<fp16, [1, {QH}, 1, {D}]> one = add(x=zero, y=fp16(0x1p+0))[name=string("one")];
+    tensor<fp16, [1, {QH}, 1, {D}]> mw = mul(x=mx4, y=one)[name=string("mw")];
+    tensor<fp16, [1, {QH}, 1, {D}]> dw = mul(x=dn4, y=one)[name=string("dw")];
+    tensor<int32, [8]> py = const()[name=string("py"), val=tensor<int32, [8]>([0,0,0,{2*QH},0,0,0,0])];
+    tensor<int32, [8]> pm = const()[name=string("pm"), val=tensor<int32, [8]>([0,0,{QH},{QH},0,0,0,0])];
+    tensor<int32, [8]> pd = const()[name=string("pd"), val=tensor<int32, [8]>([0,0,{2*QH},0,0,0,0,0])];
+    tensor<fp16, [1, {3*QH}, 1, {D}]> yp = pad(mode=string("constant"), constant_val=fp16(0x0p+0), pad=py, x=y0)[name=string("yp")];
+    tensor<fp16, [1, {3*QH}, 1, {D}]> mp = pad(mode=string("constant"), constant_val=fp16(0x0p+0), pad=pm, x=mw)[name=string("mp")];
+    tensor<fp16, [1, {3*QH}, 1, {D}]> dp = pad(mode=string("constant"), constant_val=fp16(0x0p+0), pad=pd, x=dw)[name=string("dp")];
+    tensor<fp16, [1, {3*QH}, 1, {D}]> ym = add(x=yp, y=mp)[name=string("ym")];
+    tensor<fp16, [1, {3*QH}, 1, {D}]> out = add(x=ym, y=dp)[name=string("out")];
+  }} -> (out);
+}}
+// pure_ane_attention_stream_B{B}_T{T}
+'''
+        capture=io.StringIO()
+        with contextlib.redirect_stdout(capture),contextlib.redirect_stderr(capture):
+            program=self.driver.engine.compile_multiproc(mil,{},C,3*QH,D)
+        if program is None:
+            tail="\n".join(capture.getvalue().strip().splitlines()[-8:])
+            print(f"PURE_ANE_BATCHED_STREAM=SKIP {tail}",flush=True)
+            return
+        self.driver.engine._ensure_io(program)
+        self.batched_stream_program=program
+        self.batched_stream_input=C
+
+    def _unpack_batched_heads(self, packed: np.ndarray, T: int) -> np.ndarray:
+        grouped=packed.reshape(self.Hkv,self.batched_T*(self.Hq//self.Hkv),self.D)
+        out=np.empty((T,self.Hq,self.D),np.float16)
+        for t in range(T):
+            out[t]=grouped[:,t*6:(t+1)*6].reshape(self.Hq,self.D)
+        return out
+
+    def _host_combine(self,left:np.ndarray,right:np.ndarray)->np.ndarray:
+        """Merge T online-softmax states in fp32. left/right are [T, 3H, D]."""
+        H=self.Hq
+        ya=left[:,:H].astype(np.float32)
+        yb=right[:,:H].astype(np.float32)
+        ma=left[:,H:2*H].astype(np.float32)
+        mb=right[:,H:2*H].astype(np.float32)
+        da=left[:,2*H:3*H].astype(np.float32)
+        db=right[:,2*H:3*H].astype(np.float32)
+        gm=np.maximum(ma,mb)
+        wa=da*np.exp(ma-gm)
+        wb=db*np.exp(mb-gm)
+        den=wa+wb
+        y=(ya*wa+yb*wb)/np.maximum(den,np.float32(1e-12))
+        out=np.empty(left.shape,np.float16)
+        out[:,:H]=y
+        out[:,H:2*H]=gm
+        out[:,2*H:3*H]=den
+        return out
+
+    def _run_batched_stream_block(self,qs:np.ndarray,start:int,T:int,
+                                  block_index:int,end:int)->np.ndarray:
+        QH=self.batched_T*self.Hq
+        packed=np.zeros((self.Hkv,self.batched_T*(self.Hq//self.Hkv),self.D),np.float16)
+        grouped_mask=np.zeros(
+            (self.Hkv,self.batched_T*(self.Hq//self.Hkv),self.B),np.float16
+        )
+        block_start=block_index*self.B
+        for t in range(T):
+            packed[:,t*6:(t+1)*6]=qs[t].reshape(self.Hkv,self.Hq//self.Hkv,self.D)
+        for t in range(self.batched_T):
+            valid=start+t+1 if t<T else 0
+            visible=int(np.clip(valid-block_start,0,self.B))
+            row=np.zeros(self.B,np.float16)
+            row[visible:]=np.float16(-1e4)
+            grouped_mask[:,t*6:(t+1)*6]=row
+        with self.driver.view(
+            self.batched_stream_program._in_surf,
+            (self.batched_stream_input,self.D),np.float16
+        ) as dst:
+            dst[:]=0
+            dst[:QH]=packed.reshape(-1,self.D)
+            p=QH
+            dst[p:p+self.Hkv*self.B]=self.keys[block_index].reshape(-1,self.D)
+            p+=self.Hkv*self.B
+            dst[p:p+self.Hkv*self.B]=self.values[block_index].reshape(-1,self.D)
+            p+=self.Hkv*self.B
+            dst[p:p+QH]=grouped_mask.reshape(-1,self.B)
+        if not self.driver.engine.submit(self.batched_stream_program):
+            raise RuntimeError("ANE batched stream attention submission failed")
+        with self.driver.view(
+            self.batched_stream_program._out_surf,(3*QH,self.D),np.float16
+        ) as src:
+            packed_out=np.array(src,np.float16)
+        y=self._unpack_batched_heads(packed_out[:QH],T)
+        m=self._unpack_batched_heads(packed_out[QH:2*QH],T)
+        d=self._unpack_batched_heads(packed_out[2*QH:3*QH],T)
+        state=np.empty((T,3*self.Hq,self.D),np.float16)
+        state[:,:self.Hq]=y
+        state[:,self.Hq:2*self.Hq]=m
+        state[:,2*self.Hq:]=d
+        return state
+
+    def _run_stream_many(self,qs:np.ndarray,start:int)->np.ndarray:
+        T=qs.shape[0]
+        end=start+T
+        n_blocks=-(-end//self.B)
+        state=None
+        for block_index in range(n_blocks):
+            chunk=self._run_batched_stream_block(qs,start,T,block_index,end)
+            state=chunk if state is None else self._host_combine(state,chunk)
+        assert state is not None
+        return state[:,:self.Hq]
 
     def _run_direct_many(self, qs: np.ndarray, start: int) -> np.ndarray:
         T = qs.shape[0]
@@ -2561,6 +2746,18 @@ class AneLongContextAttentionCore:
             self.offset = end
             assert_standalone("long-context batched attention dispatch")
             return out
+        if (self.batched_stream_program is not None and T > 1
+                and T <= self.batched_T):
+            out = self._run_stream_many(qs, start)
+            self.offset = end
+            assert_standalone("long-context batched stream attention dispatch")
+            return out
+        if (self.batched_stream_program is not None and T > self.batched_T > 1):
+            outs = np.empty((T, self.Hq, self.D), np.float16)
+            for start_at in range(0, T, self.batched_T):
+                sl = slice(start_at, min(start_at + self.batched_T, T))
+                outs[sl] = self.call_many(qs[sl], ks[sl], vs[sl])
+            return outs
         outs = np.empty((T, self.Hq, self.D), np.float16)
         self.offset = start
         for t in range(T):
@@ -2949,6 +3146,155 @@ class AneFinalHead:
                 logits[v0:v1]=src[:,:lanes]
         assert_standalone("final norm and head dispatch")
         return _restore_lane_rank(logits,lanes)
+
+class Sampler:
+    """Unified sampler supporting greedy, temperature/top-p/top-k sampling,
+    and exact speculative rejection sampling (Leviathan et al., 2023)."""
+
+    def __init__(self, temperature: float = 0.0, top_p: float = 1.0,
+                 top_k: int = 0, repetition_penalty: float = 1.0,
+                 seed: int | None = None, prompt_ids: list[int] | None = None):
+        self.temperature = float(temperature)
+        self.top_p = float(top_p)
+        self.top_k = int(top_k)
+        self.repetition_penalty = float(repetition_penalty)
+        self.rng = np.random.default_rng(seed)
+        self.prompt_set = set(prompt_ids or [])
+
+    def is_greedy(self) -> bool:
+        return self.temperature <= 0.0
+
+    def get_probs(self, raw_logits: np.ndarray, generated: list[int] | None = None) -> np.ndarray:
+        if self.is_greedy():
+            probs = np.zeros(len(raw_logits), dtype=np.float32)
+            probs[int(np.argmax(raw_logits))] = 1.0
+            return probs
+
+        scores = np.asarray(raw_logits, dtype=np.float32).copy()
+        if self.repetition_penalty != 1.0:
+            seen = self.prompt_set if generated is None else self.prompt_set.union(generated)
+            for token in seen:
+                if token < len(scores):
+                    scores[token] = (scores[token] * self.repetition_penalty
+                                     if scores[token] < 0 else
+                                     scores[token] / self.repetition_penalty)
+
+        scores /= self.temperature
+
+        if 0 < self.top_k < len(scores):
+            k = self.top_k
+            idx = np.argpartition(scores, -k)[:-k]
+            scores[idx] = -np.inf
+
+        max_s = float(np.max(scores))
+        if not np.isfinite(max_s):
+            probs = np.zeros(len(raw_logits), dtype=np.float32)
+            probs[int(np.argmax(raw_logits))] = 1.0
+            return probs
+
+        exp_scores = np.exp(scores - max_s)
+        sum_exp = float(np.sum(exp_scores))
+        if sum_exp <= 0 or not np.isfinite(sum_exp):
+            probs = np.zeros(len(raw_logits), dtype=np.float32)
+            probs[int(np.argmax(raw_logits))] = 1.0
+            return probs
+        probs = exp_scores / sum_exp
+
+        if 0.0 < self.top_p < 1.0:
+            order = np.argsort(probs)[::-1]
+            sorted_probs = probs[order]
+            cumsum = np.cumsum(sorted_probs)
+            cutoff = int(np.searchsorted(cumsum, self.top_p, side="right")) + 1
+            cutoff = min(cutoff, len(order))
+            probs[order[cutoff:]] = 0.0
+            p_sum = float(np.sum(probs))
+            if p_sum > 0:
+                probs /= p_sum
+            else:
+                probs[order[0]] = 1.0
+
+        return probs
+
+    def sample(self, raw_logits: np.ndarray, generated: list[int] | None = None) -> tuple[int, np.ndarray]:
+        if self.is_greedy():
+            tok = int(np.argmax(raw_logits))
+            return tok, np.array([], dtype=np.float32)
+
+        probs = self.get_probs(raw_logits, generated)
+        nonzero = np.flatnonzero(probs)
+        if len(nonzero) == 0:
+            tok = int(np.argmax(raw_logits))
+        elif len(nonzero) == 1:
+            tok = int(nonzero[0])
+        else:
+            tok = int(self.rng.choice(nonzero, p=probs[nonzero]))
+        return tok, probs
+
+    def speculative_verify(self, draft_token: int, q_probs: np.ndarray,
+                           target_logits: np.ndarray,
+                           generated: list[int] | None = None) -> tuple[bool, int | None]:
+        if self.is_greedy():
+            pred = int(np.argmax(target_logits))
+            if pred == draft_token:
+                return True, None
+            return False, pred
+
+        p_probs = self.get_probs(target_logits, generated)
+        p_val = float(p_probs[draft_token]) if draft_token < len(p_probs) else 0.0
+        q_val = float(q_probs[draft_token]) if len(q_probs) > draft_token else 0.0
+
+        if q_val <= 0.0:
+            alpha = 1.0 if p_val > 0 else 0.0
+        else:
+            alpha = min(1.0, p_val / q_val)
+
+        u = float(self.rng.uniform(0.0, 1.0))
+        if u < alpha:
+            return True, None
+
+        if len(q_probs) == len(p_probs):
+            diff = np.maximum(0.0, p_probs - q_probs)
+        else:
+            diff = p_probs.copy()
+            if draft_token < len(diff):
+                diff[draft_token] = 0.0
+
+        diff_sum = float(np.sum(diff))
+        if diff_sum > 1e-7:
+            diff /= diff_sum
+            nonzero = np.flatnonzero(diff)
+            corr = int(self.rng.choice(nonzero, p=diff[nonzero]))
+        else:
+            nonzero = np.flatnonzero(p_probs)
+            corr = int(self.rng.choice(nonzero, p=p_probs[nonzero]))
+
+        return False, corr
+
+
+class _TokenNgram:
+    """Last-occurrence n-gram over prompt+generated tokens.
+
+    Flash-Next's lookup drafts (docs/CONTEXT-LOOKUP-DRAFTS.md) beat the neural
+    head on anything that repeats. A hit replaces MTP argmax for that step;
+    the head still runs so its KV stays aligned for partial rollback.
+    """
+
+    def __init__(self, order: int = 3):
+        self.order = max(0, order)
+        self.last: dict[tuple[int, ...], int] = {}
+
+    def observe(self, ids: list[int]) -> None:
+        o = self.order
+        if o <= 0:
+            return
+        for i in range(o, len(ids)):
+            self.last[tuple(ids[i - o:i])] = ids[i]
+
+    def lookup(self, ctx: list[int]) -> int | None:
+        o = self.order
+        if o <= 0 or len(ctx) < o:
+            return None
+        return self.last.get(tuple(ctx[-o:]))
 
 
 class AneMtpFusion:
@@ -4065,15 +4411,24 @@ class PureAneRuntime:
                 f"{self.active_lanes} lanes exceeds the convolution limit "
                 f"{self.program_width - 3} at width {self.program_width}")
         # Speculative draft width, so the maximum draft depth is this minus
-        # one. It was 3, capping drafting at depth 2, but the verify pass
-        # batches up to active_lanes positions and a marginal candidate costs
-        # ~23 ms against 273 ms for the first. Measured over five varied
-        # prompts: depth 2 gives 3.78 tok/s, depth 3 gives 3.98, depth 4 falls
-        # back to 3.68 as sequential drafting cost overtakes acceptance.
-        self.mtp_lanes = int(os.environ.get("Q38_ANE_MTP_LANES", "5"))
+        # one. Prompt ingestion and partial-accept replay use the same width.
+        # Default matches backbone active_lanes so a 300-token prompt is 19
+        # MTP batches instead of 60 at the old 5-lane cap.
+        self.mtp_lanes = int(os.environ.get(
+            "Q38_ANE_MTP_LANES", str(self.active_lanes)
+        ))
+        if self.mtp_lanes > self.program_width:
+            raise ValueError(
+                f"{self.mtp_lanes} MTP lanes exceed program width "
+                f"{self.program_width}"
+            )
         if not 0 <= mtp_draft < self.mtp_lanes:
             raise ValueError(f"MTP draft must be 0..{self.mtp_lanes-1}")
         self.mtp_draft=mtp_draft
+        self.mtp_bits = int(os.environ.get("Q38_ANE_MTP_BITS", "16"))
+        if self.mtp_bits not in (4, 8, 16):
+            raise ValueError("Q38_ANE_MTP_BITS must be 4, 8, or 16")
+        self.ngram_order = int(os.environ.get("Q38_ANE_MTP_NGRAM", "3"))
         self.profile_enabled=profile_decode
         self._profile_phase="idle"
         self._profile_request:dict[str,dict]={}
@@ -4083,15 +4438,20 @@ class PureAneRuntime:
         self.driver = AneDriver(engine_path)
         self.recurrence = AneGdnRecurrence(self.driver)
         self.driver.discard_compiler_files(self.recurrence.program)
-        # One shared, weight-free exact 16-position recurrence graph. Importing
-        # lazily avoids a module cycle in the standalone qualification probe;
-        # this class is framework-free and uses the same local ANE driver.
+        # Chunked prefill does not use the token-unrolled graph. Compiling a
+        # 32-step unroll at width 64 is the documented scheduler cliff; skip
+        # it unless A/B explicitly asks for unroll.
         from probes.ane_gdn_scan64 import AneGdnUnrolled
-        self.prefill_recurrence = AneGdnUnrolled(self.driver, self.active_lanes)
-        self.unrolled_prefill_recurrence = self.prefill_recurrence
-        self.chunked_prefill_recurrence = None
-        self.prefill_recurrence_mode = "unroll"
-        self.driver.discard_compiler_files(self.prefill_recurrence.program)
+        gdn_prefill=os.environ.get("Q38_ANE_GDN_PREFILL","unroll")
+        self.unrolled_prefill_recurrence=None
+        self.chunked_prefill_recurrence=None
+        self.chunked_prefill_by_live:dict[int,object]={}
+        self.prefill_recurrence=None
+        self.prefill_recurrence_mode="unroll"
+        if gdn_prefill!="chunk":
+            self.prefill_recurrence=AneGdnUnrolled(self.driver,self.active_lanes)
+            self.unrolled_prefill_recurrence=self.prefill_recurrence
+            self.driver.discard_compiler_files(self.prefill_recurrence.program)
         shared_prepare = AneAttentionPrepareDynamic(self.driver, context)
         self.driver.discard_compiler_files(shared_prepare.program)
         types = text.get("layer_types") or [
@@ -4117,7 +4477,7 @@ class PureAneRuntime:
                 for x in ("q_proj","k_proj","v_proj")
             ]
             mtp_bank=AneLinearProjectionBank(
-                self.driver,checkpoint,[mtp_names],bits,"mtp_head"
+                self.driver,checkpoint,[mtp_names],self.mtp_bits,"mtp_head"
             )
             # the bank defaults to 3 active lanes; the MTP path drafts mtp_lanes
             mtp_bank.active_lanes=self.mtp_lanes
@@ -4125,11 +4485,7 @@ class PureAneRuntime:
         if context<=256:
             shared_core=AneAttentionCore(self.driver,context)
         else:
-            # Stay within the 127 distinct-model budget observed on this
-            # process's _ANEInMemoryModel loader path. Missing
-            # group sizes fall back to repeated one-block scans, so this only
-            # changes dispatch efficiency, never supported context or math.
-            group_sizes=(() if bits==16 else ((32,) if mtp_draft else (4,16,32)))
+            group_sizes=(() if bits==16 else (4,16,32))
             shared_core=AneLongContextAttentionCore(
                 self.driver,context,group_sizes=group_sizes
             )
@@ -4332,8 +4688,8 @@ class PureAneRuntime:
             )
             self.mtp=PureAneMtp(
                 self.driver,checkpoint,_BankProjection(mtp_bank,0),
-                mtp_prepare,shared_core.fork_cache(),self.final_head,bits,
-                self.mtp_lanes,down_proj_parts
+                mtp_prepare,shared_core.fork_cache(),self.final_head,
+                self.mtp_bits,self.mtp_lanes,down_proj_parts
             )
             extra=0
             for prog in (self.mtp.fusion.program,self.mtp.tail.program):
@@ -4347,7 +4703,7 @@ class PureAneRuntime:
         cache_count=len(aidx)+(1 if self.mtp is not None else 0)
         self.kv_cache_bytes=(cache_count*2*shared_core.Hkv*cache_capacity*
                              shared_core.D*np.dtype(np.float16).itemsize)
-        self.set_prefill_recurrence(os.environ.get("Q38_ANE_GDN_PREFILL", "chunk"))
+        self.set_prefill_recurrence(os.environ.get("Q38_ANE_GDN_PREFILL", "unroll"))
         assert_standalone("full model bake")
         total_seconds = time.perf_counter() - startup_started
         engine_metrics = dict(self.driver.engine.compile_metrics)
@@ -4368,8 +4724,11 @@ class PureAneRuntime:
                            if checkpoint.quant_cache_dir else None),
             "down_proj_parts": down_proj_parts,
         }
+        chunk_lives=",".join(str(n) for n in sorted(self.chunked_prefill_by_live, reverse=True)) or "none"
         print(f"PURE_ANE_BAKE=PASS programs={self.program_count} "
               f"blobs={self.blob_bytes/1e9:.2f}GB context={self.context} "
+              f"width={self.program_width} lanes={self.active_lanes} "
+              f"chunk_lives={chunk_lives} "
               f"down_proj_parts={down_proj_parts} "
               f"kv_capacity={self.kv_cache_bytes/1e9:.2f}GB "
               f"seconds={total_seconds:.1f} "
@@ -4385,17 +4744,95 @@ class PureAneRuntime:
         """
         if mode not in ("unroll", "chunk"):
             raise ValueError("Q38_ANE_GDN_PREFILL must be unroll or chunk")
-        if mode == "chunk" and self.chunked_prefill_recurrence is None:
-            if self.program_count + 1 >= 127:
-                raise ValueError("chunk graph would exceed the resident program budget")
-            from tools.ane_gdn_chunk import AneGdnChunked
-            program = AneGdnChunked(self.driver, self.active_lanes)
-            self.driver.discard_compiler_files(program.program)
-            self.chunked_prefill_recurrence = program
-            self.program_count += 1
-        self.prefill_recurrence = (self.chunked_prefill_recurrence if mode == "chunk"
-                                   else self.unrolled_prefill_recurrence)
+        if mode == "chunk" and not self.chunked_prefill_by_live:
+            try:
+                from tools.ane_gdn_chunk import AneGdnChunked
+            except ImportError:
+                print("Q38_ANE_GDN_PREFILL=chunk but tools.ane_gdn_chunk is missing; "
+                      "using unroll", flush=True)
+                mode = "unroll"
+            else:
+                # 32-wide tile cost is ~the same at live 8/16/32, so remainders
+                # of 8+ beat stepwise; live 4 does not (chunk_mil rejects it).
+                lives = [n for n in (32, 16, 8) if n <= self.active_lanes]
+                if self.active_lanes not in lives and self.active_lanes in (8, 16, 32):
+                    lives.append(self.active_lanes)
+                for live in lives:
+                    if self.program_count + 1 >= 127:
+                        print(f"  chunk GDN live={live} skipped: program budget",
+                              flush=True)
+                        break
+                    program = AneGdnChunked(self.driver, live)
+                    self.driver.discard_compiler_files(program.program)
+                    self.chunked_prefill_by_live[live] = program
+                    self.program_count += 1
+                    print(f"  chunk GDN live={live}", flush=True)
+                self.chunked_prefill_recurrence = (
+                    self.chunked_prefill_by_live.get(self.active_lanes)
+                    or next(iter(self.chunked_prefill_by_live.values()), None)
+                )
+        if mode == "chunk":
+            self.prefill_recurrence = self.chunked_prefill_recurrence
+        else:
+            if self.unrolled_prefill_recurrence is None:
+                from probes.ane_gdn_scan64 import AneGdnUnrolled
+                self.unrolled_prefill_recurrence = AneGdnUnrolled(
+                    self.driver, self.active_lanes
+                )
+                self.driver.discard_compiler_files(
+                    self.unrolled_prefill_recurrence.program
+                )
+            self.prefill_recurrence = self.unrolled_prefill_recurrence
         self.prefill_recurrence_mode = mode
+
+    def _gdn_chunk_cover(self, lanes: int) -> list[tuple[int, int]]:
+        """Largest compiled chunk lives that fit inside this ragged batch."""
+        graphs = self.chunked_prefill_by_live
+        if self.prefill_recurrence_mode != "chunk" or not graphs:
+            rec = self.prefill_recurrence
+            if rec is not None and lanes == getattr(rec, "tokens", None):
+                return [(0, lanes)]
+            return []
+        parts: list[tuple[int, int]] = []
+        col = 0
+        left = lanes
+        for live in sorted(graphs, reverse=True):
+            while left >= live:
+                parts.append((col, live))
+                col += live
+                left -= live
+        return parts
+
+    def _run_gdn_chunk(self, layer, activated, projection, start, live):
+        graph = self.chunked_prefill_by_live.get(live) or self.prefill_recurrence
+        end = start + live
+        raw_q = np.stack([
+            activated[:2048, lane].reshape(16, 128)
+            for lane in range(start, end)
+        ])
+        raw_k = np.stack([
+            activated[2048:4096, lane].reshape(16, 128)
+            for lane in range(start, end)
+        ])
+        values = np.stack([
+            activated[4096:10240, lane].reshape(48, 128)
+            for lane in range(start, end)
+        ])
+        initial = self.recurrence.snapshot(layer.state)
+        graph.load(
+            raw_q, raw_k, values,
+            projection[16432:16480, start:end].T,
+            projection[16384:16432, start:end].T,
+            layer.a_log, layer.dt_bias, initial
+        )
+        block, state = graph.run_loaded()
+        self.recurrence.restore(
+            layer.state,
+            np.ascontiguousarray(state.transpose(0, 2, 1)).reshape(
+                self.recurrence.HK, self.recurrence.Dv
+            ).astype(np.float16, copy=False)
+        )
+        return np.ascontiguousarray(block.reshape(live, 6144).T)
 
     def snapshot(self) -> PureAneSnapshot:
         """Capture all mutable target state before speculative verification."""
@@ -4502,7 +4939,8 @@ class PureAneRuntime:
         return {"request":self._format_profile(self._profile_request),
                 "cumulative":self._format_profile(self._profile_cumulative)}
 
-    def step_many(self,token_ids:list[int])->tuple[np.ndarray,np.ndarray]:
+    def step_many(self,token_ids:list[int],*,
+                 project_logits:bool=True)->tuple[np.ndarray,np.ndarray]:
         """Advance up to active_lanes positions, batching learned matmuls."""
         if not 1<=len(token_ids)<=self.active_lanes:
             raise ValueError(f"step_many supports 1..{self.active_lanes} tokens")
@@ -4536,53 +4974,44 @@ class PureAneRuntime:
                 activated=layer.conv(projection[:10240])
                 if profiling:record("gdn_conv",started)
                 activated,_=_lane_matrix(activated,10240,self.active_lanes)
-                if lanes == self.active_lanes:
-                    started=time.perf_counter_ns() if profiling else 0
-                    raw_q=np.stack([
-                        activated[:2048,lane].reshape(16,128)
-                        for lane in range(lanes)
-                    ])
-                    raw_k=np.stack([
-                        activated[2048:4096,lane].reshape(16,128)
-                        for lane in range(lanes)
-                    ])
-                    values=np.stack([
-                        activated[4096:10240,lane].reshape(48,128)
-                        for lane in range(lanes)
-                    ])
-                    initial=self.recurrence.snapshot(layer.state)
-                    self.prefill_recurrence.load(
-                        raw_q,raw_k,values,
-                        projection[16432:16480,:lanes].T,
-                        projection[16384:16432,:lanes].T,
-                        layer.a_log,layer.dt_bias,initial
-                    )
-                    block,state=self.prefill_recurrence.run_loaded()
-                    self.recurrence.restore(
-                        layer.state,
-                        np.ascontiguousarray(state.transpose(0,2,1)).reshape(
-                            self.recurrence.HK,self.recurrence.Dv
+                debug_nan = index == 0 and os.environ.get("Q38_ANE_DEBUG_NAN") == "1"
+                if debug_nan:
+                    def _nan_stat(name: str, arr: np.ndarray) -> None:
+                        x = np.asarray(arr, np.float32)
+                        finite = np.isfinite(x)
+                        absmax = float(np.nanmax(np.abs(x))) if x.size else 0.0
+                        print(
+                            f"NANDBG layer0 {name} shape={tuple(x.shape)} "
+                            f"finite={float(finite.mean()):.4f} absmax={absmax:.4g}",
+                            flush=True,
                         )
+                    _nan_stat("projection", projection)
+                    _nan_stat("activated", activated)
+                parts=self._gdn_chunk_cover(lanes)
+                covered=(parts[-1][0]+parts[-1][1]) if parts else 0
+                cores=np.empty((6144,lanes),np.float16)
+                if parts:
+                    started=time.perf_counter_ns() if profiling else 0
+                    for start,live in parts:
+                        cores[:,start:start+live]=self._run_gdn_chunk(
+                            layer,activated,projection,start,live
+                        )
+                    if profiling:record("gdn_recurrence",started)
+                for lane in range(covered,lanes):
+                    q=activated[:2048,lane].reshape(16,128)
+                    k=activated[2048:4096,lane].reshape(16,128)
+                    v=activated[4096:10240,lane].reshape(48,128)
+                    started=time.perf_counter_ns() if profiling else 0
+                    core=self.recurrence(
+                        layer.state,q,k,v,projection[16432:16480,lane],
+                        projection[16384:16432,lane],
+                        layer.rep_a_log if layer.rep_a_log is not None else layer.a_log,
+                        layer.rep_dt_bias if layer.rep_dt_bias is not None else layer.dt_bias
                     )
                     if profiling:record("gdn_recurrence",started)
-                    cores=np.ascontiguousarray(
-                        block.reshape(lanes,6144).T
-                    ).astype(np.float16,copy=False)
-                else:
-                    cores=np.empty((6144,lanes),np.float16)
-                    for lane in range(lanes):
-                        q=activated[:2048,lane].reshape(16,128)
-                        k=activated[2048:4096,lane].reshape(16,128)
-                        v=activated[4096:10240,lane].reshape(48,128)
-                        started=time.perf_counter_ns() if profiling else 0
-                        core=self.recurrence(
-                            layer.state,q,k,v,projection[16432:16480,lane],
-                            projection[16384:16432,lane],
-                            layer.rep_a_log if layer.rep_a_log is not None else layer.a_log,
-                            layer.rep_dt_bias if layer.rep_dt_bias is not None else layer.dt_bias
-                        )
-                        if profiling:record("gdn_recurrence",started)
-                        cores[:,lane]=core.reshape(-1)
+                    cores[:,lane]=core.reshape(-1)
+                if debug_nan:
+                    _nan_stat("cores", cores)
                 started=time.perf_counter_ns() if profiling else 0
                 result=layer.tail(
                     cores,projection[10240:16384],hidden
@@ -4655,9 +5084,12 @@ class PureAneRuntime:
                     f"first={trace[:4].tolist()}",flush=True
                 )
         started=time.perf_counter_ns() if profiling else 0
-        logits=self.final_head(hidden)
-        if profiling:record("final_head",started)
-        logits,_=_lane_matrix(logits,self.final_head.V,self.active_lanes)
+        if project_logits:
+            logits=self.final_head(hidden)
+            if profiling:record("final_head",started)
+            logits,_=_lane_matrix(logits,self.final_head.V,self.active_lanes)
+        else:
+            logits=np.zeros((self.final_head.V,lanes),np.float16)
         self.steps += lanes
         self.last_hidden=hidden[:,-1].copy()
         if profiling:
@@ -4675,6 +5107,7 @@ class PureAneRuntime:
                  on_token: Callable[[int], bool | None] | None = None,
                  stop_token_ids: set[int] | None = None,
                  token_selector: Callable[[np.ndarray,list[int]],int] | None = None,
+                 sampler: Sampler | None = None,
                  prefilled_tokens: int = 0,
                  prefill_logits: np.ndarray | None = None,
                  on_prefill: Callable[[np.ndarray],None] | None = None,
@@ -4682,9 +5115,9 @@ class PureAneRuntime:
         """Prefill and decode a sequence, optionally reporting tokens live.
 
         ``on_token`` runs after a token is committed and can return ``False``
-        to stop. A custom ``token_selector`` enables CPU-side sampling; MTP is
-        used only for the deterministic greedy path because speculative
-        acceptance for sampling requires coupled RNG distributions.
+        to stop. A custom ``sampler`` or ``token_selector`` enables sampling;
+        MTP uses speculative rejection sampling under temperature to match
+        the target distribution with zero mathematical bias.
         """
         ids=tokenizer.encode(prompt)
         if not ids:
@@ -4713,13 +5146,19 @@ class PureAneRuntime:
         self._profile_phase="prefill"
         for start_at in range(prefilled_tokens,len(ids),self.active_lanes):
             chunk=ids[start_at:start_at+self.active_lanes]
-            batch_logits,batch_hidden=self.step_many(chunk)
+            last_chunk=start_at+len(chunk)>=len(ids)
+            batch_logits,batch_hidden=self.step_many(
+                chunk,project_logits=last_chunk
+            )
             logits=batch_logits[:,-1]
             prompt_hidden.extend(batch_hidden[:,i].copy() for i in range(len(chunk)))
             if os.environ.get("PURE_ANE_TRACE_PREFIX") == "1":
                 print(f"prefix={start_at+len(chunk)} token={chunk[-1]} "
                       f"next={int(np.argmax(logits))}",flush=True)
-        use_mtp=self.mtp is not None and token_selector is None
+        use_mtp = self.mtp is not None and self.mtp_draft > 0
+        min_prompt = int(os.environ.get("Q38_ANE_MTP_MIN_PROMPT","8"))
+        if use_mtp and len(ids)<min_prompt:
+            use_mtp = False
         self._profile_phase="mtp_prefill"
         if use_mtp and prefilled_tokens==0 and len(ids)>1:
             history=np.stack(prompt_hidden[:-1],axis=1);next_ids=ids[1:]
@@ -4743,21 +5182,39 @@ class PureAneRuntime:
         if on_prefill is not None:
             on_prefill(logits)
         self._profile_phase="decode"
-        def select(current:np.ndarray,generated:list[int])->int:
-            if token_selector is None:return int(np.argmax(current))
-            return int(token_selector(current,generated))
+
+        if sampler is not None:
+            active_sampler = sampler
+        elif isinstance(token_selector, Sampler):
+            active_sampler = token_selector
+        elif token_selector is not None:
+            class _LegacyCallableSampler:
+                def __init__(self, fn): self.fn = fn
+                def is_greedy(self): return False
+                def sample(self, raw, gen=None):
+                    return int(self.fn(raw, gen or [])), np.array([], dtype=np.float32)
+                def speculative_verify(self, draft_tok, q_probs, target_logits, gen=None):
+                    target_tok = int(self.fn(target_logits, gen or []))
+                    if target_tok == draft_tok: return True, None
+                    return False, target_tok
+            active_sampler = _LegacyCallableSampler(token_selector)
+        else:
+            active_sampler = Sampler(temperature=0.0, prompt_ids=ids)
+
         if use_mtp:
             last_prompt_hidden=(prompt_hidden[-1] if prompt_hidden else
                                 self.last_hidden)
             if last_prompt_hidden is None:
                 raise ValueError("MTP generation requires the last prompt hidden state")
+            first_tok, _ = active_sampler.sample(logits, [])
             return self._generate_mtp(
-                int(np.argmax(logits)),last_prompt_hidden,max_tokens,start,
-                on_token=on_token,stop_token_ids=stop_token_ids
+                first_tok, last_prompt_hidden, max_tokens, start,
+                on_token=on_token, stop_token_ids=stop_token_ids,
+                prompt_ids=ids, sampler=active_sampler
             )
         generated=[]
         for index in range(max_tokens):
-            token=select(logits,generated)
+            token, _ = active_sampler.sample(logits, generated)
             if stop_token_ids and token in stop_token_ids:
                 break
             generated.append(token)
@@ -4770,40 +5227,85 @@ class PureAneRuntime:
     def _generate_mtp(self,cur:int,last_hidden:np.ndarray,max_tokens:int,
                       start:float,*,
                       on_token:Callable[[int],bool | None] | None=None,
-                      stop_token_ids:set[int] | None=None
+                      stop_token_ids:set[int] | None=None,
+                      prompt_ids:list[int] | None=None,
+                      sampler:Sampler | None=None
                       )->tuple[list[int],float]:
         assert self.mtp is not None
-        generated=[];cycles=accepted=0
+        if sampler is None:
+            sampler = Sampler(temperature=0.0, prompt_ids=prompt_ids)
+        generated=[];cycles=accepted=0;reject_streak=0;hot_streak=0
+        ngram_hits=0
+        fallback_after=int(os.environ.get("Q38_ANE_MTP_REJECT_FALLBACK","2"))
+        ngram=_TokenNgram(self.ngram_order)
+        seq=list(prompt_ids or [])
+        ngram.observe(seq)
         def commit(tokens:list[int])->bool:
             for token in tokens:
                 if len(generated)>=max_tokens:return False
                 if stop_token_ids and token in stop_token_ids:return False
                 generated.append(token)
+                seq.append(token)
+                ngram.observe(seq[-self.ngram_order-1:] if self.ngram_order else seq)
                 if on_token is not None and on_token(token) is False:return False
             return True
         if not commit([cur]):
             return generated,time.perf_counter()-start
         while len(generated)<max_tokens:
-            mtp_saved=self.mtp.snapshot();drafts=[];dh=last_hidden;dtok=cur
+            mtp_saved=self.mtp.snapshot()
+            drafts=[]
+            draft_probs=[]
+            dh=last_hidden
+            dtok=cur
             remaining=max_tokens-len(generated)
-            draft_count=min(self.mtp_draft,max(0,remaining-1))
+            depth=1+hot_streak if hot_streak else 1
+            draft_count=min(self.mtp_draft,max(0,remaining-1),depth)
+            draft_ctx=list(seq)
             for _ in range(draft_count):
+                hit=ngram.lookup(draft_ctx)
+                if hit is None and drafts:
+                    break
                 dlogits,dh=self.mtp.step(dh,dtok)
-                dtok=int(np.argmax(dlogits));drafts.append(dtok)
+                if hit is not None:
+                    dtok=hit
+                    ngram_hits+=1
+                    dq=np.zeros(len(dlogits),dtype=np.float32)
+                    dq[dtok]=1.0
+                else:
+                    dtok,dq=sampler.sample(dlogits,draft_ctx)
+                drafts.append(dtok)
+                draft_probs.append(dq)
+                draft_ctx.append(dtok)
             target_saved=self.snapshot()
             verify_logits,verify_hidden=self.step_many([cur]+drafts)
-            preds=[int(x) for x in np.argmax(verify_logits,axis=0)]
             n_ok=0
-            for wanted,actual in zip(drafts,preds):
-                if wanted!=actual:break
+            fix=None
+            for i,wanted in enumerate(drafts):
+                ctx_at_i=seq+drafts[:i]
+                acc,corr=sampler.speculative_verify(
+                    wanted,draft_probs[i],verify_logits[:,i],ctx_at_i
+                )
+                if not acc:
+                    fix=corr
+                    break
                 n_ok+=1
+            if os.environ.get("Q38_ANE_MTP_TRACE")=="1" and cycles<3:
+                print(
+                    f"MTPTRACE cycle={cycles} cur={cur} drafts={drafts} "
+                    f"n_ok={n_ok} fix={fix} hits={ngram_hits}",
+                    flush=True,
+                )
             if n_ok==len(drafts):
-                additions=drafts+[preds[-1]]
+                final_tok,_=sampler.sample(verify_logits[:,-1],seq+drafts)
+                additions=drafts+[final_tok]
                 accepted+=min(len(additions),max_tokens-len(generated))
-                cur=preds[-1];last_hidden=verify_hidden[:,-1]
+                cur=final_tok
+                last_hidden=verify_hidden[:,-1]
+                reject_streak=0
+                hot_streak+=1
             else:
                 self.restore(target_saved);self.mtp.restore(mtp_saved)
-                keep=drafts[:n_ok];fix=preds[n_ok]
+                keep=drafts[:n_ok]
                 replay=[cur]+keep
                 _,replay_hidden=self.step_many(replay)
                 actual_next=keep+[fix]
@@ -4813,11 +5315,25 @@ class PureAneRuntime:
                 additions=actual_next
                 accepted+=min(len(additions),max_tokens-len(generated))
                 cur=fix;last_hidden=replay_hidden[:,-1]
+                hot_streak=0
+                reject_streak=0 if n_ok else reject_streak+1
             cycles+=1
             if not commit(additions):break
+            if fallback_after>0 and reject_streak>=fallback_after:
+                break
+        while len(generated)<max_tokens:
+            nxt,_=sampler.sample(self.step(cur),seq)
+            if stop_token_ids and nxt in stop_token_ids:
+                break
+            if not commit([nxt]):
+                break
+            cur=nxt
         elapsed=time.perf_counter()-start
-        print(f"PURE_ANE_MTP=PASS draft={self.mtp_draft} cycles={cycles} "
-              f"accepted_per_cycle={accepted/max(1,cycles):.3f}",flush=True)
+        print(f"PURE_ANE_MTP=PASS draft={self.mtp_draft} bits={self.mtp_bits} "
+              f"cycles={cycles} accepted_per_cycle={accepted/max(1,cycles):.3f} "
+              f"ngram_hits={ngram_hits} "
+              f"sampling={not sampler.is_greedy()} "
+              f"tail={max(0,len(generated)-accepted)}",flush=True)
         return generated[:max_tokens],elapsed
 
 
@@ -5217,6 +5733,57 @@ def long_attention_core_smoke(engine_path:str,context:int=512,
         raise RuntimeError(f"long-context attention validation failed rel={rel}")
     print(f"PURE_ANE_LONG_ATTENTION=PASS context={context} valid={valid} "
           f"relative_error={rel:.6g} programs={len(core.programs)}")
+    T=8
+    prefix=min(context-T,300)
+    k_all=rng.normal(0,.3,(4,prefix+T,256)).astype(np.float16)
+    v_all=rng.normal(0,.3,(4,prefix+T,256)).astype(np.float16)
+    q_all=rng.normal(0,.3,(T,24,256)).astype(np.float16)
+    batched=core.fork_cache()
+    for pos in range(prefix):
+        block,token=divmod(pos,batched.B)
+        batched.keys[block,:,token]=k_all[:,pos]
+        batched.values[block,:,token]=v_all[:,pos]
+    batched.offset=prefix
+    t0=time.perf_counter()
+    got_many=batched.call_many(
+        q_all,
+        np.moveaxis(k_all[:,prefix:prefix+T],1,0),
+        np.moveaxis(v_all[:,prefix:prefix+T],1,0),
+    ).astype(np.float32)
+    batched_ms=(time.perf_counter()-t0)*1e3
+    serial=core.fork_cache()
+    for pos in range(prefix):
+        block,token=divmod(pos,serial.B)
+        serial.keys[block,:,token]=k_all[:,pos]
+        serial.values[block,:,token]=v_all[:,pos]
+    serial.offset=prefix
+    t0=time.perf_counter()
+    got_serial=np.stack([
+        serial(q_all[t],k_all[:,prefix+t],v_all[:,prefix+t])
+        for t in range(T)
+    ]).astype(np.float32)
+    serial_ms=(time.perf_counter()-t0)*1e3
+    ref=np.empty_like(got_many)
+    for t in range(T):
+        valid=prefix+t+1
+        qg=q_all[t].astype(np.float32).reshape(4,6,256)
+        k=k_all[:,:valid].astype(np.float32)
+        v=v_all[:,:valid].astype(np.float32)
+        scores=np.matmul(qg,k.swapaxes(-1,-2))*.0625
+        scores-=scores.max(axis=-1,keepdims=True)
+        prob=np.exp(scores);prob/=prob.sum(axis=-1,keepdims=True)
+        ref[t]=np.matmul(prob,v).reshape(24,256)
+    rel_many=float(np.max(np.abs(got_many-ref))/(np.max(np.abs(ref))+1e-9))
+    rel_vs=float(np.max(np.abs(got_many-got_serial))/(np.max(np.abs(got_serial))+1e-9))
+    if not np.isfinite(got_many).all() or rel_many>=2e-2:
+        raise RuntimeError(
+            f"batched stream attention failed rel={rel_many} vs_serial={rel_vs}"
+        )
+    print(f"PURE_ANE_BATCHED_STREAM=PASS T={T} prefix={prefix} "
+          f"rel={rel_many:.6g} vs_serial={rel_vs:.6g} "
+          f"batched_ms={batched_ms:.2f} serial_ms={serial_ms:.2f} "
+          f"speedup={serial_ms/max(batched_ms,1e-6):.2f}x "
+          f"stream={'yes' if batched.batched_stream_program is not None else 'no'}")
     assert_standalone("long attention core smoke test")
 
 
