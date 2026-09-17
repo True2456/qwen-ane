@@ -48,6 +48,36 @@ export default function (api: ExtensionAPI) {
           xhigh: "xhigh",
         },
       },
+      {
+        id: "Qwen3.8-27B",
+        name: "Qwen3.8-27B (pure ANE · :2457)",
+        reasoning: true,
+        input: ["text"] as "text"[],
+        contextWindow: 131072,
+        maxTokens: 2048,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        compat: {
+          supportsStore: false,
+          supportsDeveloperRole: false,
+          supportsReasoningEffort: true,
+          maxTokensField: "max_tokens",
+          requiresReasoningContentOnAssistantMessages: true,
+          thinkingFormat: "chat-template",
+          chatTemplateKwargs: {
+            enable_thinking: { $var: "thinking.enabled" },
+            reasoning_effort: { $var: "thinking.effort", omitWhenOff: true },
+            preserve_thinking: true,
+          },
+          supportsFinishReason: true,
+        },
+        thinkingLevelMap: {
+          minimal: null,
+          low: "low",
+          medium: "medium",
+          high: null,
+          xhigh: "xhigh",
+        },
+      },
     ],
   });
 

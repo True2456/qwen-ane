@@ -2,7 +2,8 @@
 // Independent of Flash-Next on :2457 and of native rindi on :2456.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const BASE_URL = "http://127.0.0.1:1240/v1";
+const PORT = process.env.PURE27_PORT || "1240";
+const BASE_URL = process.env.PURE27_BASE_URL || `http://127.0.0.1:${PORT}/v1`;
 const API_KEY = "pure27";
 const LEAN_SYSTEM_PROMPT = `You are a concise coding assistant running locally on Apple Silicon.
 Answer the user's request directly. Inspect or modify files only when asked, and explain the result briefly.
