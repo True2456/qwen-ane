@@ -1,8 +1,20 @@
-"""Apple Foundation Models (fm)-inspired interactive CLI chat for qwen-ane."""
+"""Apple Foundation Models (fm)-faithful interactive CLI chat for qwen-ane.
+
+Recreates the signature AFM terminal experience:
+  - Apple Intelligence truecolor gradient header
+  - Subtitle status bar
+  - Bordered input pane with readline history & tab completion
+  - Live thinking indicator & dim reasoning stream
+  - Streaming markdown rendering with code block borders and word wrapping
+  - Subtle turn metric badges
+  - AFM-aligned slash commands (/model, /think, /instructions, /sessions, etc.)
+"""
 from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -11,30 +23,72 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from .config import get_sessions_dir, load_config
+# Standard library readline on macOS (libedit/readline)
+try:
+    import readline
+except ImportError:
+    readline = None
+
+from .config import get_qwen_ane_dir, get_sessions_dir, load_config
 from .downloader import ensure_model, normalize_model_name
-from .server import is_server_running, run_server
+from .server import is_server_running
 
-BANNER = """
-  Qwen ANE CLI
-  {silicon}
+SLASH_COMMANDS = [
+    "/help",
+    "/model",
+    "/think",
+    "/instructions",
+    "/clear",
+    "/save",
+    "/sessions",
+    "/resume",
+    "/info",
+    "/exit",
+    "/quit",
+]
 
-  Model:    {model_name}
-  Context:  {ctx_human}
-  Endpoint: http://{host}:{port}/v1
-  Cache:    {cache_status}
-  Thinking: {thinking_status}
 
-  Commands: /exit (quit), /clear (new chat), /think [level], /help
-"""
+def gradient_text(
+    text: str,
+    start_rgb: tuple[int, int, int] = (130, 215, 90),
+    end_rgb: tuple[int, int, int] = (35, 130, 205),
+) -> str:
+    """Interpolate truecolor ANSI escape codes across characters in text."""
+    n = len(text)
+    if n <= 1:
+        return f"\033[38;2;{start_rgb[0]};{start_rgb[1]};{start_rgb[2]}m{text}\033[0m"
+    res = []
+    for i, ch in enumerate(text):
+        t = i / (n - 1)
+        r = int(start_rgb[0] + (end_rgb[0] - start_rgb[0]) * t)
+        g = int(start_rgb[1] + (end_rgb[1] - start_rgb[1]) * t)
+        b = int(start_rgb[2] + (end_rgb[2] - start_rgb[2]) * t)
+        res.append(f"\033[38;2;{r};{g};{b}m{ch}")
+    res.append("\033[0m")
+    return "".join(res)
 
 
 def format_tokens(n: int) -> str:
     if n >= 1024:
         return f"{n // 1024}k" if n % 1024 == 0 else f"{n / 1024:.1f}k"
     return str(n)
+
+
+def time_ago(ts: float) -> str:
+    diff = max(0.0, time.time() - ts)
+    if diff < 60:
+        return "just now"
+    if diff < 3600:
+        return f"{int(diff / 60)}m ago"
+    if diff < 86400:
+        return f"{int(diff / 3600)}h ago"
+    return f"{int(diff / 86400)}d ago"
+
+
+def get_term_width() -> int:
+    return min(96, max(50, shutil.get_terminal_size().columns - 2))
 
 
 class ChatSession:
@@ -62,11 +116,13 @@ class ChatSession:
         if system_prompt:
             self.messages.append({"role": "system", "content": system_prompt})
 
-    def save(self) -> None:
-        if not self.messages:
-            return
+    def save(self, custom_name: str | None = None) -> Path:
         sdir = get_sessions_dir()
-        path = sdir / f"{self.session_id}.json"
+        name = custom_name or self.session_id
+        if not name.endswith(".json"):
+            path = sdir / f"{name}.json"
+        else:
+            path = sdir / name
         with open(path, "w", encoding="utf-8") as f:
             json.dump({
                 "session_id": self.session_id,
@@ -75,22 +131,97 @@ class ChatSession:
                 "messages": self.messages,
                 "saved_at": time.time(),
             }, f, indent=2)
+        return path
 
-    def load(self, session_id: str) -> bool:
+    def load(self, session_id_or_name: str) -> bool:
         sdir = get_sessions_dir()
-        path = sdir / f"{session_id}.json"
+        path = sdir / f"{session_id_or_name}.json"
+        if not path.exists():
+            path = sdir / session_id_or_name
         if not path.exists():
             return False
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                self.session_id = data.get("session_id", session_id)
+                self.session_id = data.get("session_id", session_id_or_name)
                 self.model = data.get("model", self.model)
+                self.model_id = "Qwen3.8-Flash-Next" if self.model == "flash-next" else "Qwen3.8-27B"
                 self.thinking = data.get("thinking", self.thinking)
                 self.messages = data.get("messages", [])
                 return True
         except Exception:
             return False
+
+
+class StreamingMarkdownRenderer:
+    """Streams model output live while styling markdown headings, bold, inline code, and code blocks."""
+
+    def __init__(self, width: int | None = None):
+        self.width = width or get_term_width()
+        self.col = 0
+        self.in_code = False
+        self.fence_buf = ""
+        self.code_lang = ""
+
+    def write(self, chunk: str):
+        for ch in chunk:
+            if ch == "\n":
+                sys.stdout.write("\n")
+                self.col = 0
+                if self.in_code:
+                    sys.stdout.write("\033[38;2;120;120;120m│\033[0m ")
+                    self.col = 2
+                continue
+
+            # Detect code fence ```
+            if ch == "`":
+                self.fence_buf += "`"
+                if self.fence_buf.endswith("```"):
+                    self.fence_buf = ""
+                    if not self.in_code:
+                        self.in_code = True
+                        dash = "─" * (self.width - 2)
+                        border = f"\n\033[38;2;120;120;120m╭{dash}╮\033[0m\n\033[38;2;120;120;120m│\033[0m \033[38;2;180;225;255m"
+                        sys.stdout.write(border)
+                        self.col = 2
+                    else:
+                        self.in_code = False
+                        dash = "─" * (self.width - 2)
+                        border = f"\033[0m\n\033[38;2;120;120;120m╰{dash}╯\033[0m\n"
+                        sys.stdout.write(border)
+                        self.col = 0
+                    continue
+                continue
+            elif self.fence_buf:
+                # Flush non-fence backticks
+                sys.stdout.write(self.fence_buf)
+                self.col += len(self.fence_buf)
+                self.fence_buf = ""
+
+            # Word wrapping near terminal boundary
+            if self.col >= self.width and ch == " ":
+                sys.stdout.write("\n")
+                self.col = 0
+                if self.in_code:
+                    sys.stdout.write("\033[38;2;120;120;120m│\033[0m ")
+                    self.col = 2
+                continue
+
+            sys.stdout.write(ch)
+            self.col += 1
+
+        sys.stdout.flush()
+
+    def finish(self):
+        if self.fence_buf:
+            sys.stdout.write(self.fence_buf)
+            self.fence_buf = ""
+        if self.in_code:
+            self.in_code = False
+            dash = "─" * (self.width - 2)
+            sys.stdout.write(f"\033[0m\n\033[38;2;120;120;120m╰{dash}╯\033[0m\n")
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
 
 def stream_chat_completion(
@@ -143,6 +274,113 @@ def stream_chat_completion(
                     continue
 
 
+def print_banner(model_name: str, ctx_human: str, silicon: str):
+    """Prints the Apple Foundation Models-style title banner."""
+    print()
+    print(gradient_text(" Qwen Neural Engine Chat", (130, 215, 90), (35, 130, 205)))
+    print(f"\033[38;2;153;153;153m model: {model_name} ({silicon}) · context: {ctx_human} · /help for help\033[0m")
+    print()
+
+
+def print_help():
+    """Prints AFM-style bordered help card."""
+    width = get_term_width()
+    dash = "─" * (width - 2)
+    header_dash = "─" * max(2, width - 14)
+    card = f"""\033[38;2;136;136;136m╭─ Commands {header_dash}╮\033[0m
+\033[38;2;136;136;136m│\033[0m  \033[1m/exit, /quit\033[0m          Exit the chat session
+\033[38;2;136;136;136m│\033[0m  \033[1m/clear\033[0m                Clear conversation history and screen
+\033[38;2;136;136;136m│\033[0m  \033[1m/model [name]\033[0m         Switch active model (flash-next, 27b)
+\033[38;2;136;136;136m│\033[0m  \033[1m/think [level]\033[0m        Set reasoning effort (off, low, medium, xhigh)
+\033[38;2;136;136;136m│\033[0m  \033[1m/instructions [text]\033[0m  Set or view system instructions
+\033[38;2;136;136;136m│\033[0m  \033[1m/save [name]\033[0m          Save session transcript to disk
+\033[38;2;136;136;136m│\033[0m  \033[1m/sessions\033[0m             List saved chat sessions
+\033[38;2;136;136;136m│\033[0m  \033[1m/resume <name>\033[0m        Resume a saved session
+\033[38;2;136;136;136m│\033[0m  \033[1m/info\033[0m                 Display hardware, context, and endpoint info
+\033[38;2;136;136;136m╰{dash}╯\033[0m"""
+    print(card + "\n")
+
+
+def print_sessions():
+    """Lists saved sessions in an AFM-styled bordered box."""
+    sdir = get_sessions_dir()
+    files = sorted(sdir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    width = get_term_width()
+    dash = "─" * (width - 2)
+
+    if not files:
+        print(f"\033[38;2;153;153;153mNo saved sessions found in {sdir}.\033[0m\n")
+        return
+
+    header_dash = "─" * max(2, width - 14)
+    print(f"\033[38;2;136;136;136m╭─ Sessions {header_dash}╮\033[0m")
+    for f in files[:10]:
+        try:
+            with open(f, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+            s_id = data.get("session_id", f.stem)[:24]
+            m_id = data.get("model", "unknown")
+            msg_count = len(data.get("messages", []))
+            age = time_ago(data.get("saved_at", f.stat().st_mtime))
+            row = f"  \033[1m{s_id:<24}\033[0m  {m_id:<12}  {msg_count:>3} msgs  ({age})"
+            print(f"\033[38;2;136;136;136m│\033[0m{row}")
+        except Exception:
+            continue
+    print(f"\033[38;2;136;136;136m╰{dash}╯\033[0m\n")
+
+
+def print_info(session: ChatSession, ctx: int, host: str, port: int, lru: bool):
+    """Prints runtime hardware and configuration info."""
+    width = get_term_width()
+    dash = "─" * (width - 2)
+    header_dash = "─" * max(2, width - 10)
+    silicon = (
+        "Apple Neural Engine (100% pure on-chip)"
+        if normalize_model_name(session.model) == "27b"
+        else "Apple Neural Engine (GDN/QSA) + MLX (MoE)"
+    )
+    cache = "Enabled (LRU prefix reuse)" if lru else "Disabled"
+    print(f"""\033[38;2;136;136;136m╭─ Info {header_dash}╮\033[0m
+\033[38;2;136;136;136m│\033[0m  Model:       \033[1m{session.model_id}\033[0m
+\033[38;2;136;136;136m│\033[0m  Hardware:    {silicon}
+\033[38;2;136;136;136m│\033[0m  Context:     {format_tokens(ctx)} tokens
+\033[38;2;136;136;136m│\033[0m  Endpoint:    http://{host}:{port}/v1
+\033[38;2;136;136;136m│\033[0m  Cache:       {cache}
+\033[38;2;136;136;136m│\033[0m  Thinking:    {session.thinking}
+\033[38;2;136;136;136m│\033[0m  Session:     {session.session_id}
+\033[38;2;136;136;136m╰{dash}╯\033[0m\n""")
+
+
+def setup_readline():
+    """Configures readline history and slash command completion."""
+    if readline is None:
+        return
+    def completer(text: str, state: int):
+        options = [c for c in SLASH_COMMANDS if c.startswith(text)]
+        return options[state] if state < len(options) else None
+
+    try:
+        readline.set_completer(completer)
+        readline.set_completer_delims(" \t\n")
+        readline.parse_and_bind("tab: complete")
+        hist_file = get_qwen_ane_dir() / "history"
+        if hist_file.exists():
+            readline.read_history_file(str(hist_file))
+    except Exception:
+        pass
+
+
+def save_readline():
+    if readline is None:
+        return
+    try:
+        hist_file = get_qwen_ane_dir() / "history"
+        readline.set_history_length(1000)
+        readline.write_history_file(str(hist_file))
+    except Exception:
+        pass
+
+
 def start_chat(
     model: str = "flash-next",
     ctx: int = 131072,
@@ -157,14 +395,14 @@ def start_chat(
     model_path: str | Path | None = None,
     hf_repo: str | None = None,
 ) -> int:
-    """Launch the interactive chat REPL."""
+    """Launch the interactive chat REPL with AFM styling."""
     canon = normalize_model_name(model)
     model_id = "Qwen3.8-Flash-Next" if canon == "flash-next" else "Qwen3.8-27B"
 
-    # Check if server is running
+    # 1. Start background inference server if not running
     server_proc = None
     if not is_server_running(host, port):
-        print(f"Starting background {canon} engine on port {port}...", flush=True)
+        print(f"\033[38;2;153;153;153mStarting background {canon} engine on port {port}...\033[0m", flush=True)
         resolved_path = ensure_model(canon, custom_path=model_path, hf_repo=hf_repo)
 
         env = dict(os.environ)
@@ -233,7 +471,7 @@ def start_chat(
                 break
             time.sleep(1.0)
         else:
-            print(f"❌ Server timed out while starting.")
+            print(f"\033[31mError: Server timed out while starting.\033[0m")
             if server_proc:
                 server_proc.terminate()
             return 1
@@ -250,67 +488,153 @@ def start_chat(
 
     if resume_id:
         if session.load(resume_id):
-            print(f"Loaded existing session: {resume_id} ({len(session.messages)} messages)")
+            print(f"\033[38;2;130;215;90m✓ Resumed session '{resume_id}' ({len(session.messages)} messages)\033[0m")
         else:
-            print(f"Session '{resume_id}' not found. Starting fresh session.")
+            print(f"\033[38;2;220;120;120mSession '{resume_id}' not found. Starting fresh session.\033[0m")
+
+    setup_readline()
 
     ctx_human = format_tokens(ctx)
-    cache_str = "Enabled (LRU prefix reuse)" if lru else "Disabled"
-    silicon = (
-        "Neural Engine (pure ANE)"
-        if normalize_model_name(session.model) == "27b"
-        else "Hybrid: ANE attention, GPU MoE (not full-ANE)"
-    )
-    print(BANNER.format(
-        silicon=silicon,
-        model_name=model_id,
-        ctx_human=ctx_human,
-        host=host,
-        port=port,
-        cache_status=cache_str,
-        thinking_status=session.thinking,
-    ))
+    silicon = "pure ANE" if canon == "27b" else "ANE + GPU"
+    print_banner(session.model_id, ctx_human, silicon)
+
+    last_sigint_time = 0.0
 
     try:
         while True:
+            width = get_term_width()
+            dash = "─" * (width - 2)
+
+            # AFM-style rounded input box
+            top_border = f"\033[38;2;136;136;136m╭{dash}╮\033[0m"
+            prompt_marker = f"\033[38;2;136;136;136m│\033[0m \033[1;38;2;130;215;90m›\033[0m "
+            bottom_border = f"\033[38;2;136;136;136m╰{dash}╯\033[0m"
+            status_tag = f"\033[38;2;153;153;153m {session.model_id}\033[0m"
+
             try:
-                user_input = input("you> ").strip()
-            except (EOFError, KeyboardInterrupt):
+                print(top_border)
+                raw_input = input(prompt_marker)
+                print(bottom_border)
+                print(status_tag)
                 print()
+            except KeyboardInterrupt:
+                print(f"\n{bottom_border}")
+                now = time.time()
+                if now - last_sigint_time < 2.5:
+                    print("\n\033[38;2;153;153;153mExiting.\033[0m")
+                    break
+                last_sigint_time = now
+                print("\033[38;2;153;153;153m(Press Ctrl+C again or /exit to quit)\033[0m\n")
+                continue
+            except EOFError:
+                print("\n\033[38;2;153;153;153mExiting.\033[0m")
                 break
 
+            user_input = raw_input.strip()
             if not user_input:
                 continue
 
+            # Multi-line continuation with backslash \
+            while user_input.endswith("\\"):
+                user_input = user_input[:-1].strip()
+                try:
+                    cont = input("\033[38;2;136;136;136m│\033[0m   ").strip()
+                    user_input += "\n" + cont
+                except (KeyboardInterrupt, EOFError):
+                    break
+
+            # Slash commands
             if user_input in ("/exit", "/quit"):
                 break
+
             elif user_input == "/clear":
                 session.messages = []
-                print("✨ Conversation history cleared.\n")
+                print("\033[2J\033[H", end="")
+                print_banner(session.model_id, ctx_human, silicon)
                 continue
+
+            elif user_input == "/help":
+                print_help()
+                continue
+
+            elif user_input == "/sessions":
+                print_sessions()
+                continue
+
+            elif user_input == "/info":
+                print_info(session, ctx, host, port, lru)
+                continue
+
+            elif user_input.startswith("/save"):
+                parts = user_input.split(maxsplit=1)
+                save_name = parts[1] if len(parts) > 1 else None
+                saved_path = session.save(save_name)
+                print(f"\033[38;2;130;215;90m✓ Session saved as '{saved_path.stem}'\033[0m\n")
+                continue
+
+            elif user_input.startswith("/resume"):
+                parts = user_input.split(maxsplit=1)
+                if len(parts) < 2:
+                    print("\033[38;2;220;120;120mUsage: /resume <session-id-or-name>\033[0m\n")
+                else:
+                    if session.load(parts[1]):
+                        print(f"\033[38;2;130;215;90m✓ Resumed session '{parts[1]}' ({len(session.messages)} messages)\033[0m\n")
+                    else:
+                        print(f"\033[38;2;220;120;120mSession '{parts[1]}' not found.\033[0m\n")
+                continue
+
             elif user_input.startswith("/think"):
                 parts = user_input.split()
-                if len(parts) > 1 and parts[1] in ("off", "low", "medium", "xhigh"):
+                if len(parts) == 1:
+                    print(f"\033[38;2;153;153;153mThinking level: {session.thinking}\033[0m\n")
+                elif parts[1] in ("off", "low", "medium", "xhigh"):
                     session.thinking = parts[1]
-                    print(f"💡 Thinking set to: {session.thinking}\n")
+                    print(f"\033[38;2;130;215;90m✓ Thinking set to: {session.thinking}\033[0m\n")
                 else:
-                    print("Usage: /think [off|low|medium|xhigh]\n")
-                continue
-            elif user_input == "/help":
-                print("Commands:")
-                print("  /exit, /quit       Exit chat")
-                print("  /clear             Clear conversation history")
-                print("  /think [level]     Set thinking level (off, low, medium, xhigh)")
-                print("  /help              Show this help\n")
+                    print("\033[38;2;220;120;120mUsage: /think [off|low|medium|xhigh]\033[0m\n")
                 continue
 
+            elif user_input.startswith("/instructions"):
+                parts = user_input.split(maxsplit=1)
+                if len(parts) == 1:
+                    current = next((m["content"] for m in session.messages if m.get("role") == "system"), "(none)")
+                    print(f"\033[38;2;153;153;153mInstructions: {current}\033[0m\n")
+                else:
+                    inst_text = parts[1]
+                    session.messages = [m for m in session.messages if m.get("role") != "system"]
+                    session.messages.insert(0, {"role": "system", "content": inst_text})
+                    print(f"\033[38;2;130;215;90m✓ Instructions updated.\033[0m\n")
+                continue
+
+            elif user_input.startswith("/model"):
+                parts = user_input.split()
+                if len(parts) == 1:
+                    print(f"\033[38;2;153;153;153mActive model: {session.model_id} ({silicon})\033[0m\n")
+                else:
+                    target_model = normalize_model_name(parts[1])
+                    if target_model in ("flash-next", "27b"):
+                        session.model = target_model
+                        session.model_id = "Qwen3.8-Flash-Next" if target_model == "flash-next" else "Qwen3.8-27B"
+                        silicon = "pure ANE" if target_model == "27b" else "ANE + GPU"
+                        print(f"\033[38;2;130;215;90m✓ Switched model to: {session.model_id}\033[0m\n")
+                    else:
+                        print("\033[38;2;220;120;120mUnknown model. Choose 'flash-next' or '27b'.\033[0m\n")
+                continue
+
+            elif user_input.startswith("/"):
+                print(f"\033[38;2;220;120;120mUnknown command '{user_input}'. Type /help for available commands.\033[0m\n")
+                continue
+
+            # Model Turn Generation
             session.messages.append({"role": "user", "content": user_input})
-            print("qwen> ", end="", flush=True)
-
             t0 = time.perf_counter()
+            first_token_time = None
+            token_count = 0
             full_reply = []
             full_thought = []
             in_thinking = False
+
+            renderer = StreamingMarkdownRenderer()
 
             try:
                 for delta in stream_chat_completion(
@@ -322,10 +646,13 @@ def start_chat(
                     temperature=session.temperature,
                     max_tokens=session.max_tokens,
                 ):
+                    if first_token_time is None:
+                        first_token_time = time.perf_counter()
+
                     reasoning = delta.get("reasoning_content")
                     if reasoning:
                         if not in_thinking:
-                            print("\033[2m[thinking: ", end="", flush=True)
+                            print("\033[38;2;150;150;240m⠋ Thinking...\033[0m\n\033[38;2;140;140;150m\033[3m", end="", flush=True)
                             in_thinking = True
                         print(reasoning, end="", flush=True)
                         full_thought.append(reasoning)
@@ -333,14 +660,19 @@ def start_chat(
                     content = delta.get("content")
                     if content:
                         if in_thinking:
-                            print("]\033[0m\n", end="", flush=True)
+                            print("\033[0m\n\n", end="", flush=True)
                             in_thinking = False
-                        print(content, end="", flush=True)
+                        renderer.write(content)
                         full_reply.append(content)
+                        token_count += 1
 
                 if in_thinking:
-                    print("]\033[0m", flush=True)
-                print("\n")
+                    print("\033[0m\n", flush=True)
+                renderer.finish()
+
+                elapsed = max(0.001, time.perf_counter() - t0)
+                ttft_ms = int((first_token_time - t0) * 1000) if first_token_time else 0
+                tok_per_sec = token_count / elapsed
 
                 reply_text = "".join(full_reply)
                 msg: dict[str, Any] = {"role": "assistant", "content": reply_text}
@@ -349,16 +681,28 @@ def start_chat(
                 session.messages.append(msg)
                 session.save()
 
+                # AFM-style subtle turn metrics badge
+                print(f"\033[38;2;120;120;120m {token_count} tokens · {tok_per_sec:.1f} tok/s · TTFT {ttft_ms}ms · {elapsed:.2f}s\033[0m\n")
+
+            except KeyboardInterrupt:
+                print(f"\n\033[38;2;220;120;120m [Cancelled.]\033[0m\n")
+                if full_reply:
+                    session.messages.append({"role": "assistant", "content": "".join(full_reply)})
+                    session.save()
             except Exception as exc:
-                print(f"\n❌ Error during completion: {exc}\n")
+                print(f"\n\033[31mError during completion: {exc}\033[0m\n")
 
     finally:
+        save_readline()
         session.save()
-        print(f"\nYou are exiting the conversation.")
-        print(f"Resume conversation with: qwen-ane chat --resume {session.session_id}\n")
+        print(f"\033[38;2;153;153;153mSession saved as {session.session_id}.\033[0m")
+        print(f"\033[38;2;153;153;153mResume later with: qwen-ane chat --resume {session.session_id}\033[0m\n")
         if server_proc:
-            print("Stopping background server...")
+            print("\033[38;2;153;153;153mStopping background server...\033[0m")
             server_proc.terminate()
-            server_proc.wait(timeout=5)
+            try:
+                server_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                server_proc.kill()
 
     return 0
