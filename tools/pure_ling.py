@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Standalone, GPU-free Ling-3.0-tiny (BailingMoeV3) inference on the ANE.
 
-Like ``pure_ane.py`` this module imports no MLX, oMLX, PyTorch, Core ML or
+Like ``pure_ane.py`` this module imports no MLX, PyTorch, Core ML or
 Transformers; it reuses that module's checkpoint reader, MIL helpers and driver
 boundary, and adds the BailingMoeV3 architecture on top.  Importing
 ``pure_ane`` is safe: its ``main()`` is guarded.

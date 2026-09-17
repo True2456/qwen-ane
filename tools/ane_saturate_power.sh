@@ -4,10 +4,8 @@
 #   sudo tools/ane_saturate_power.sh
 #
 set -u
-REPO="/Users/true/Desktop/LLM - Reap"
-O=/Applications/oMLX.app/Contents/Resources
-PY="$O/Python/cpython-3.11/bin/python3.11"
-export PYTHONPATH="$O/Python/framework-mlx-base/lib/python3.11/site-packages:$O:$HOME/AppleLLM/q38_native_engine"
+REPO=${0:A:h:h}
+PY=${PYTHON:-python3}
 [[ $EUID -ne 0 ]] && { echo "run with sudo"; exit 1; }
 OUT=$(mktemp -d); trap 'rm -rf "$OUT"' EXIT
 

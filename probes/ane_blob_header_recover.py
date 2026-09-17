@@ -104,7 +104,7 @@ MARK_INT8 = 0x08
 #     this field and breaks exactly that node -- do not write a marker.
 #
 # The chunk version field at byte 4 is NOT load bearing (variant m passes with
-# it zeroed); it is written anyway to match what oMLX emits.
+# it zeroed); it is written anyway to match what the ANE runtime expects.
 # ---------------------------------------------------------------------------
 
 def pack_weight_bin(payloads):

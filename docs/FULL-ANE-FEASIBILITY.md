@@ -3,7 +3,7 @@
 This document answers a narrower question than the existing hybrid benchmarks:
 **can Qwen3.8-27B run without using the GPU for model arithmetic?** The answer
 is now **yes at the execution-stack level**, not just as isolated arithmetic
-probes. `tools/pure_ane.py` loads the checkpoint without MLX/oMLX/PyTorch/Core
+probes. `tools/pure_ane.py` loads the checkpoint without MLX/PyTorch/Core
 ML, bakes all 64 layers, executes full attention and GDN, and runs the final
 head through direct private-ANE requests. Persistent GDN state has no
 per-token MLX/GPU round trip; the private compiler still prevents a literally

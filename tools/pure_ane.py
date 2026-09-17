@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Standalone, GPU-free Qwen3.8 inference through AppleNeuralEngine.framework.
 
-This module intentionally does not import MLX, oMLX, PyTorch, Core ML, or
+This module intentionally does not import MLX, PyTorch, Core ML, or
 Transformers.  The checkpoint reader memory-maps safetensors directly; the
 tokenizer uses the small Rust ``tokenizers`` package; model arithmetic is
 submitted to the ANE through the project's private-framework driver.

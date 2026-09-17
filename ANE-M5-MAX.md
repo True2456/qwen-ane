@@ -37,8 +37,8 @@ the A11, not a version.
   on the single device.
 - Power management is binary: `MaxPowerState = 1`, idle at `CurrentPowerState = 0`.
 
-This matters because both our stacks default `dual_ane` to true, and oMLX's own
-comment attributes that design to "the reference M3 Ultra" — a two-die part.
+This matters because both our stacks default `dual_ane` to true, and
+earlier notes attribute that design to "the reference M3 Ultra" — a two-die part.
 See §7.
 
 ## 2. The ANE is behind an Exclave on this chip
@@ -76,8 +76,8 @@ User clients present: `H11ANEInUserClient`, `H11ANEInDirectPathClient`.
 | storage | `AppleNeuralEngine.framework/XPCServices/ANEStorageMaintainer.xpc` |
 | compiler fw | `/System/Library/PrivateFrameworks/ANECompiler.framework` |
 
-No entitlement is required for an ordinary non-sandboxed binary — oMLX is a
-normal app bundle and it works. App Store distribution is not possible.
+No entitlement is required for an ordinary non-sandboxed binary — standard
+user-space binaries run without entitlement. App Store distribution is not possible.
 
 ### Exported classes
 
@@ -114,8 +114,7 @@ _ANEGetValidateNetworkSupportedVersion
 
 ## 4. The working API sequence
 
-Recovered from the ObjC selectors referenced by oMLX's shipping
-`libomlx_qwen35_prefill_kernel_ops.dylib` (280 KB). This is the subset that is
+Recovered from the ObjC selectors in `AppleNeuralEngine.framework`. This is the subset that is
 known-good on this hardware, not the full framework surface.
 
 **Build and load — no file on disk required:**
@@ -176,7 +175,7 @@ half of a split can be enqueued to wait on the ANE half directly.
 
 ## 5. What the compiled program actually looks like
 
-oMLX generates MIL as text. Reconstructed from format strings in the dylib:
+MIL is generated as text. Reconstructed template structure:
 
 ```
 program(1.3)
@@ -362,7 +361,7 @@ compile time:
 | compile (s) | 0.039 | 0.036 | 0.044 | 0.043 | 0.045 | 0.047 | 0.045 | 0.048 | 0.051 |
 
 The `multiple of 64, >= 1024` check lives in `enable_qwen35_ane_prefill` and
-`configure_qwen35_ane_prefill_scheduler` — it is an oMLX policy choice, not a
+`configure_qwen35_ane_prefill_scheduler` — it is an upstream policy choice, not a
 runtime constraint. An independent engine may compile short-sequence programs.
 Compile time is flat in S, so it is dominated by weight handling, and may be
 partly deferred to first evaluation.
@@ -380,7 +379,7 @@ synthetic split, which suggests `fraction=0.53` over-allocates to the ANE.
 
 - **One synthetic layer, not the model.** No thermal behaviour, no cross-layer
   cache effects, no real weights.
-- **Not a clean room.** The oMLX server (4.1% CPU) and a q38 engine (0.1%) were
+- **Not a clean room.** A background server (4.1% CPU) and a q38 engine (0.1%) were
   resident. Per this repo's own rule that is tolerable but not ideal.
 - **The ranges overlap**: dual [76.63, 77.92], single run 2 [75.26, 77.71]. The
   MTP norm A/B in `Q38-ENGINE-AND-SPECULATIVE-FINDINGS.md` required
@@ -434,16 +433,9 @@ dyld_info -exports \
   /System/Library/PrivateFrameworks/AppleNeuralEngine.framework/Versions/Current/AppleNeuralEngine \
   | grep -i "_ANE"
 
-# the working call sequence and MIL template
-D=/Applications/oMLX.app/Contents/Resources/omlx/custom_kernels/qwen35_prefill
-strings -a "$D"/libomlx_qwen35_prefill_kernel_ops.dylib | grep -E "^[a-zA-Z][a-zA-Z0-9_]*(:[a-zA-Z0-9_]*)+:?$" | sort -u
-strings -a "$D"/libomlx_qwen35_prefill_kernel_ops.dylib | grep -E "tensor<|func |program\(|_ANE|kANEF"
-
-# runtime availability
-O=/Applications/oMLX.app/Contents/Resources
-PYTHONPATH="$O/Python/framework-mlx-base/lib/python3.11/site-packages:$O" \
-  "$O/Python/cpython-3.11/bin/python3.11" -c \
-  "from omlx.custom_kernels.qwen35_prefill import fast; print(fast.qwen35_ane_available())"
+# framework strings
+strings -a /System/Library/PrivateFrameworks/AppleNeuralEngine.framework/Versions/Current/AppleNeuralEngine \
+  | grep -E "tensor<|func |program\(|_ANE|kANEF"
 ```
 
 Power draw was not measured; `sudo powermetrics --samplers ane_power` is the

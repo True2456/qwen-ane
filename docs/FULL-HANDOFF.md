@@ -153,11 +153,9 @@ bookkeeping detail, not a design constraint. A full 8-expert layer projects to
   raw = np.frombuffer(mm, np.uint16, count, offset).astype(np.uint32)
   w = (raw << 16).view(np.float32).astype(np.float16)   # bf16 == top 16 bits of fp32
   ```
-- Run probes with the **oMLX bundled interpreter**, not system python:
+- Run probes with Python:
   ```
-  O=/Applications/oMLX.app/Contents/Resources
-  PYTHONPATH="$O/Python/framework-mlx-base/lib/python3.11/site-packages:$O:$HOME/AppleLLM/q38_native_engine" \
-    "$O/Python/cpython-3.11/bin/python3.11" -P artifacts/ane_probes/<probe>.py
+  python3 -P artifacts/ane_probes/<probe>.py
   ```
   `-P` matters: having the script's own directory on `sys.path` triggered
   `PermissionError` from the import path hooks under macOS file-access restrictions.
@@ -190,7 +188,7 @@ the checkpoint and nothing can be committed.
 
 ## 9. Uncommitted / loose ends
 
-- `/tmp/replay_stream.py` and `/tmp/multiturn.py` — the oMLX↔q38 parity harness that found
+- `/tmp/replay_stream.py` and `/tmp/multiturn.py` — the reference parity harness that found
   the CoT bug. **Still orphaned in /tmp**, will be lost on reboot. Move into the repo.
 - `_system_boundary` at `q38_patches.py:1267` is dead code.
 - The TCC revocation in §7 resolved on its own; everything is committed now.
@@ -376,9 +374,7 @@ win on joules per token, and nothing here has measured that for a real MoE layer
 `ane_moe_energy.py` does it (needs sudo for powermetrics):
 
 ```
-O=/Applications/oMLX.app/Contents/Resources
-sudo env PYTHONPATH="$O/Python/framework-mlx-base/lib/python3.11/site-packages:$O:$HOME/AppleLLM/q38_native_engine" \
-    "$O/Python/cpython-3.11/bin/python3.11" -P artifacts/ane_probes/ane_moe_energy.py
+sudo python3 -P artifacts/ane_probes/ane_moe_energy.py
 ```
 
 **Measured — see §12. The answer is no.**
@@ -565,8 +561,8 @@ step, which lands at 1.2–1.6x slower — not the parity point.
 
 ## 14.2 Where this lands
 
-The measurements point at **ANE for prefill, GPU for decode** — which is exactly
-the split oMLX already ships as its ANE prefill option. The MoE work does not
+The measurements point at **ANE for prefill, GPU for decode** — which is a
+natural split for this workload. The MoE work does not
 displace the GPU for interactive generation; it makes the prefill half cheaper on
 battery, and becomes genuinely attractive only under batching.
 
@@ -629,8 +625,8 @@ dispatches — a workload that does not exist. It is void.
 - **MoE on ANE is dead.** Not for want of tuning: the ANE has no gather, and MoE
   is a gather. One dispatch per active expert, and nearly all experts activate.
 - **Dense models on ANE are fine** — this whole problem is MoE-specific. A dense
-  layer is one dispatch regardless of token count, which is why oMLX's existing
-  ANE prefill (a dense drafter) works well and should be kept.
+  layer is one dispatch regardless of token count, which is why a dense
+  ANE prefill (or a dense drafter) works well and should be kept.
 - The **dispatch optimisations are real and reusable**: caching one `_ANERequest`
   per procedure (11%), writing inputs once per program, and issuing work across
   4 threads (23%). Any future ANE work should start with these.
@@ -856,7 +852,7 @@ routed experts. That remains the most promising direction.
 ## 18.3 Practical answer for the 27B
 
 - **Prefill on ANE: yes.** 16.4 TFLOP/s at int8/S=64, compute-bound, saturating.
-  This is precisely what oMLX's existing ANE prefill option does, and the
+  This is an effective ANE prefill strategy, and the
   measurements support keeping it — ideally chunked at S~64, not 256.
 - **Decode on ANE: no.** 4.8 tok/s, bandwidth-bound.
 - So for this model the split stays **ANE prefill + GPU decode**, and the 27B is
@@ -1124,7 +1120,7 @@ experts, int8, real weights, verified against fp32.
 What a full engine still needs:
 - **Attention stays on the GPU.** `linear_attn` (Mamba-style) does not map to
   1x1 conv; this was never solved.
-- Wiring the layer into oMLX's forward pass, with the router driving staging.
+- Wiring the layer into the runtime forward pass, with the router driving staging.
 - The S>=32 floor means decode must be padded or batched (§14).
 - Multi-prompt validation: §21's locality numbers come from a single 64-token
   generation.

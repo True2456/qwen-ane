@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-"""Standalone OpenAI-compatible server for A/B testing the ANE, no oMLX patching.
+"""Standalone OpenAI-compatible server for A/B testing the ANE.
 
     ane_serve.py --model <path> --ane-layers 4          # serve on :1239
     ane_serve.py --model <path> --ane-layers 0          # GPU baseline
     ane_serve.py --model <path> --bench --ane-layers 4  # A/B, no server
 
-Why standalone: patching oMLX means bundle edits that App Management blocks,
-that oMLX updates wipe, and that make it hard to tell whether a change came from
-the ANE or from oMLX's own MoE patches. This owns the whole path.
+Why standalone: provides a fully reproducible environment that owns the whole path.
 
 The four things that broke the first attempt, fixed here:
   1. SSE declared HTTP/1.1 with neither Content-Length nor chunking -> clients

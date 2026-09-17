@@ -1,11 +1,8 @@
 #!/bin/zsh
-# Launcher for the ANE tools. Hybrid commands use oMLX's isolated interpreter.
-# The pure-* commands deliberately use system Python with PYTHONPATH removed;
-# they do not import or link MLX/oMLX, PyTorch, Core ML, or Metal compute.
+# Launcher for the ANE tools.
+# The pure-* commands deliberately use Python with PYTHONPATH removed;
+# they do not import or link MLX, PyTorch, Core ML, or Metal compute.
 #
-#   tools/ane serve  --dense-layers 64 --ane-lm-head --dense-bits 4
-#   tools/ane spec   --ane-layers 64 --ane-lm-head --draft 2 --tokens 48
-#   tools/ane bench  --dense-layers 64 --ane-lm-head --dense-bits 4
 #   tools/ane pure-inspect
 #   tools/ane pure-loader-smoke --text 'hello'
 #   tools/ane pure-projection-smoke --bits 4
@@ -24,19 +21,17 @@
 #
 set -u
 REPO=${0:A:h:h}
-O=/Applications/oMLX.app/Contents/Resources
-PY="$O/Python/cpython-3.11/bin/python3.11"
+PY=${PYTHON:-python3}
 MODEL=${Q38_MODEL:-/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B}
-export PYTHONPATH="$O/Python/framework-mlx-base/lib/python3.11/site-packages:$O:${Q38_ANE_ENGINE:-$REPO}"
-require_omlx() {
-  [[ -x "$PY" ]] || { echo "oMLX python not found at $PY"; exit 1; }
+require_py() {
+  command -v "$PY" >/dev/null 2>&1 || { echo "Python not found: $PY"; exit 1; }
 }
 
 cmd=${1:-serve}; shift 2>/dev/null || true
 case "$cmd" in
-  serve) require_omlx; exec "$PY" -u -P "$REPO/tools/ane_serve.py" --model "$MODEL" "$@" ;;
-  bench) require_omlx; exec "$PY" -u -P "$REPO/tools/ane_serve.py" --model "$MODEL" --bench "$@" ;;
-  spec)  require_omlx; exec "$PY" -u -P "$REPO/tools/mtp_specdec.py" --model "$MODEL" "$@" ;;
+  serve) require_py; exec "$PY" -u -P "$REPO/tools/ane_serve.py" --model "$MODEL" "$@" ;;
+  bench) require_py; exec "$PY" -u -P "$REPO/tools/ane_serve.py" --model "$MODEL" --bench "$@" ;;
+  spec)  require_py; exec "$PY" -u -P "$REPO/tools/mtp_specdec.py" --model "$MODEL" "$@" ;;
   ling-inspect) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ling.py" inspect "$@" ;;
   ling-reference-generate) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ling.py" reference-generate "$@" ;;
   pure-inspect) exec env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P "$REPO/tools/pure_ane.py" --model "$MODEL" inspect "$@" ;;

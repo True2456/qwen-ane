@@ -19,7 +19,7 @@ the full BLOBFILE path string as the key, and the value is a dict with
 @model_path/weights/filename.bin, but the framework resolves them through
 the weights dict, not the filesystem.
 
-Standalone compile needs the same on-disk layout oMLX writes *before*
+Standalone compile needs the same on-disk layout the ANE compiler expects *before*
 compileWithQoS: hashed temp dir with model.mil + weights/*.bin, nil
 optionsPlist, and MIL 1x1-conv programs. saveModelFiles is the espresso
 path and must not be used for MIL. Blob headers are 128 bytes with
@@ -146,7 +146,7 @@ def _nsnumber_int(val: int) -> ctypes.c_void_p:
 
 
 def _nsnumber_uint(val: int) -> ctypes.c_void_p:
-    """Create NSNumber; small ints match oMLX's NSConstantIntegerNumber."""
+    """Create NSNumber; small ints match standard NSConstantIntegerNumber."""
     return _nsnumber_int(val)
 
 
@@ -235,7 +235,7 @@ def _iosurf_key(name: str) -> ctypes.c_void_p:
 
 
 def _iosurface_alloc_size(n_fp16: int) -> int:
-    """oMLX: max(64KiB, round_up_64KiB(n_fp16 * 2))."""
+    """ANE buffer requirement: max(64KiB, round_up_64KiB(n_fp16 * 2))."""
     n = (n_fp16 * 2 + 0xFFFF) & ~0xFFFF
     return max(n, 0x10000)
 
@@ -373,7 +373,7 @@ def _indexset_to_nsarray(idxset) -> ctypes.c_void_p:
 
 
 def _make_blob(data: bytes) -> bytes:
-    """Wrap raw weight data in the milinternal blob layout oMLX writes.
+    """Wrap raw weight data in the milinternal blob layout expected by the ANE.
 
     Layout from ``AneLinearModel::Impl`` (calloc payload+0x80) and a live
     ``qwen35_ane_compile_linear`` capture:
@@ -1146,7 +1146,7 @@ class AneEngine:
             weight: float32 weight matrix [output_dim, input_dim]
             seq_len: fixed sequence length
             instance_hint: ANE instance hint (1-4, or 0 for unpinned)
-            quantized: if True, re-quantize to int8 per-channel (matching oMLX)
+            quantized: if True, re-quantize to int8 per-channel
                        if False, convert to fp16 directly
             keep_weight_dequant: if False, drop the fp32 reference copy after
                 compile (hybrid banks with dozens of programs would otherwise
@@ -1213,7 +1213,7 @@ class AneEngine:
             })
 
         mil_data = _nsdata(mil_text.encode("utf-8"))
-        # oMLX passes nil, not empty NSData. Empty plist trips InvalidCompilationParam.
+        # Pass nil, not empty NSData. Empty plist trips InvalidCompilationParam.
         opts_data = None
 
         # Create descriptor
@@ -1244,12 +1244,12 @@ class AneEngine:
         local = _desc(_msg(model, "localModelPath"))
         logger.info("ident=%s local=%s", ident[:120], local[:200])
 
-        # oMLX writes model.mil + weights/*.bin into the hashed temp dir
+        # Write model.mil + weights/*.bin into the hashed temp dir
         # *before* compileWithQoS. saveModelFiles is the espresso path
         # (net.plist + data) and produces InvalidMILProgram for MIL models.
         if local and local != "(nil)":
-            # oMLX deletes the hashed dir first so espresso leftovers cannot
-            # shadow model.mil, then writes model.mil + weights/*.bin.
+            # Delete the hashed dir first so espresso leftovers cannot
+            # shadow model.mil, then write model.mil + weights/*.bin.
             shutil.rmtree(local, ignore_errors=True)
             wdir = os.path.join(local, "weights")
             os.makedirs(wdir, exist_ok=True)

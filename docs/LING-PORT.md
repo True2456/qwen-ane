@@ -559,8 +559,8 @@ start, and measure the batched path rather than the single-token one.
 
 ## Clean benchmark, and a correction that matters
 
-Every MLX comparison earlier in this document was measured while an
-`omlx-server` held 25 GB at 30% CPU. Re-measured with that process idle:
+Every MLX comparison earlier in this document was measured while a
+background server held 25 GB at 30% CPU. Re-measured with that process idle:
 
 | | ANE port | MLX (bf16, GPU) | ratio |
 |---|---:|---:|---:|
@@ -688,7 +688,7 @@ work to the ANE; leave **batched elementwise** work in numpy.
 
 Decode measured 8.0 tok/s at one point and 5.9 later for identical code, and
 two features were wrongly suspected before isolation cleared them. The cause was
-an `omlx-server` holding 23.6 GB resident. With it idle, decode is stable at
+a background inference server holding 23.6 GB resident. With it idle, decode is stable at
 5.55-5.94 (spread 1.07x) and prefill at 93.5-98.3.
 
 Decode is the more sensitive of the two because it is dispatch- and

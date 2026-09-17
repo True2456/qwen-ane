@@ -4,8 +4,8 @@
 
 * Apple Silicon with an ANE. Everything here was measured on an **M5 Max**;
   program limits and throughput will differ on other parts.
-* **oMLX.app** installed at `/Applications/oMLX.app` for the hybrid server. It
-  is not imported or required by the framework-free `pure-*` backend.
+* Python 3.10+ with `numpy` and `safetensors`. The framework-free `pure-*` backend
+  runs with zero external dependencies beyond numpy and tokenizers.
 * Nothing else. The ANE driver — MIL compilation, IOSurface allocation and the
   `_ANEInMemoryModel` plumbing — is vendored at `runtime/q38_ane_engine.py` and
   needs only the standard library and numpy. Point `Q38_ANE_ENGINE` at another
@@ -38,13 +38,12 @@ tools/ane pure-bench --url http://127.0.0.1:1240 --tokens 32 --runs 3
 ```
 
 `tools/ane` is a launcher, and you should use it rather than running the Python
-directly. Hybrid commands select oMLX's isolated interpreter. `pure-*` commands
-select `/opt/homebrew/bin/python3`, remove `PYTHONPATH`, and enforce a runtime
+directly. `pure-*` commands select Python, remove `PYTHONPATH`, and enforce a runtime
 guard against MLX, PyTorch, and Core ML imports.
 
-> **Do not run `tools/ane_serve.py` with the system Python.** It aborts with
+> **Do not run `tools/ane_serve.py` with the system Python without isolation.** It aborts with
 > `OMP: Error #15: Initializing libomp.dylib, but found libomp.dylib already
-> initialized.` The launcher runs it under oMLX's interpreter with an isolated
+> initialized.` The launcher runs it with an isolated
 > import path (`-P`), which is what keeps a second `libomp` out of the process.
 
 ## Verify the install
@@ -52,12 +51,10 @@ guard against MLX, PyTorch, and Core ML imports.
 Run the probes in dependency order; each is standalone and prints pass/fail.
 
 ```bash
-O=/Applications/oMLX.app/Contents/Resources
-export PYTHONPATH="$O/Python/framework-mlx-base/lib/python3.11/site-packages:$O:$PWD"
-PY="$O/Python/cpython-3.11/bin/python3.11"
+PY=${PYTHON:-python3}
 
 $PY -u -P probes/ane_rmsnorm.py        # RMSNorm formulations
-env -u PYTHONPATH /opt/homebrew/bin/python3 -u -P probes/ane_rmsnorm_lanes.py # three independent stable lanes
+env -u PYTHONPATH python3 -u -P probes/ane_rmsnorm_lanes.py # three independent stable lanes
 $PY -u -P probes/ane_two_outputs.py    # two output tensors per program
 $PY -u -P probes/ane_gdn_mech.py       # grouped-conv reduction / broadcast
 $PY -u -P probes/ane_gdn_step.py       # a full gated-delta step vs numpy

@@ -5,11 +5,9 @@
 #   sudo tools/ane_power_ab.sh
 #
 set -u
-REPO="/Users/true/Desktop/LLM - Reap"
-O=/Applications/oMLX.app/Contents/Resources
-PY="$O/Python/cpython-3.11/bin/python3.11"
-M=/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B
-export PYTHONPATH="$O/Python/framework-mlx-base/lib/python3.11/site-packages:$O:$HOME/AppleLLM/q38_native_engine"
+REPO=${0:A:h:h}
+PY=${PYTHON:-python3}
+M=${Q38_MODEL:-/Users/true/.lmstudio/models/Qwen/Qwen3.8-27B}
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 
