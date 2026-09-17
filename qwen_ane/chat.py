@@ -88,7 +88,9 @@ def time_ago(ts: float) -> str:
 
 
 def get_term_width() -> int:
-    return min(96, max(50, shutil.get_terminal_size().columns - 2))
+    """Returns dynamic terminal width with a 2-char margin, minimum 20 columns."""
+    cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+    return max(20, cols - 2)
 
 
 class ChatSession:
@@ -157,11 +159,17 @@ class StreamingMarkdownRenderer:
     """Streams model output live while styling markdown headings, bold, inline code, and code blocks."""
 
     def __init__(self, width: int | None = None):
-        self.width = width or get_term_width()
+        self._custom_width = width
         self.col = 0
         self.in_code = False
         self.fence_buf = ""
         self.code_lang = ""
+
+    @property
+    def width(self) -> int:
+        if self._custom_width is not None:
+            return self._custom_width
+        return get_term_width()
 
     def write(self, chunk: str):
         for ch in chunk:
@@ -180,13 +188,13 @@ class StreamingMarkdownRenderer:
                     self.fence_buf = ""
                     if not self.in_code:
                         self.in_code = True
-                        dash = "─" * (self.width - 2)
+                        dash = "─" * max(2, self.width - 2)
                         border = f"\n\033[38;2;120;120;120m╭{dash}╮\033[0m\n\033[38;2;120;120;120m│\033[0m \033[38;2;180;225;255m"
                         sys.stdout.write(border)
                         self.col = 2
                     else:
                         self.in_code = False
-                        dash = "─" * (self.width - 2)
+                        dash = "─" * max(2, self.width - 2)
                         border = f"\033[0m\n\033[38;2;120;120;120m╰{dash}╯\033[0m\n"
                         sys.stdout.write(border)
                         self.col = 0
@@ -218,7 +226,7 @@ class StreamingMarkdownRenderer:
             self.fence_buf = ""
         if self.in_code:
             self.in_code = False
-            dash = "─" * (self.width - 2)
+            dash = "─" * max(2, self.width - 2)
             sys.stdout.write(f"\033[0m\n\033[38;2;120;120;120m╰{dash}╯\033[0m\n")
         sys.stdout.write("\n")
         sys.stdout.flush()
@@ -285,8 +293,8 @@ def print_banner(model_name: str, ctx_human: str, silicon: str):
 def print_help():
     """Prints AFM-style bordered help card."""
     width = get_term_width()
-    dash = "─" * (width - 2)
-    header_dash = "─" * max(2, width - 14)
+    dash = "─" * max(2, width - 2)
+    header_dash = "─" * max(2, width - 13)
     card = f"""\033[38;2;136;136;136m╭─ Commands {header_dash}╮\033[0m
 \033[38;2;136;136;136m│\033[0m  \033[1m/exit, /quit\033[0m          Exit the chat session
 \033[38;2;136;136;136m│\033[0m  \033[1m/clear\033[0m                Clear conversation history and screen
@@ -306,13 +314,13 @@ def print_sessions():
     sdir = get_sessions_dir()
     files = sorted(sdir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
     width = get_term_width()
-    dash = "─" * (width - 2)
+    dash = "─" * max(2, width - 2)
 
     if not files:
         print(f"\033[38;2;153;153;153mNo saved sessions found in {sdir}.\033[0m\n")
         return
 
-    header_dash = "─" * max(2, width - 14)
+    header_dash = "─" * max(2, width - 13)
     print(f"\033[38;2;136;136;136m╭─ Sessions {header_dash}╮\033[0m")
     for f in files[:10]:
         try:
@@ -332,8 +340,8 @@ def print_sessions():
 def print_info(session: ChatSession, ctx: int, host: str, port: int, lru: bool):
     """Prints runtime hardware and configuration info."""
     width = get_term_width()
-    dash = "─" * (width - 2)
-    header_dash = "─" * max(2, width - 10)
+    dash = "─" * max(2, width - 2)
+    header_dash = "─" * max(2, width - 9)
     silicon = (
         "Apple Neural Engine (100% pure on-chip)"
         if normalize_model_name(session.model) == "27b"
@@ -366,6 +374,20 @@ def setup_readline():
         hist_file = get_qwen_ane_dir() / "history"
         if hist_file.exists():
             readline.read_history_file(str(hist_file))
+    except Exception:
+        pass
+
+
+def setup_sigwinch():
+    """Handles terminal window resize events so readline and buffers adapt."""
+    def _on_winch(signum, frame):
+        if readline is not None:
+            try:
+                readline.redisplay()
+            except Exception:
+                pass
+    try:
+        signal.signal(signal.SIGWINCH, _on_winch)
     except Exception:
         pass
 
@@ -508,6 +530,7 @@ def start_chat(
             print(f"\033[38;2;220;120;120mSession '{resume_id}' not found. Starting fresh session.\033[0m")
 
     setup_readline()
+    setup_sigwinch()
 
     ctx_human = format_tokens(ctx)
     silicon = "pure ANE" if canon == "27b" else "ANE + GPU"
@@ -517,22 +540,22 @@ def start_chat(
 
     try:
         while True:
-            width = get_term_width()
-            dash = "─" * (width - 2)
-
-            # AFM-style rounded input box
-            top_border = f"\033[38;2;136;136;136m╭{dash}╮\033[0m"
+            cur_width = get_term_width()
+            top_border = f"\033[38;2;136;136;136m╭{'─' * max(2, cur_width - 2)}╮\033[0m"
             prompt_marker = f"\033[38;2;136;136;136m│\033[0m \033[1;38;2;130;215;90m›\033[0m "
-            bottom_border = f"\033[38;2;136;136;136m╰{dash}╯\033[0m"
             status_tag = f"\033[38;2;153;153;153m {session.model_id}\033[0m"
 
             try:
                 print(top_border)
                 raw_input = input(prompt_marker)
+                bot_width = get_term_width()
+                bottom_border = f"\033[38;2;136;136;136m╰{'─' * max(2, bot_width - 2)}╯\033[0m"
                 print(bottom_border)
                 print(status_tag)
                 print()
             except KeyboardInterrupt:
+                bot_width = get_term_width()
+                bottom_border = f"\033[38;2;136;136;136m╰{'─' * max(2, bot_width - 2)}╯\033[0m"
                 print(f"\n{bottom_border}")
                 now = time.time()
                 if now - last_sigint_time < 2.5:
@@ -542,6 +565,9 @@ def start_chat(
                 print("\033[38;2;153;153;153m(Press Ctrl+C again or /exit to quit)\033[0m\n")
                 continue
             except EOFError:
+                bot_width = get_term_width()
+                bottom_border = f"\033[38;2;136;136;136m╰{'─' * max(2, bot_width - 2)}╯\033[0m"
+                print(f"\n{bottom_border}")
                 print("\n\033[38;2;153;153;153mExiting.\033[0m")
                 break
 
