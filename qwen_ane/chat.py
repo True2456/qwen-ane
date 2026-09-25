@@ -682,10 +682,7 @@ def start_chat(
     if port is None:
         port = 1240 if canon == "27b" else cfg.get("default_port", 2457)
     if ctx is None:
-        ctx = 4096 if canon == "27b" else cfg.get("default_ctx", 131072)
-    elif canon == "27b" and ctx > 4096:
-        print(f"\033[38;2;153;153;153mℹ️  Qwen3.8-27B pure ANE engine operates with 4096 token context; setting ctx=4096.\033[0m")
-        ctx = 4096
+        ctx = cfg.get("default_ctx", 131072)
 
     # 1. Start background inference server if not running
     server_proc = None

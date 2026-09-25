@@ -53,7 +53,7 @@ def create_parser() -> argparse.ArgumentParser:
             "-c", "--ctx", "-ctx",
             type=parse_context_size,
             default=None,
-            help="Context window size (e.g. 128k, 64k, 4096. Default: 128k for flash-next, 4096 for 27b)",
+            help="Context window size (e.g. 128k, 64k, 32k, 8192, 4096. Up to 256k)",
         )
         p.add_argument(
             "-p", "--port", "-port",

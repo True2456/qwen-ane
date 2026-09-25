@@ -676,22 +676,47 @@ def main() -> int:
     try:
         if "27b" in models:
             existing_pid = find_pid_on_port(args.port)
+            needed_ctx = max(4096, max(lengths) + tg + 256)
+            server_ctx = None
             if existing_pid:
-                log(f"Found existing 27B server on port {args.port} (pid={existing_pid}). Reusing resident weights...")
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{args.port}/v1/models", timeout=3) as resp:
+                        mdata = json.loads(resp.read().decode())
+                        if mdata.get("data") and "context_length" in mdata["data"][0]:
+                            server_ctx = int(mdata["data"][0]["context_length"])
+                except Exception:
+                    pass
+
+                # If running server is too small for requested prompt lengths, restart with needed_ctx
+                if server_ctx is not None and server_ctx < max(lengths):
+                    log(f"Existing 27B server on port {args.port} has context={server_ctx}, but benchmark requires up to {max(lengths)}. Restarting server with context={needed_ctx}...")
+                    try:
+                        os.kill(existing_pid, signal.SIGTERM)
+                        time.sleep(2)
+                    except Exception:
+                        pass
+                    existing_pid = None
+
+            if existing_pid:
+                log(f"Found existing 27B server on port {args.port} (pid={existing_pid}, context={server_ctx or 'unknown'}). Reusing resident weights...")
                 srv = AttachedServer("27b", existing_pid)
             else:
                 slog = RESULTS / f"{stamp}.27b.serve.log"
-                srv = start_27b(args.port, m27, slog, context=4096)
+                srv = start_27b(args.port, m27, slog, context=needed_ctx)
                 wait_http(f"http://127.0.0.1:{args.port}/health",
                           '"ready":true', timeout=480, server=srv)
+                server_ctx = needed_ctx
+
+            log(f"27b active server context: {server_ctx} tokens")
+
             try:
                 idle = sample_footprint(srv.pid())
                 log(f"27b idle footprint={gb(idle.get('current'))} GB "
                     f"peak={gb(idle.get('peak'))} GB pid={srv.pid()}")
                 tok = m27 / "tokenizer.json"
                 for pp in lengths:
-                    if pp > 4096:
-                        log(f"--- 27b pp {pp} / tg {tg} [SKIPPED: 27B pure ANE tile capacity is 4096 tokens; use flash-next for 4k-32k context scaling]")
+                    if pp > server_ctx:
+                        log(f"--- 27b pp {pp} / tg {tg} [SKIPPED: prompt length {pp} exceeds active server context {server_ctx}. Restart server with: qwen-ane serve --model 27b --ctx {pp}]")
                         continue
                     if not srv.alive():
                         raise RuntimeError("27b server died")

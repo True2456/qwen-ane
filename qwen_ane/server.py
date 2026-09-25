@@ -53,8 +53,7 @@ def run_server(
     if ctx is None:
         ctx = 4096 if canon == "27b" else cfg.get("default_ctx", 131072)
     elif canon == "27b" and ctx > 4096:
-        print(f"ℹ️  Qwen3.8-27B ANE engine supports up to 4096 hardware context; clamping ctx to 4096.")
-        ctx = 4096
+        print(f"ℹ️  Starting Qwen3.8-27B with {ctx} context. Pure ANE prefill is linear and unrolled.")
 
     # 1. Check if server already running
     active = is_server_running(host, port)
