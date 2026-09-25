@@ -17,12 +17,22 @@ import ctypes
 import hashlib
 import io
 import json
+import mmap
 import os
 import re
 import shutil
 import struct
 import sys
 import time
+
+try:
+    import resource
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = min(65536, hard if hard > 0 else 65536)
+    if soft < target:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+except Exception:
+    pass
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator
@@ -101,15 +111,35 @@ class SafeTensorFile:
 
     def __init__(self, path: str | os.PathLike[str]):
         self.path = Path(path)
-        with self.path.open("rb") as f:
-            raw = f.read(8)
-            if len(raw) != 8:
-                raise ValueError(f"truncated safetensors header: {self.path}")
-            header_len = struct.unpack("<Q", raw)[0]
-            header = json.loads(f.read(header_len))
+        self._fh = open(self.path, "rb")
+        raw = self._fh.read(8)
+        if len(raw) != 8:
+            self._fh.close()
+            raise ValueError(f"truncated safetensors header: {self.path}")
+        header_len = struct.unpack("<Q", raw)[0]
+        header = json.loads(self._fh.read(header_len))
         self.data_offset = 8 + header_len
         self.header = {k: v for k, v in header.items() if k != "__metadata__"}
-        self._mmaps: dict[str, np.memmap] = {}
+        self._mm = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
+        self._mmaps: dict[str, np.ndarray] = {}
+
+    def close(self) -> None:
+        self._mmaps.clear()
+        if hasattr(self, "_mm") and self._mm is not None:
+            try:
+                self._mm.close()
+            except Exception:
+                pass
+            self._mm = None
+        if hasattr(self, "_fh") and self._fh is not None:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+            self._fh = None
+
+    def __del__(self) -> None:
+        self.close()
 
     def info(self, name: str) -> TensorInfo:
         meta = self.header[name]
@@ -126,13 +156,13 @@ class SafeTensorFile:
         return TensorInfo(name, self.path, dtype, shape,
                           self.data_offset + a, b - a)
 
-    def mmap(self, name: str) -> np.memmap:
+    def mmap(self, name: str) -> np.ndarray:
         m = self._mmaps.get(name)
         if m is None:
             info = self.info(name)
             dtype = self._DTYPES[info.dtype][0]
-            m = np.memmap(info.path, mode="r", dtype=dtype,
-                          offset=info.offset, shape=info.shape, order="C")
+            count = int(np.prod(info.shape, dtype=np.int64))
+            m = np.frombuffer(self._mm, dtype=dtype, count=count, offset=info.offset).reshape(info.shape)
             self._mmaps[name] = m
         return m
 
@@ -260,6 +290,18 @@ class Checkpoint:
         if filename not in self._files:
             self._files[filename] = SafeTensorFile(self.path / filename)
         return self._files[filename]
+
+    def close(self) -> None:
+        if hasattr(self, "_files"):
+            for sf in self._files.values():
+                try:
+                    sf.close()
+                except Exception:
+                    pass
+            self._files.clear()
+
+    def __del__(self) -> None:
+        self.close()
 
     def info(self, name: str) -> TensorInfo:
         if name in self.weight_map:

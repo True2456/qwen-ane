@@ -34,9 +34,9 @@ def is_server_running(host: str = "127.0.0.1", port: int = 2457, timeout: float 
 
 def run_server(
     model: str = "flash-next",
-    port: int = 2457,
+    port: int | None = None,
     host: str = "127.0.0.1",
-    ctx: int = 131072,
+    ctx: int | None = None,
     lru: bool = True,
     spec: int = 4,
     mtp_draft: int | None = None,
@@ -46,6 +46,15 @@ def run_server(
 ) -> int:
     """Launch the OpenAI-compatible ANE server for the specified model."""
     canon = normalize_model_name(model)
+    cfg = load_config()
+
+    if port is None:
+        port = 1240 if canon == "27b" else cfg.get("default_port", 2457)
+    if ctx is None:
+        ctx = 4096 if canon == "27b" else cfg.get("default_ctx", 131072)
+    elif canon == "27b" and ctx > 4096:
+        print(f"ℹ️  Qwen3.8-27B ANE engine supports up to 4096 hardware context; clamping ctx to 4096.")
+        ctx = 4096
 
     # 1. Check if server already running
     active = is_server_running(host, port)

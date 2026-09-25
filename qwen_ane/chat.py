@@ -405,8 +405,8 @@ def save_readline():
 
 def start_chat(
     model: str = "flash-next",
-    ctx: int = 131072,
-    port: int = 2457,
+    ctx: int | None = None,
+    port: int | None = None,
     host: str = "127.0.0.1",
     lru: bool = True,
     thinking: str = "off",
@@ -420,11 +420,27 @@ def start_chat(
     """Launch the interactive chat REPL with AFM styling."""
     canon = normalize_model_name(model)
     model_id = "Qwen3.8-Flash-Next" if canon == "flash-next" else "Qwen3.8-27B"
+    cfg = load_config()
+
+    if port is None:
+        port = 1240 if canon == "27b" else cfg.get("default_port", 2457)
+    if ctx is None:
+        ctx = 4096 if canon == "27b" else cfg.get("default_ctx", 131072)
+    elif canon == "27b" and ctx > 4096:
+        print(f"\033[38;2;153;153;153mℹ️  Qwen3.8-27B pure ANE engine operates with 4096 token context; setting ctx=4096.\033[0m")
+        ctx = 4096
 
     # 1. Start background inference server if not running
     server_proc = None
     server_log = None
-    if not is_server_running(host, port):
+    active = is_server_running(host, port)
+    if active:
+        running_models = [m.get("id") for m in active.get("data", [])]
+        if running_models and not any(canon in rm.lower() or model_id.lower() in rm.lower() for rm in running_models):
+            print(f"\033[33m⚠️  A server is already running on http://{host}:{port}/v1 serving {running_models}, but you requested '{canon}'.\033[0m")
+            print(f"   Please specify a different port (e.g. --port 1240 or --port 2457) or stop the existing server.")
+            return 1
+    else:
         print(f"\033[38;2;153;153;153mStarting background {canon} engine on port {port}...\033[0m", flush=True)
         resolved_path = ensure_model(canon, custom_path=model_path, hf_repo=hf_repo)
 
@@ -504,6 +520,11 @@ def start_chat(
         for _ in range(120):
             if is_server_running(host, port):
                 break
+            if server_proc.poll() is not None:
+                print(f"\033[31mError: Server process exited unexpectedly with code {server_proc.returncode}. See {log_path} for details.\033[0m")
+                if server_log:
+                    server_log.close()
+                return 1
             time.sleep(1.0)
         else:
             print(f"\033[31mError: Server timed out while starting. See {log_path} for details.\033[0m")
@@ -650,14 +671,15 @@ def start_chat(
             elif user_input.startswith("/model"):
                 parts = user_input.split()
                 if len(parts) == 1:
-                    print(f"\033[38;2;153;153;153mActive model: {session.model_id} ({silicon})\033[0m\n")
+                    print(f"\033[38;2;153;153;153mActive model: {session.model_id} ({silicon}) on port {session.port}\033[0m\n")
                 else:
                     target_model = normalize_model_name(parts[1])
                     if target_model in ("flash-next", "27b"):
                         session.model = target_model
                         session.model_id = "Qwen3.8-Flash-Next" if target_model == "flash-next" else "Qwen3.8-27B"
+                        session.port = 1240 if target_model == "27b" else 2457
                         silicon = "pure ANE" if target_model == "27b" else "ANE + GPU"
-                        print(f"\033[38;2;130;215;90m✓ Switched model to: {session.model_id}\033[0m\n")
+                        print(f"\033[38;2;130;215;90m✓ Switched model to: {session.model_id} (port {session.port})\033[0m\n")
                     else:
                         print("\033[38;2;220;120;120mUnknown model. Choose 'flash-next' or '27b'.\033[0m\n")
                 continue

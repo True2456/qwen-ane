@@ -52,14 +52,14 @@ def create_parser() -> argparse.ArgumentParser:
         p.add_argument(
             "-c", "--ctx", "-ctx",
             type=parse_context_size,
-            default=cfg.get("default_ctx", 131072),
-            help="Context window size (e.g. 128k, 64k, 8192, 4096. Default: 128k)",
+            default=None,
+            help="Context window size (e.g. 128k, 64k, 4096. Default: 128k for flash-next, 4096 for 27b)",
         )
         p.add_argument(
             "-p", "--port", "-port",
             type=int,
-            default=cfg.get("default_port", 2457),
-            help="Port to listen on or connect to (default: 2457)",
+            default=None,
+            help="Port to listen on or connect to (default: 2457 for flash-next, 1240 for 27b)",
         )
         p.add_argument(
             "--host", "-host",

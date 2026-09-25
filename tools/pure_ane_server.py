@@ -20,6 +20,16 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
+
+try:
+    import resource
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = min(65536, hard if hard > 0 else 65536)
+    if soft < target:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+except Exception:
+    pass
+
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from dataclasses import dataclass
