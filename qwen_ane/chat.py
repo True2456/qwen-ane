@@ -431,43 +431,27 @@ class AFMPromptReader:
         hist_idx = len(history_temp)
         saved_draft = ""
 
+        prev_rendered = False
         prev_lines_count = 0
-        prev_lines_below = 0
 
         def get_width() -> int:
             return max(24, shutil.get_terminal_size(fallback=(80, 24)).columns)
 
-        def clear_previous():
-            nonlocal prev_lines_count, prev_lines_below
-            if prev_lines_count > 0:
-                if prev_lines_below > 0:
-                    sys.stdout.write(f"\033[{prev_lines_below}B")
-                sys.stdout.write("\r")
-                for _ in range(prev_lines_count - 1):
-                    sys.stdout.write("\033[2K\033[1A")
-                sys.stdout.write("\033[2K\r")
-                sys.stdout.flush()
-                prev_lines_count = 0
-                prev_lines_below = 0
-
         def render():
-            nonlocal prev_lines_count, prev_lines_below
-            clear_previous()
+            nonlocal prev_rendered, prev_lines_count
 
             width = get_width()
             inner_width = max(10, width - 2)
 
             text_str = "".join(buffer)
-            # Find matching slash commands if typing /
             matches = []
             if text_str.startswith("/"):
                 query = text_str.strip().lower()
-                matches = [(cmd, desc) for cmd, desc in SLASH_COMMAND_INFO if cmd.lower().startswith(query)]
+                if " " not in text_str:
+                    matches = [(cmd, desc) for cmd, desc in SLASH_COMMAND_INFO if cmd.lower().startswith(query) and cmd.lower() != query]
 
-            # Border colors: rgb(136, 136, 136)
             top_border = f"\033[38;2;136;136;136m╭{'─' * inner_width}╮\033[0m\r\n"
 
-            # Input row with prompt marker "> "
             prefix = " > "
             prefix_len = len(prefix)
             max_visible_len = inner_width - prefix_len
@@ -490,7 +474,6 @@ class AFMPromptReader:
 
             lines = [top_border, input_row, bottom_border, tag_line]
 
-            # Slash command completion popup matching AFM
             if matches:
                 for cmd, desc in matches[:6]:
                     lines.append(f"\033[38;2;153;153;153m  \033[1m{cmd:<14}\033[0m\033[38;2;153;153;153m·  {desc}\033[0m\r\n")
@@ -499,19 +482,27 @@ class AFMPromptReader:
                 else:
                     lines.append(f"\033[38;2;120;120;120m  tab to complete · ↑↓ to select\033[0m\r\n")
 
-            for l in lines:
-                sys.stdout.write(l)
+            if prev_rendered:
+                # Move cursor from Line 1 (input_row) up to Line 0 (top_border)
+                sys.stdout.write("\033[1A\r")
 
-            # Move cursor back inside the input box: to row 2, column (2 + prefix_len + cursor_offset)
-            lines_below_input = len(lines) - 2
+            for l in lines:
+                sys.stdout.write("\033[2K" + l)
+
+            if prev_lines_count > len(lines):
+                extra = prev_lines_count - len(lines)
+                for _ in range(extra):
+                    sys.stdout.write("\033[2K\r\n")
+                sys.stdout.write(f"\033[{extra}A")
+
+            # Cursor is at line len(lines). Move up to Line 1 (input_row):
+            lines_up = len(lines) - 1
             cursor_col = 1 + 1 + prefix_len + (cursor - view_start)
-            if lines_below_input > 0:
-                sys.stdout.write(f"\033[{lines_below_input}A")
-            sys.stdout.write(f"\033[{cursor_col}G")
+            sys.stdout.write(f"\033[{lines_up}A\033[{cursor_col}G")
             sys.stdout.flush()
 
+            prev_rendered = True
             prev_lines_count = len(lines)
-            prev_lines_below = lines_below_input
 
         try:
             tty.setcbreak(fd)
@@ -538,7 +529,6 @@ class AFMPromptReader:
 
                 if ch in (b"\r", b"\n"):
                     # Enter pressed: finalize box cleanly
-                    clear_previous()
                     width = get_width()
                     inner_width = max(10, width - 2)
                     top_border = f"\033[38;2;136;136;136m╭{'─' * inner_width}╮\033[0m\r\n"
@@ -550,7 +540,22 @@ class AFMPromptReader:
                     input_row = f"\033[38;2;136;136;136m│\033[0m{prefix}{vis}{' ' * pad}\033[38;2;136;136;136m│\033[0m\r\n"
                     bottom_border = f"\033[38;2;136;136;136m╰{'─' * inner_width}╯\033[0m\r\n"
                     tag_line = f"\033[38;2;153;153;153m {self.model_tag}\033[0m\r\n"
-                    sys.stdout.write(top_border + input_row + bottom_border + tag_line + "\r\n")
+
+                    if prev_rendered:
+                        sys.stdout.write("\033[1A\r")
+
+                    sys.stdout.write("\033[2K" + top_border)
+                    sys.stdout.write("\033[2K" + input_row)
+                    sys.stdout.write("\033[2K" + bottom_border)
+                    sys.stdout.write("\033[2K" + tag_line)
+
+                    extra = prev_lines_count - 4
+                    if extra > 0:
+                        for _ in range(extra):
+                            sys.stdout.write("\033[2K\r\n")
+                        sys.stdout.write(f"\033[{extra}A")
+
+                    sys.stdout.write("\r\n")
                     sys.stdout.flush()
 
                     res = text_str.strip()
@@ -560,14 +565,18 @@ class AFMPromptReader:
                     return res
 
                 elif ch == b"\x03":  # Ctrl+C
-                    clear_previous()
+                    lines_below = max(0, prev_lines_count - 2)
+                    if lines_below > 0:
+                        sys.stdout.write(f"\033[{lines_below}B")
                     sys.stdout.write("\r\n")
                     sys.stdout.flush()
                     raise KeyboardInterrupt
 
                 elif ch == b"\x04":  # Ctrl+D
                     if not buffer:
-                        clear_previous()
+                        lines_below = max(0, prev_lines_count - 2)
+                        if lines_below > 0:
+                            sys.stdout.write(f"\033[{lines_below}B")
                         sys.stdout.write("\r\n")
                         sys.stdout.flush()
                         raise EOFError
