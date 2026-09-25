@@ -192,8 +192,8 @@ def create_parser() -> argparse.ArgumentParser:
     )
     p_bench.add_argument(
         "--pp",
-        default="4096,8192,16384,32768",
-        help="Comma-separated prompt token lengths (default: 4096,8192,16384,32768)",
+        default=None,
+        help="Comma-separated prompt token lengths (default: 1024,2048,4096 for 27B; 4096,8192,16384,32768 for Flash-Next)",
     )
     p_bench.add_argument(
         "--tg",
@@ -362,9 +362,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
     elif args.command == "bench":
         import probes.ctx_scale_bench as csb
+        model_canon = "27b" if "27b" in args.model.lower() else "flash-next"
+        default_pp = "1024,2048,4096" if model_canon == "27b" else "4096,8192,16384,32768"
+        pp_val = args.pp if args.pp else default_pp
         bench_args = [
             f"--models={args.model}",
-            f"--pp={args.pp}",
+            f"--pp={pp_val}",
             f"--tg={args.tg}",
             f"--port={args.port}",
         ]

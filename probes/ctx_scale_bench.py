@@ -303,16 +303,20 @@ def wait_http(url: str, needle: str | None, timeout: float,
             if not server.alive():
                 tail = ""
                 try:
-                    tail = server.log_path.read_text(errors="replace")[-2500:]
-                except OSError:
+                    if hasattr(server, "log_path"):
+                        tail = server.log_path.read_text(errors="replace")[-2500:]
+                except (OSError, AttributeError):
                     pass
+                rc = getattr(getattr(server, "proc", None), "returncode", "unknown")
                 raise RuntimeError(
-                    f"{server.name} exited {server.proc.returncode}\n{tail}"
+                    f"{server.name} exited {rc}\n{tail}"
                 )
-            try:
-                data = server.log_path.read_bytes()
-            except OSError:
-                data = b""
+            data = b""
+            if hasattr(server, "log_path"):
+                try:
+                    data = server.log_path.read_bytes()
+                except OSError:
+                    data = b""
             if len(data) > log_off:
                 chunk = data[log_off:].decode(errors="replace")
                 log_off = len(data)
@@ -418,7 +422,40 @@ class Server:
             self.proc.wait(timeout=10)
 
 
-def start_27b(port: int, model: Path, serve_log: Path) -> Server:
+def find_pid_on_port(port: int) -> int | None:
+    try:
+        proc = subprocess.run(
+            ["lsof", "-t", f"-i:{port}", "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=5,
+        )
+        out = proc.stdout.strip()
+        if out:
+            return int(out.split()[0])
+    except Exception:
+        pass
+    return None
+
+
+class AttachedServer:
+    def __init__(self, name: str, pid: int):
+        self.name = name
+        self._pid = pid
+
+    def pid(self) -> int:
+        return self._pid
+
+    def alive(self) -> bool:
+        try:
+            os.kill(self._pid, 0)
+            return True
+        except OSError:
+            return False
+
+    def stop(self) -> None:
+        pass
+
+
+def start_27b(port: int, model: Path, serve_log: Path, context: int = 4096) -> Server:
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)
     env.update({
@@ -437,13 +474,13 @@ def start_27b(port: int, model: Path, serve_log: Path) -> Server:
     cmd = [
         py, "-u", "-P", str(ROOT / "tools" / "pure_ane_server.py"),
         "serve", "--model", str(model), "--host", "127.0.0.1",
-        "--port", str(port), "--context", str(CTX), "--bits", "4",
+        "--port", str(port), "--context", str(context), "--bits", "4",
         "--max-tokens", "256", "--profile-decode",
         "--max-request-bytes", str(32 * 1024 * 1024),
     ]
     serve_log.parent.mkdir(parents=True, exist_ok=True)
     fh = open(serve_log, "w")
-    log(f"START 27b context={CTX} port={port}")
+    log(f"START 27b context={context} port={port}")
     proc = subprocess.Popen(
         cmd, cwd=str(ROOT), env=env, stdout=fh, stderr=subprocess.STDOUT,
     )
@@ -638,16 +675,24 @@ def main() -> int:
 
     try:
         if "27b" in models:
-            slog = RESULTS / f"{stamp}.27b.serve.log"
-            srv = start_27b(args.port, m27, slog)
-            try:
+            existing_pid = find_pid_on_port(args.port)
+            if existing_pid:
+                log(f"Found existing 27B server on port {args.port} (pid={existing_pid}). Reusing resident weights...")
+                srv = AttachedServer("27b", existing_pid)
+            else:
+                slog = RESULTS / f"{stamp}.27b.serve.log"
+                srv = start_27b(args.port, m27, slog, context=4096)
                 wait_http(f"http://127.0.0.1:{args.port}/health",
                           '"ready":true', timeout=480, server=srv)
+            try:
                 idle = sample_footprint(srv.pid())
                 log(f"27b idle footprint={gb(idle.get('current'))} GB "
                     f"peak={gb(idle.get('peak'))} GB pid={srv.pid()}")
                 tok = m27 / "tokenizer.json"
                 for pp in lengths:
+                    if pp > 4096:
+                        log(f"--- 27b pp {pp} / tg {tg} [SKIPPED: 27B pure ANE tile capacity is 4096 tokens; use flash-next for 4k-32k context scaling]")
+                        continue
                     if not srv.alive():
                         raise RuntimeError("27b server died")
                     log(f"--- 27b pp {pp} / tg {tg}")
