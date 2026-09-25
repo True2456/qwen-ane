@@ -25,7 +25,13 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-# Standard library readline on macOS (libedit/readline)
+try:
+    import termios
+    import tty
+except ImportError:
+    termios = None
+    tty = None
+
 try:
     import readline
 except ImportError:
@@ -35,19 +41,20 @@ from .config import get_qwen_ane_dir, get_sessions_dir, load_config
 from .downloader import ensure_model, normalize_model_name
 from .server import is_server_running
 
-SLASH_COMMANDS = [
-    "/help",
-    "/model",
-    "/think",
-    "/instructions",
-    "/clear",
-    "/save",
-    "/sessions",
-    "/resume",
-    "/info",
-    "/exit",
-    "/quit",
+SLASH_COMMAND_INFO = [
+    ("/exit", "Exit the chat session"),
+    ("/clear", "Clear conversation history and screen"),
+    ("/model", "Switch active model (flash-next, 27b)"),
+    ("/think", "Set reasoning effort (off, low, medium, xhigh)"),
+    ("/instructions", "Set or view system instructions"),
+    ("/save", "Save session transcript to disk"),
+    ("/sessions", "List saved chat sessions"),
+    ("/resume", "Resume a saved session"),
+    ("/info", "Display hardware, context, and endpoint info"),
+    ("/help", "Show help card"),
+    ("/quit", "Exit the chat session"),
 ]
+SLASH_COMMANDS = [cmd for cmd, _ in SLASH_COMMAND_INFO]
 
 
 def gradient_text(
@@ -282,12 +289,20 @@ def stream_chat_completion(
                     continue
 
 
-def print_banner(model_name: str, ctx_human: str, silicon: str):
-    """Prints the Apple Foundation Models-style title banner."""
+def print_banner(model_name: str):
+    """Prints the exact Apple Foundation Models-style title banner."""
     print()
     print(gradient_text(" Qwen Neural Engine Chat", (130, 215, 90), (35, 130, 205)))
-    print(f"\033[38;2;153;153;153m model: {model_name} ({silicon}) · context: {ctx_human} · /help for help\033[0m")
+    print(f"\033[38;2;153;153;153m model: {model_name} · /help for help\033[0m")
     print()
+
+
+def get_model_badge(canon: str) -> str:
+    """Returns the AFM model tag displayed right below the input box."""
+    if canon == "27b":
+        return "27b (Qwen 3.8 27B Pure ANE)"
+    else:
+        return "flash-next (Qwen 3.8 Flash-Next ANE+MLX)"
 
 
 def print_help():
@@ -359,48 +374,281 @@ def print_info(session: ChatSession, ctx: int, host: str, port: int, lru: bool):
 \033[38;2;136;136;136m╰{dash}╯\033[0m\n""")
 
 
-def setup_readline():
-    """Configures readline history and slash command completion."""
-    if readline is None:
-        return
-    def completer(text: str, state: int):
-        options = [c for c in SLASH_COMMANDS if c.startswith(text)]
-        return options[state] if state < len(options) else None
+class AFMPromptReader:
+    """Exact reverse-engineered AFM interactive input prompt with live terminal resizing."""
 
-    try:
-        readline.set_completer(completer)
-        readline.set_completer_delims(" \t\n")
-        readline.parse_and_bind("tab: complete")
-        hist_file = get_qwen_ane_dir() / "history"
-        if hist_file.exists():
-            readline.read_history_file(str(hist_file))
-    except Exception:
-        pass
+    def __init__(self, model_tag: str = "27b (Qwen 3.8 27B Pure ANE)"):
+        self.model_tag = model_tag
+        self.history: list[str] = []
+        self.resized = False
+        self._load_history()
+        self._setup_signals()
 
+    def _load_history(self):
+        try:
+            hist_file = get_qwen_ane_dir() / "history"
+            if hist_file.is_file():
+                with hist_file.open("r", encoding="utf-8", errors="ignore") as f:
+                    self.history = [line.strip() for line in f if line.strip()][-200:]
+        except Exception:
+            pass
 
-def setup_sigwinch():
-    """Handles terminal window resize events so readline and buffers adapt."""
-    def _on_winch(signum, frame):
-        if readline is not None:
+    def _save_history(self):
+        try:
+            hist_file = get_qwen_ane_dir() / "history"
+            hist_file.parent.mkdir(parents=True, exist_ok=True)
+            with hist_file.open("w", encoding="utf-8") as f:
+                for line in self.history[-500:]:
+                    f.write(line + "\n")
+        except Exception:
+            pass
+
+    def _setup_signals(self):
+        def _handle_winch(signum, frame):
+            self.resized = True
+        try:
+            signal.signal(signal.SIGWINCH, _handle_winch)
+        except Exception:
+            pass
+
+    def read_prompt(self) -> str:
+        """Reads user input using raw terminal mode with exact AFM box styling and live resize."""
+        if not sys.stdin.isatty() or termios is None or tty is None:
             try:
-                readline.redisplay()
-            except Exception:
-                pass
-    try:
-        signal.signal(signal.SIGWINCH, _on_winch)
-    except Exception:
-        pass
+                line = sys.stdin.readline()
+                if not line:
+                    raise EOFError
+                return line.rstrip("\r\n")
+            except (KeyboardInterrupt, EOFError):
+                raise
 
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
 
-def save_readline():
-    if readline is None:
-        return
-    try:
-        hist_file = get_qwen_ane_dir() / "history"
-        readline.set_history_length(1000)
-        readline.write_history_file(str(hist_file))
-    except Exception:
-        pass
+        buffer: list[str] = []
+        cursor = 0
+        history_temp = list(self.history)
+        hist_idx = len(history_temp)
+        saved_draft = ""
+
+        prev_lines_count = 0
+        prev_lines_below = 0
+
+        def get_width() -> int:
+            return max(24, shutil.get_terminal_size(fallback=(80, 24)).columns)
+
+        def clear_previous():
+            nonlocal prev_lines_count, prev_lines_below
+            if prev_lines_count > 0:
+                if prev_lines_below > 0:
+                    sys.stdout.write(f"\033[{prev_lines_below}B")
+                sys.stdout.write("\r")
+                for _ in range(prev_lines_count - 1):
+                    sys.stdout.write("\033[2K\033[1A")
+                sys.stdout.write("\033[2K\r")
+                sys.stdout.flush()
+                prev_lines_count = 0
+                prev_lines_below = 0
+
+        def render():
+            nonlocal prev_lines_count, prev_lines_below
+            clear_previous()
+
+            width = get_width()
+            inner_width = max(10, width - 2)
+
+            text_str = "".join(buffer)
+            # Find matching slash commands if typing /
+            matches = []
+            if text_str.startswith("/"):
+                query = text_str.strip().lower()
+                matches = [(cmd, desc) for cmd, desc in SLASH_COMMAND_INFO if cmd.lower().startswith(query)]
+
+            # Border colors: rgb(136, 136, 136)
+            top_border = f"\033[38;2;136;136;136m╭{'─' * inner_width}╮\033[0m\r\n"
+
+            # Input row with prompt marker "> "
+            prefix = " > "
+            prefix_len = len(prefix)
+            max_visible_len = inner_width - prefix_len
+
+            if cursor < max_visible_len:
+                view_start = 0
+            else:
+                view_start = cursor - max_visible_len + 1
+
+            visible_text = text_str[view_start : view_start + max_visible_len]
+            pad_len = max(0, max_visible_len - len(visible_text))
+            input_row = (
+                f"\033[38;2;136;136;136m│\033[0m"
+                f"{prefix}{visible_text}{' ' * pad_len}"
+                f"\033[38;2;136;136;136m│\033[0m\r\n"
+            )
+
+            bottom_border = f"\033[38;2;136;136;136m╰{'─' * inner_width}╯\033[0m\r\n"
+            tag_line = f"\033[38;2;153;153;153m {self.model_tag}\033[0m\r\n"
+
+            lines = [top_border, input_row, bottom_border, tag_line]
+
+            # Slash command completion popup matching AFM
+            if matches:
+                for cmd, desc in matches[:6]:
+                    lines.append(f"\033[38;2;153;153;153m  \033[1m{cmd:<14}\033[0m\033[38;2;153;153;153m·  {desc}\033[0m\r\n")
+                if len(matches) == 1:
+                    lines.append(f"\033[38;2;120;120;120m  tab to complete\033[0m\r\n")
+                else:
+                    lines.append(f"\033[38;2;120;120;120m  tab to complete · ↑↓ to select\033[0m\r\n")
+
+            for l in lines:
+                sys.stdout.write(l)
+
+            # Move cursor back inside the input box: to row 2, column (2 + prefix_len + cursor_offset)
+            lines_below_input = len(lines) - 2
+            cursor_col = 1 + 1 + prefix_len + (cursor - view_start)
+            if lines_below_input > 0:
+                sys.stdout.write(f"\033[{lines_below_input}A")
+            sys.stdout.write(f"\033[{cursor_col}G")
+            sys.stdout.flush()
+
+            prev_lines_count = len(lines)
+            prev_lines_below = lines_below_input
+
+        try:
+            tty.setcbreak(fd)
+            sys.stdout.write("\033[?25l")
+            render()
+            sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
+
+            while True:
+                if self.resized:
+                    self.resized = False
+                    sys.stdout.write("\033[?25l")
+                    render()
+                    sys.stdout.write("\033[?25h")
+                    sys.stdout.flush()
+
+                try:
+                    ch = os.read(fd, 1)
+                except InterruptedError:
+                    continue
+
+                if not ch:
+                    raise EOFError
+
+                if ch in (b"\r", b"\n"):
+                    # Enter pressed: finalize box cleanly
+                    clear_previous()
+                    width = get_width()
+                    inner_width = max(10, width - 2)
+                    top_border = f"\033[38;2;136;136;136m╭{'─' * inner_width}╮\033[0m\r\n"
+                    prefix = " > "
+                    max_visible_len = inner_width - len(prefix)
+                    text_str = "".join(buffer)
+                    vis = text_str[:max_visible_len]
+                    pad = max(0, max_visible_len - len(vis))
+                    input_row = f"\033[38;2;136;136;136m│\033[0m{prefix}{vis}{' ' * pad}\033[38;2;136;136;136m│\033[0m\r\n"
+                    bottom_border = f"\033[38;2;136;136;136m╰{'─' * inner_width}╯\033[0m\r\n"
+                    tag_line = f"\033[38;2;153;153;153m {self.model_tag}\033[0m\r\n"
+                    sys.stdout.write(top_border + input_row + bottom_border + tag_line + "\r\n")
+                    sys.stdout.flush()
+
+                    res = text_str.strip()
+                    if res:
+                        self.history.append("".join(buffer))
+                        self._save_history()
+                    return res
+
+                elif ch == b"\x03":  # Ctrl+C
+                    clear_previous()
+                    sys.stdout.write("\r\n")
+                    sys.stdout.flush()
+                    raise KeyboardInterrupt
+
+                elif ch == b"\x04":  # Ctrl+D
+                    if not buffer:
+                        clear_previous()
+                        sys.stdout.write("\r\n")
+                        sys.stdout.flush()
+                        raise EOFError
+                    else:
+                        if cursor < len(buffer):
+                            del buffer[cursor]
+
+                elif ch in (b"\x7f", b"\x08"):  # Backspace
+                    if cursor > 0:
+                        cursor -= 1
+                        del buffer[cursor]
+
+                elif ch == b"\x01":  # Ctrl+A (Home)
+                    cursor = 0
+
+                elif ch == b"\x05":  # Ctrl+E (End)
+                    cursor = len(buffer)
+
+                elif ch == b"\x15":  # Ctrl+U (Clear before cursor)
+                    buffer = buffer[cursor:]
+                    cursor = 0
+
+                elif ch == b"\x0b":  # Ctrl+K (Kill to end)
+                    buffer = buffer[:cursor]
+
+                elif ch == b"\t":  # Tab completion
+                    text_str = "".join(buffer)
+                    if text_str.startswith("/"):
+                        query = text_str.strip().lower()
+                        matches = [cmd for cmd, _ in SLASH_COMMAND_INFO if cmd.lower().startswith(query)]
+                        if matches:
+                            buffer = list(matches[0] + " ")
+                            cursor = len(buffer)
+
+                elif ch == b"\x1b":  # Escape sequence
+                    seq = os.read(fd, 2)
+                    if seq == b"[A":  # Up arrow
+                        if hist_idx > 0:
+                            if hist_idx == len(history_temp):
+                                saved_draft = "".join(buffer)
+                            hist_idx -= 1
+                            buffer = list(history_temp[hist_idx])
+                            cursor = len(buffer)
+                    elif seq == b"[B":  # Down arrow
+                        if hist_idx < len(history_temp):
+                            hist_idx += 1
+                            if hist_idx == len(history_temp):
+                                buffer = list(saved_draft)
+                            else:
+                                buffer = list(history_temp[hist_idx])
+                            cursor = len(buffer)
+                    elif seq == b"[C":  # Right arrow
+                        if cursor < len(buffer):
+                            cursor += 1
+                    elif seq == b"[D":  # Left arrow
+                        if cursor > 0:
+                            cursor -= 1
+                    elif seq == b"[H":  # Home
+                        cursor = 0
+                    elif seq == b"[F":  # End
+                        cursor = len(buffer)
+                    elif seq == b"[3":  # Delete
+                        seq2 = os.read(fd, 1)
+                        if seq2 == b"~" and cursor < len(buffer):
+                            del buffer[cursor]
+
+                else:
+                    try:
+                        decoded = ch.decode("utf-8")
+                        buffer.insert(cursor, decoded)
+                        cursor += 1
+                    except UnicodeDecodeError:
+                        pass
+
+                sys.stdout.write("\033[?25l")
+                render()
+                sys.stdout.write("\033[?25h")
+                sys.stdout.flush()
+
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
 def start_chat(
@@ -441,7 +689,7 @@ def start_chat(
             print(f"   Please specify a different port (e.g. --port 1240 or --port 2457) or stop the existing server.")
             return 1
     else:
-        print(f"\033[38;2;153;153;153mStarting background {canon} engine on port {port}...\033[0m", flush=True)
+        print(f"\033[38;2;153;153;153mLoading {model_id} into Apple Neural Engine...\033[0m", flush=True)
         resolved_path = ensure_model(canon, custom_path=model_path, hf_repo=hf_repo)
 
         env = dict(os.environ)
@@ -550,34 +798,16 @@ def start_chat(
         else:
             print(f"\033[38;2;220;120;120mSession '{resume_id}' not found. Starting fresh session.\033[0m")
 
-    setup_readline()
-    setup_sigwinch()
-
-    ctx_human = format_tokens(ctx)
-    silicon = "pure ANE" if canon == "27b" else "ANE + GPU"
-    print_banner(session.model_id, ctx_human, silicon)
+    reader = AFMPromptReader(get_model_badge(canon))
+    print_banner(canon)
 
     last_sigint_time = 0.0
 
     try:
         while True:
-            cur_width = get_term_width()
-            top_border = f"\033[38;2;136;136;136m╭{'─' * max(2, cur_width - 2)}╮\033[0m"
-            prompt_marker = f"\033[38;2;136;136;136m│\033[0m \033[1;38;2;130;215;90m›\033[0m "
-            status_tag = f"\033[38;2;153;153;153m {session.model_id}\033[0m"
-
             try:
-                print(top_border)
-                raw_input = input(prompt_marker)
-                bot_width = get_term_width()
-                bottom_border = f"\033[38;2;136;136;136m╰{'─' * max(2, bot_width - 2)}╯\033[0m"
-                print(bottom_border)
-                print(status_tag)
-                print()
+                raw_input = reader.read_prompt()
             except KeyboardInterrupt:
-                bot_width = get_term_width()
-                bottom_border = f"\033[38;2;136;136;136m╰{'─' * max(2, bot_width - 2)}╯\033[0m"
-                print(f"\n{bottom_border}")
                 now = time.time()
                 if now - last_sigint_time < 2.5:
                     print("\n\033[38;2;153;153;153mExiting.\033[0m")
@@ -586,9 +816,6 @@ def start_chat(
                 print("\033[38;2;153;153;153m(Press Ctrl+C again or /exit to quit)\033[0m\n")
                 continue
             except EOFError:
-                bot_width = get_term_width()
-                bottom_border = f"\033[38;2;136;136;136m╰{'─' * max(2, bot_width - 2)}╯\033[0m"
-                print(f"\n{bottom_border}")
                 print("\n\033[38;2;153;153;153mExiting.\033[0m")
                 break
 
@@ -600,7 +827,7 @@ def start_chat(
             while user_input.endswith("\\"):
                 user_input = user_input[:-1].strip()
                 try:
-                    cont = input("\033[38;2;136;136;136m│\033[0m   ").strip()
+                    cont = reader.read_prompt()
                     user_input += "\n" + cont
                 except (KeyboardInterrupt, EOFError):
                     break
@@ -612,7 +839,7 @@ def start_chat(
             elif user_input == "/clear":
                 session.messages = []
                 print("\033[2J\033[H", end="")
-                print_banner(session.model_id, ctx_human, silicon)
+                print_banner(session.model)
                 continue
 
             elif user_input == "/help":
@@ -679,6 +906,7 @@ def start_chat(
                         session.model_id = "Qwen3.8-Flash-Next" if target_model == "flash-next" else "Qwen3.8-27B"
                         session.port = 1240 if target_model == "27b" else 2457
                         silicon = "pure ANE" if target_model == "27b" else "ANE + GPU"
+                        reader.model_tag = get_model_badge(target_model)
                         print(f"\033[38;2;130;215;90m✓ Switched model to: {session.model_id} (port {session.port})\033[0m\n")
                     else:
                         print("\033[38;2;220;120;120mUnknown model. Choose 'flash-next' or '27b'.\033[0m\n")
@@ -756,7 +984,6 @@ def start_chat(
                 print(f"\n\033[31mError during completion: {exc}\033[0m\n")
 
     finally:
-        save_readline()
         session.save()
         print(f"\033[38;2;153;153;153mSession saved as {session.session_id}.\033[0m")
         print(f"\033[38;2;153;153;153mResume later with: qwen-ane chat --resume {session.session_id}\033[0m\n")
