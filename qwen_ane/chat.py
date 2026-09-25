@@ -801,14 +801,20 @@ def start_chat(
         max_tokens=max_tokens,
     )
 
+    reader = AFMPromptReader(get_model_badge(canon))
+
+    # Clear terminal window on startup matching AFM behavior
+    if sys.stdout.isatty():
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
+
+    print_banner(canon)
+
     if resume_id:
         if session.load(resume_id):
-            print(f"\033[38;2;130;215;90m✓ Resumed session '{resume_id}' ({len(session.messages)} messages)\033[0m")
+            print(f"\033[38;2;130;215;90m✓ Resumed session '{resume_id}' ({len(session.messages)} messages)\033[0m\n")
         else:
-            print(f"\033[38;2;220;120;120mSession '{resume_id}' not found. Starting fresh session.\033[0m")
-
-    reader = AFMPromptReader(get_model_badge(canon))
-    print_banner(canon)
+            print(f"\033[38;2;220;120;120mSession '{resume_id}' not found. Starting fresh session.\033[0m\n")
 
     last_sigint_time = 0.0
 
