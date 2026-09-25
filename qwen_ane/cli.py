@@ -180,6 +180,44 @@ def create_parser() -> argparse.ArgumentParser:
     p_config.add_argument("key", nargs="?", help="Configuration key")
     p_config.add_argument("value", nargs="?", help="Configuration value")
 
+    # 6. 'bench' command
+    p_bench = subparsers.add_parser(
+        "bench",
+        help="Run power, prefill/decode speed, and context scaling benchmark (with powermetrics)",
+    )
+    p_bench.add_argument(
+        "-m", "--model", "-model",
+        default="flash-next",
+        help="Model to benchmark ('flash-next', '27b', or '27b,flash-next', default: flash-next)",
+    )
+    p_bench.add_argument(
+        "--pp",
+        default="4096,8192,16384,32768",
+        help="Comma-separated prompt token lengths (default: 4096,8192,16384,32768)",
+    )
+    p_bench.add_argument(
+        "--tg",
+        type=int,
+        default=128,
+        help="Number of tokens to generate (default: 128)",
+    )
+    p_bench.add_argument(
+        "-p", "--port", "-port",
+        type=int,
+        default=1240,
+        help="Port for 27B benchmark server (default: 1240)",
+    )
+    p_bench.add_argument(
+        "--skip-power",
+        action="store_true",
+        help="Skip powermetrics sampling",
+    )
+    p_bench.add_argument(
+        "--model-path", "-model-path",
+        default=None,
+        help="Explicit path to model directory",
+    )
+
     return parser
 
 
@@ -322,7 +360,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             save_config(cfg)
             print(f"Updated {args.key} = {val}")
             return 0
+    elif args.command == "bench":
+        import probes.ctx_scale_bench as csb
+        bench_args = [
+            f"--models={args.model}",
+            f"--pp={args.pp}",
+            f"--tg={args.tg}",
+            f"--port={args.port}",
+        ]
+        if args.skip_power:
+            bench_args.append("--skip-power")
+        if args.model_path:
+            if "27b" in args.model:
+                bench_args.append(f"--model-27b={args.model_path}")
+            if "flash" in args.model:
+                bench_args.append(f"--model-flashnext={args.model_path}")
+        old_argv = sys.argv
+        try:
+            sys.argv = ["ctx_scale_bench.py", *bench_args]
+            return csb.main()
+        finally:
+            sys.argv = old_argv
 
     else:
         parser.print_help()
         return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
