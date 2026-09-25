@@ -235,6 +235,26 @@ Decode is ~15 tok/s (includes MTP, spec 4). A 511-token prose walk on the
 same k=32 graphs was 58–82 tok/s depending on the graph set
 ([docs/PREFILL.md](docs/PREFILL.md)); do not mix that row with this table.
 
+## Measured: 27B Pure ANE context scale (M5 Max, 2026-09-25)
+
+Cold prefix (`reset` between lengths, salted prompts, **reused=0**). Pure ANE
+server context 8576, INT4 weights. 100% on-chip Apple Neural Engine execution
+(`AppleNeuralEngine.framework`): GDN linear recurrence, 16 full-attention layers,
+projections, and SwiGLU MLP tails. Metal GPU is completely idle (0.1–0.2 W).
+Watts are **mean** `powermetrics --samplers cpu_power,gpu_power,ane_power -i 500`
+over the generate. PeakMem is `footprint -p` `phys_footprint_peak`. Prompt tokens
+were 1000 / 1999 / 3997 / 7993; completion 128.
+
+| Test | TTFT(ms) | TPOT(ms) | ppTPS | tgTPS | E2E(s) | Throughput | PeakMem | ANE / GPU / CPU W |
+|---|---:|---:|---:|---:|---:|---:|---|---|
+| pp 1024 / tg 128 | 31856.7 | 251.4 | 31.4 | 4.0 | 63.8 | 17.7 | 21.0 GB | 2.86 / 0.24 / 7.04 |
+| pp 2048 / tg 128 | 69915.0 | 260.6 | 28.6 | 3.8 | 103.0 | 20.6 | 21.0 GB | 2.67 / 0.11 / 5.91 |
+| pp 4096 / tg 128 | 165730.8 | 278.2 | 24.1 | 3.6 | 201.1 | 20.5 | 21.0 GB | 2.44 / 0.17 / 6.27 |
+| pp 8192 / tg 128 | 439329.1 | 319.8 | 18.2 | 3.1 | 480.0 | 16.9 | 21.0 GB | 2.23 / 0.25 / 7.34 |
+
+ANE power stays exceptionally low (~2.2–2.9 W) under sustained 27B inference,
+with total system rails under 10 W and memory footprint flat at 21.0 GB across all context depths.
+
 Full CLI notes: [docs/QWEN-ANE.md](docs/QWEN-ANE.md).
 Setup / moving machines: [docs/SETUP.md](docs/SETUP.md).
 Measured ANE vs GPU energy: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).

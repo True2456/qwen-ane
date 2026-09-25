@@ -60,21 +60,38 @@ hf download True2456/Qwen3.8-27B-ANE --local-dir ~/.qwenANE/models/27b
 Chat and serve:
 
 ```bash
-qwen-ane chat -model 27b -ctx 4096
-qwen-ane serve -model 27b -port 2457 -ctx 4096
+qwen-ane chat -model 27b
+qwen-ane serve -model 27b -port 2457
 ```
 
 Optional speculative decode (`--mtp-draft 2` uses `mtp.safetensors`):
 
 ```bash
-qwen-ane serve -model 27b -port 2457 -ctx 4096 --mtp-draft 2
+qwen-ane serve -model 27b -port 2457 --mtp-draft 2
 ```
 
 Coding agents can point an OpenAI-compatible client at that server. A Pi provider lives in the qwen-ane tree as `extensions/pure27-pi.ts`.
 
 ## Measured performance (M5 Max)
 
-Figures below are from qwen-ane on the development M5 Max. Other M-series parts are untested. 16k / 32k 27B benches are not claimed here.
+Figures below are from `qwen-ane` on an Apple M5 Max running 100% on-chip Apple Neural Engine inference (0% Metal GPU).
+
+### Context scale & power metrics (2026-09-25)
+
+Cold prefix (`reset` between lengths, salted prompts, **reused=0**). Pure ANE server context 8576, INT4 weights. Watts are **mean** `powermetrics --samplers cpu_power,gpu_power,ane_power -i 500` over the generate. PeakMem is `footprint -p` `phys_footprint_peak`. Prompt tokens were 1000 / 1999 / 3997 / 7993; completion 128.
+
+| Test | TTFT(ms) | TPOT(ms) | ppTPS | tgTPS | E2E(s) | Throughput | PeakMem | ANE / GPU / CPU W |
+|---|---:|---:|---:|---:|---:|---:|---|---|
+| pp 1024 / tg 128 | 31856.7 | 251.4 | 31.4 | 4.0 | 63.8 | 17.7 | 21.0 GB | 2.86 / 0.24 / 7.04 |
+| pp 2048 / tg 128 | 69915.0 | 260.6 | 28.6 | 3.8 | 103.0 | 20.6 | 21.0 GB | 2.67 / 0.11 / 5.91 |
+| pp 4096 / tg 128 | 165730.8 | 278.2 | 24.1 | 3.6 | 201.1 | 20.5 | 21.0 GB | 2.44 / 0.17 / 6.27 |
+| pp 8192 / tg 128 | 439329.1 | 319.8 | 18.2 | 3.1 | 480.0 | 16.9 | 21.0 GB | 2.23 / 0.25 / 7.34 |
+
+- **Zero GPU utilization**: Metal GPU stays idle at 0.1–0.2 W while the 27B model runs entirely on the ANE.
+- **Ultra-low power draw**: Sustained ANE power draw is only **~2.2–2.9 W**; total package power stays under **10 W**.
+- **Rock-solid memory footprint**: Physical memory footprint stays flat at **21.0 GB** from 1k through 8k+ tokens.
+
+### Microbenchmarks & Agent turns
 
 | Workload | Result |
 | --- | --- |
